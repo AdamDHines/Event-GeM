@@ -524,6 +524,7 @@ def main():
                     )
                     final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
                     best_arg = np.argmin(final_scores)
+                    print(best_arg)
                     np.save(f"{qry_feat_dir}/qry_rerank_{frame_idx}.npy", final_scores)
             #print(f"total: {(time.time()-start)*1000} msec")
 
