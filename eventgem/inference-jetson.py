@@ -294,12 +294,13 @@ def main():
     wall0 = time.perf_counter()
 
     print("[INFO] Starting Loop...", flush=True)
+    import dv_processing as dv
     B = dv.io.camera.DAVIS.Davis346BiasCF
 
     bias_steps_cf = {
-        B.On:         (+1, 0),
-        B.Off:        (+1, 0),
-        B.Refractory: (+1, 0),
+        B.On:         (+1, +63),
+        B.Off:        (+5, +168),
+        B.Refractory: (0, 0),
     }
 
     event_iter = stream.stream_event_windows_davis_live(
@@ -318,7 +319,7 @@ def main():
                 event_iter = stream.stream_event_windows_davis_live(
                             args.dt_ms,
                             on_window=preview.enqueue,
-                            bias_deltas=bias_deltas
+                            bias_steps_cf=bias_steps_cf
                         )
             for (_, _, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms) in event_iter:
                 cpu0 = time.perf_counter()
