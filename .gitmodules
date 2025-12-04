@@ -1,0 +1,6 @@
+[submodule "eventgem/external/backbone"]
+	path = eventgem/external/backbone
+	url = https://github.com/Yan98/Event-Camera-Data-Pre-training.git
+[submodule "eventgem/external/superevent"]
+	path = eventgem/external/superevent
+	url = https://github.com/ethz-mrl/SuperEvent.git
