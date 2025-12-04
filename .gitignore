@@ -1,3 +1,9 @@
+# Projectory directory files
+eventgem/ckpt/
+eventgem/features/
+eventgem/keypoints/
+eventgem/external/backbone/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -1,0 +1,101 @@
+[workspace]
+authors = ["Adam Hines <adam.hines@qut.edu.au>"]
+channels = ["conda-forge"]
+name = "Event-GeM"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[system-requirements]
+cuda = "12"
+
+[tasks]
+demo = {cmd = "pixi run -e backbone python3 main.py -d brisbane-event -r sunset1 -q sunset2 --mode feature-extract && pixi run -e backbone python3 main.py -d brisbane-event -r sunset1 -q sunset2 --mode keypoints"}
+
+[environments]
+backbone = ["backbone"]
+superevent = ["superevent"]
+
+[dependencies]
+prettytable = "*"
+scikit-image = "*"
+matplotlib = "*"
+
+[feature.backbone.dependencies]
+python = ">3.8"
+numpy = "<1.20"
+pytorch = "*"
+torchvision = "*"
+pytorch-lightning  = "*"
+einops = "*"
+timm = "*"
+pyyaml = "*"
+flatten-dict = "*"
+torch-scatter = "*"
+opencv = "*"
+tqdm = "*"
+scikit-learn = "*"
+
+[feature.superevent.dependencies]
+cmapy = "*"
+contourpy = "*"
+cycler = "*"
+filelock = "*"
+fonttools = "*" 
+fsspec = "*"
+h5py = "*"
+hdf5plugin = "*"
+imageio = "*"
+Jinja2 = "*"
+joblib = "*"
+kiwisolver = "*"
+kornia = "*"
+kornia-rs = "*"
+lazy_loader = "*"
+llvmlite = "*"
+MarkupSafe = "*"
+matplotlib = "*"
+mpmath = "*"
+networkx = "*"
+numba = "*"
+numpy = "*"
+opencv = "*"
+packaging = "*"
+pillow = "*"
+pyparsing = "*"
+python-dateutil = "*"
+PyYAML = "*"
+scikit-image = "*"
+scikit-learn = "*"
+scipy = "*"
+six = "*"
+sympy = "*"
+threadpoolctl = "*"
+tifffile = "*"
+pytorch = "*"
+torchaudio = "*"
+torchvision = "*"
+tqdm = "*"
+triton = "*"
+typing_extensions = "*"
+prettytable = "*"
+
+[target.linux-64.dependencies]
+cuda-version = "12.*"
+pytorch-gpu = "*"
+cuda-cudart-dev = "*"
+cuda-crt = "*"
+cudnn = "*"
+libcusparse-dev = "*"
+cuda-driver-dev = "*"
+cuda-nvcc = "*"
+cuda-nvrtc-dev = "*"
+cuda-nvtx-dev = "*"
+cuda-nvml-dev = "*"
+cuda-profiler-api = "*"
+cusparselt = "*"
+libcublas-dev = "*"
+libcudss-dev = "*"
+libcufile-dev = "*"
+libcufft-dev = "*"
+libcurand-dev = "*"
+libcusolver-dev = "*"
