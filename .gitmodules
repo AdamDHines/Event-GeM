@@ -4,3 +4,6 @@
 [submodule "eventgem/external/superevent"]
 	path = eventgem/external/superevent
 	url = https://github.com/ethz-mrl/SuperEvent.git
+[submodule "eventgem/external/eventlab"]
+	path = eventgem/external/eventlab
+	url = https://github.com/EventLAB-Team/Event-LAB.git
