@@ -20,7 +20,7 @@ def main():
                             help="Reconstruction time window in milliseconds for event datasets")
     parser.add_argument("--mcts-time", type=float, nargs='+', default=[1e-3, 1e-2, 3e-2, 4e-2, 5e-2],
                             help="Space-separated list of temporal window sizes in seconds.")
-    parser.add_argument("--data-root", type=str, default="/media/adam/vprdatasets/eventlab/brisbane_event", 
+    parser.add_argument("--data-root", type=str, default="./dataset", 
                             help="Root directory for datasets")
     
     # Model parameters
@@ -53,7 +53,7 @@ def main():
     else:
         original, reranked = eventgem.keypoint_inference()
         # Run Recall@K evaluation
-        gt = np.load(os.path.join(args.data_root, "ground_truth", f"{args.reference}_{args.query}_GT.npy"))
+        gt = np.load(os.path.join(args.data_root, args.dataset, "ground_truth", f"{args.reference}_{args.query}_GT.npy"))
         recall(original, reranked, gt)
 
 if __name__ == "__main__":

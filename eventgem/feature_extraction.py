@@ -4,8 +4,8 @@ Imports
 import os
 import sys
 import torch
-import math
 import yaml
+import math
 
 import numpy as np
 import torch.nn.functional as F
@@ -15,10 +15,28 @@ from pathlib import Path
 from joblib import Parallel, delayed
 from eventgem.dataset import EventGeMData
 from eventgem.utils.generate_mcts import gen_mcts
-from eventgem.external.superevent.models.util import fast_nms
-from eventgem.utils.eventlab_config import update_config, eventlab_data
+from eventgem.utils.eventlab_config import update_config
 from eventgem.utils.rerank_utils import load_event_features, process_single_query
-from eventgem.external.superevent.models.super_event import SuperEvent, SuperEventFullRes
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Backbone path (already working)
+BACKBONE_ROOT = os.path.join(THIS_DIR, "external", "backbone")
+
+# Superevent root — where the "models" package lives
+SUPEREVENT_ROOT = os.path.join(THIS_DIR, "external", "superevent")
+
+for path in (BACKBONE_ROOT, SUPEREVENT_ROOT):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+# Backbone import (unchanged)
+from eventgem.external.backbone.model.ours_model.ours_model_pretrain import vit_contrastive_patch16_small
+
+# Now "models" resolves to eventgem/external/superevent/models
+from models.super_event import SuperEvent, SuperEventFullRes
+from models.util import fast_nms
+
 
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -129,7 +147,6 @@ class EventGeM:
         if not os.path.exists(self.reference_path) or not os.path.exists(self.query_path):
             # Updat the eventlab config and generate the data
             update_config(root, self.dataset, self.reference, self.query, time=self.recon_msec)
-            eventlab_data() # generates the data with specified arguments
         
         # Check if features have been pre-computed
         outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")
@@ -302,11 +319,17 @@ class EventGeM:
         # Use the first file to determine shapes and cropping
         arr0 = self.load_mcts_npz(mcts_files[0])
         _, H, W = arr0.shape
+
+        # build_crop_mask returns (crop_mask, cropped_shape, crop_vec)
         crop_mask, cropped_shape, crop_vec = self.build_crop_mask((H, W), config)
 
+        # Symmetric crop offsets from crop_vec = [crop_h, crop_w]
         off_top = math.ceil(crop_vec[0] / 2)
+        off_bottom = math.floor(crop_vec[0] / 2)
         off_left = math.ceil(crop_vec[1] / 2)
-        Hc, Wc = cropped_shape
+        off_right = math.floor(crop_vec[1] / 2)
+
+        Hc, Wc = cropped_shape  # should be H - crop_vec[0], W - crop_vec[1]
 
         top_k = top_k_arg if top_k_arg is not None else max(Hc, Wc) // 2
 
@@ -323,8 +346,15 @@ class EventGeM:
             arr = self.load_mcts_npz(f)
             ts = torch.from_numpy(arr).unsqueeze(0).to(device=device)  # (1, C, H, W)
 
-            # Apply crop mask
-            ts_crop = ts[..., crop_mask].reshape(1, config["input_channels"], Hc, Wc)
+            # Compute end indices once
+            h_end = H - off_bottom if off_bottom > 0 else H
+            w_end = W - off_right if off_right > 0 else W
+
+            # If nothing to crop, just pass through
+            if off_top == 0 and off_left == 0 and off_bottom == 0 and off_right == 0:
+                ts_crop = ts  # (1, C, H, W)
+            else:
+                ts_crop = ts[..., off_top:h_end, off_left:w_end]  # (1, C, Hc, Wc)
 
             with torch.no_grad():
                 pred = model(ts_crop)
@@ -396,8 +426,8 @@ class EventGeM:
 
         # MCTS directories (where gen_mcts wrote frames)
         root = Path(self.data_root)
-        ref_mcts_dir = root / self.dataset / f"mcts_{self.reference}"
-        query_mcts_dir = root / self.dataset / f"mcts_{self.query}"
+        ref_mcts_dir = root / self.dataset / self.reference / f"mcts_{self.reference}"
+        query_mcts_dir = root / self.dataset / self.query / f"mcts_{self.query}"
 
         if not ref_mcts_dir.exists():
             raise FileNotFoundError(f"Reference MCTS directory not found: {ref_mcts_dir}")
@@ -417,28 +447,30 @@ class EventGeM:
         force_reextract = getattr(self, "force_kp_reextract", False)
 
         # Reference
-        self.extract_superevent_features_for_dir(
-            mcts_dir=ref_mcts_dir,
-            out_dir=ref_kp_dir,
-            model=model,
-            config=se_config,
-            device=device,
-            max_frames=max_frames,
-            top_k_arg=top_k_arg,
-            force_reextract=force_reextract,
-        )
+        if not os.path.exists(ref_kp_dir):
+            self.extract_superevent_features_for_dir(
+                mcts_dir=ref_mcts_dir,
+                out_dir=ref_kp_dir,
+                model=model,
+                config=se_config,
+                device=device,
+                max_frames=max_frames,
+                top_k_arg=top_k_arg,
+                force_reextract=force_reextract,
+            )
 
         # Query
-        self.extract_superevent_features_for_dir(
-            mcts_dir=query_mcts_dir,
-            out_dir=query_kp_dir,
-            model=model,
-            config=se_config,
-            device=device,
-            max_frames=max_frames,
-            top_k_arg=top_k_arg,
-            force_reextract=force_reextract,
-        )
+        if not os.path.exists(query_kp_dir):
+            self.extract_superevent_features_for_dir(
+                mcts_dir=query_mcts_dir,
+                out_dir=query_kp_dir,
+                model=model,
+                config=se_config,
+                device=device,
+                max_frames=max_frames,
+                top_k_arg=top_k_arg,
+                force_reextract=force_reextract,
+            )
 
     def rerank(self, kp_pattern="mcts_{:04d}.feat.npz"):
         R, Q = self.distance_matrix.shape
@@ -490,8 +522,8 @@ class EventGeM:
             self.extract_keypoints()
         
         # Check if keypoints have been pre-computed
-        self.reference_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.reference}")
-        self.query_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.query}")
+        self.reference_keypoints = os.path.join(self.keypoint_out, self.dataset, self.reference, f"kps_{self.reference}")
+        self.query_keypoints = os.path.join(self.keypoint_out, self.dataset, self.query, f"kps_{self.query}")
 
         if not os.path.exists(self.reference_keypoints) or not os.path.exists(self.query_keypoints):
             # Perform keypoint extraction

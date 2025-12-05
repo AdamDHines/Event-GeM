@@ -9,7 +9,7 @@ version = "0.1.0"
 cuda = "12"
 
 [tasks]
-demo = {cmd = "pixi run -e backbone python3 main.py -d brisbane-event -r sunset1 -q sunset2 --mode feature-extract && pixi run -e backbone python3 main.py -d brisbane-event -r sunset1 -q sunset2 --mode keypoints"}
+demo = {cmd = "pixi run -e backbone python3 main.py -d brisbane_event -r sunrise -q sunset2 --mode feature-extract && pixi run -e superevent python3 main.py -d brisbane_event -r sunrise -q sunset2 --mode keypoints"}
 
 [environments]
 backbone = ["backbone"]
@@ -20,6 +20,10 @@ prettytable = "*"
 scikit-image = "*"
 matplotlib = "*"
 yaml = "*"
+h5py = "*"
+numpy = "<2"
+scipy = "*"
+pandas = "*"
 
 [feature.backbone.dependencies]
 python = ">3.8"
@@ -35,6 +39,7 @@ torch-scatter = "*"
 opencv = "*"
 tqdm = "*"
 scikit-learn = "*"
+pynmea2 = "*"
 
 [feature.superevent.dependencies]
 cmapy = "*"
@@ -73,6 +78,7 @@ sympy = "*"
 threadpoolctl = "*"
 tifffile = "*"
 pytorch = "*"
+timm = "*"
 torchaudio = "*"
 torchvision = "*"
 tqdm = "*"

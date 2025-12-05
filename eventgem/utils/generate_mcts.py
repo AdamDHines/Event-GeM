@@ -1,9 +1,10 @@
-import argparse
 from pathlib import Path
 import h5py
 import numpy as np
 from tqdm import tqdm
 import math
+import yaml
+import os
 
 # ---------- HDF5 helpers ----------
 
@@ -162,7 +163,7 @@ def _generate_mcts_for_file(
     H: int,
     W: int,
     chunk_size: int = 500_000,
-    max_frames: int | None = None,
+    max_frames = None,
     start_time_sec: float = 0.0,
 ):
     """Generate MCTS frames for a single HDF5 file."""
@@ -295,43 +296,53 @@ def gen_mcts(root, dataset, reference, query, mcts_time, chunk_size=500_000, max
     time_windows = np.array(mcts_time, dtype=np.float64)
     DT_MAX = float(time_windows[-1])
 
-    ref_path = root / dataset / f"{reference}.hdf5"
-    query_path = root / dataset / f"{query}.hdf5"
+    ref_path = root / dataset / reference / f"{reference}.hdf5"
+    query_path = root / dataset / query / f"{query}.hdf5"
 
     # NOTE: keeping your original out_dir behaviour (same dir for ref and query)
-    out_dir = root / dataset / f"mcts_{reference}"
+    ref_dir = root / dataset / reference / f"mcts_{reference}"
+    qry_dir = root / dataset / query / f"mcts_{query}"
 
     # Time scale and sensor size
     if dataset == "brisbane_event":
         time_scale = 1e-9  # nanoseconds to seconds
         H, W = 240, 346
+        # load the event lab config for the brisbane event to get the start time
+        config_path = "./eventgem/external/eventlab/datasets/brisbane_event.yaml"
+        config = yaml.safe_load(open(config_path, 'r'))
+        ref_start = config['other']['offset'][reference]
+        query_start = config['other']['offset'][query]
     else:
         time_scale = 1e-6  # microseconds to seconds
+        ref_start = 0.0
+        query_start = 0.0
         # TODO: set H, W for other datasets
         raise ValueError(f"Unknown dataset {dataset}, please set H/W and time_scale.")
 
     # Reference sequence
-    _generate_mcts_for_file(
-        h5_path=ref_path,
-        out_dir=out_dir,
-        time_windows=time_windows,
-        time_scale=time_scale,
-        H=H,
-        W=W,
-        chunk_size=chunk_size,
-        max_frames=max_frames,
-        start_time_sec=0.0,
-    )
+    if not os.path.exists(ref_dir):
+        _generate_mcts_for_file(
+            h5_path=ref_path,
+            out_dir=ref_dir,
+            time_windows=time_windows,
+            time_scale=time_scale,
+            H=H,
+            W=W,
+            chunk_size=chunk_size,
+            max_frames=max_frames,
+            start_time_sec=ref_start,
+        )
 
     # Query sequence
-    _generate_mcts_for_file(
-        h5_path=query_path,
-        out_dir=out_dir,
-        time_windows=time_windows,
-        time_scale=time_scale,
-        H=H,
-        W=W,
-        chunk_size=chunk_size,
-        max_frames=max_frames,
-        start_time_sec=0.0,
-    )
+    if not os.path.exists(qry_dir):
+        _generate_mcts_for_file(
+            h5_path=query_path,
+            out_dir=qry_dir,
+            time_windows=time_windows,
+            time_scale=time_scale,
+            H=H,
+            W=W,
+            chunk_size=chunk_size,
+            max_frames=max_frames,
+            start_time_sec=query_start,
+        )
