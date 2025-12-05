@@ -1,3 +1,4 @@
+from html import parser
 import os
 import argparse
 import numpy as np
@@ -17,6 +18,8 @@ def main():
                             help="Query directory to use for evaluation")
     parser.add_argument("--recon-msec", type=int, default=50,
                             help="Reconstruction time window in milliseconds for event datasets")
+    parser.add_argument("--mcts-time", type=float, nargs='+', default=[1e-3, 1e-2, 3e-2, 4e-2, 5e-2],
+                            help="Space-separated list of temporal window sizes in seconds.")
     parser.add_argument("--data-root", type=str, default="/media/adam/vprdatasets/eventlab/brisbane_event", 
                             help="Root directory for datasets")
     

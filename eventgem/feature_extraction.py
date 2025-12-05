@@ -4,6 +4,8 @@ Imports
 import os
 import sys
 import torch
+import math
+import yaml
 
 import numpy as np
 import torch.nn.functional as F
@@ -12,8 +14,12 @@ from tqdm import tqdm
 from pathlib import Path
 from joblib import Parallel, delayed
 from eventgem.dataset import EventGeMData
+from eventgem.utils.generate_mcts import gen_mcts
+from eventgem.external.superevent.models.util import fast_nms
 from eventgem.utils.eventlab_config import update_config, eventlab_data
 from eventgem.utils.rerank_utils import load_event_features, process_single_query
+from eventgem.external.superevent.models.super_event import SuperEvent, SuperEventFullRes
+
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKBONE_ROOT = os.path.join(THIS_DIR, "external", "backbone")
@@ -133,8 +139,306 @@ class EventGeM:
             # Perform feature extraction
             self.extract_features()
 
+    # ----------------------------------------------------------
+    # SuperEvent / MCTS helpers
+    # ----------------------------------------------------------
+
+    def list_mcts_files(self, root: Path):
+        """List and sort all mcts_*.npz files in the given directory."""
+        files = sorted(root.glob("mcts_*.npz"))
+        if not files:
+            raise RuntimeError(f"No mcts_*.npz files found in {root}")
+        return files
+
+
+    def load_mcts_npz(self, path: Path) -> np.ndarray:
+        """Load the MCTS array from a compressed NPZ file."""
+        if not path.exists():
+            raise FileNotFoundError(f"MCTS file not found: {path}")
+        data = np.load(str(path))
+        if "mcts" in data:
+            arr = data["mcts"]
+        else:
+            # Fallback for old NPZ files that might use a different key
+            first_key = list(data.keys())[0]
+            arr = data[first_key]
+        return arr.astype(np.float32)
+
+
+    def load_superevent_config(self, config_path: Path):
+        """Load main config and merge with backbone config if specified."""
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+
+        if "backbone" in config:
+            # Try a couple of relative locations for the backbone config
+            backbone_config_path = config_path.parent.parent / "backbones" / f"{config['backbone']}.yaml"
+            if not backbone_config_path.exists():
+                backbone_config_path = config_path.parent / "backbones" / f"{config['backbone']}.yaml"
+
+            if backbone_config_path.exists():
+                with open(backbone_config_path, "r") as f:
+                    backbone_cfg = yaml.safe_load(f)
+                # Python 3.9-safe dict merge
+                config.update(backbone_cfg)
+                config["backbone_config"]["input_channels"] = config["input_channels"]
+            else:
+                print(f"[WARN] Could not find backbone config for {config['backbone']}")
+
+        return config
+
+
+    def build_crop_mask(self, ts_shape, config):
+        """
+        Determine cropping needed for compatibility with the backbone's downsampling.
+        Returns (crop_mask, cropped_shape, crop_vector).
+        """
+        H, W = ts_shape
+        max_factor_required = config["grid_size"]
+
+        if "backbone_config" in config:
+            stage_blocks = config["backbone_config"]["num_blocks"]
+            patch_size = config["backbone_config"]["stem"]["patch_size"]
+            downsample_factor = patch_size * (2 ** (len(stage_blocks) - 1))
+            max_factor_required = downsample_factor
+
+            # Conservative adjustment for attention partitioning if present
+            if "attention" in config["backbone_config"]["stage"]:
+                max_partition = np.max(config["backbone_config"]["stage"]["attention"]["partition_size"])
+                max_factor_required *= max_partition
+
+        crop = np.array([H, W]) % max_factor_required
+        crop_mask = torch.ones((H, W), dtype=bool)
+
+        # Symmetric crop offsets
+        off_top = math.ceil(crop[0] / 2)
+        off_left = math.ceil(crop[1] / 2)
+        off_bottom = math.floor(crop[0] / 2)
+        off_right = math.floor(crop[1] / 2)
+
+        if off_top > 0:
+            crop_mask[:off_top, :] = False
+        if off_left > 0:
+            crop_mask[:, :off_left] = False
+        if off_bottom > 0:
+            crop_mask[-off_bottom:, :] = False
+        if off_right > 0:
+            crop_mask[:, -off_right:] = False
+
+        cropped_shape = [H - crop[0], W - crop[1]]
+        return crop_mask, cropped_shape, crop
+
+
+    def build_superevent_model(self, config_path: Path, weights_path: Path, device: torch.device):
+        """Initialize and load weights for the SuperEvent model."""
+        config = self.load_superevent_config(config_path)
+
+        if config.get("pixel_wise_predictions", False):
+            model = SuperEventFullRes(config, tracing=False)
+        else:
+            model = SuperEvent(config, tracing=False)
+
+        print(f"[INFO] Loading SuperEvent weights from {weights_path}")
+        state = torch.load(weights_path, map_location=device)
+        # If checkpoint is a dict, extract actual state dict
+        if isinstance(state, dict) and any(k in state for k in ("model", "state_dict")):
+            state = state.get("model", state.get("state_dict", state))
+
+        model.load_state_dict(state)
+        model.to(device).eval()
+        return model, config
+
+
+    def sample_descriptors_at_kpts(self, keypoints, descriptors, Hc, Wc):
+        """
+        Sample descriptors at keypoint locations using bilinear interpolation
+        on the descriptor map.
+
+        keypoints: (N, 2) in (y, x)
+        descriptors: (1, C, Hc, Wc)
+        """
+        # (y, x) -> (x, y)
+        kpts_xy = keypoints.float()[:, [1, 0]]
+
+        grid = torch.zeros(
+            (1, 1, kpts_xy.shape[0], 2),
+            dtype=kpts_xy.dtype,
+            device=kpts_xy.device,
+        )
+        # x-coordinate (width)
+        grid[0, 0, :, 0] = 2.0 * kpts_xy[:, 0] / (Wc - 1) - 1.0
+        # y-coordinate (height)
+        grid[0, 0, :, 1] = 2.0 * kpts_xy[:, 1] / (Hc - 1) - 1.0
+
+        # (1, C, Hc, Wc) + (1, 1, N, 2) -> (1, C, 1, N)
+        desc_sampled = F.grid_sample(
+            descriptors, grid, mode="bilinear", align_corners=True
+        )
+        # -> (N, C)
+        desc_sampled = desc_sampled[0, :, 0, :].t()
+        desc_sampled = F.normalize(desc_sampled, p=2, dim=1)
+        return desc_sampled
+
+
+    def extract_superevent_features_for_dir(self,
+        mcts_dir: Path,
+        out_dir: Path,
+        model,
+        config: dict,
+        device: torch.device,
+        max_frames: int = None,
+        top_k_arg: int = None,
+        force_reextract: bool = False,
+    ):
+        """
+        Extract SuperEvent keypoints/descriptors from all MCTS frames in mcts_dir.
+        Writes mcts_*.feat.npz into out_dir.
+        """
+        out_dir.mkdir(parents=True, exist_ok=True)
+        mcts_files = self.list_mcts_files(mcts_dir)
+        if max_frames is not None:
+            mcts_files = mcts_files[:max_frames]
+
+        # Use the first file to determine shapes and cropping
+        arr0 = self.load_mcts_npz(mcts_files[0])
+        _, H, W = arr0.shape
+        crop_mask, cropped_shape, crop_vec = self.build_crop_mask((H, W), config)
+
+        off_top = math.ceil(crop_vec[0] / 2)
+        off_left = math.ceil(crop_vec[1] / 2)
+        Hc, Wc = cropped_shape
+
+        top_k = top_k_arg if top_k_arg is not None else max(Hc, Wc) // 2
+
+        print(f"[INFO] SuperEvent: {len(mcts_files)} frames in {mcts_dir}")
+        print(f"[INFO] Input HxW: {H}x{W}, cropped to {Hc}x{Wc}, top_k={top_k}")
+
+        for f in tqdm(mcts_files, desc=f"SuperEvent ({mcts_dir.name})"):
+            stem = f.stem        # e.g. 'mcts_00000'
+            out_path = out_dir / f"{stem}.feat.npz"
+
+            if out_path.exists() and not force_reextract:
+                continue
+
+            arr = self.load_mcts_npz(f)
+            ts = torch.from_numpy(arr).unsqueeze(0).to(device=device)  # (1, C, H, W)
+
+            # Apply crop mask
+            ts_crop = ts[..., crop_mask].reshape(1, config["input_channels"], Hc, Wc)
+
+            with torch.no_grad():
+                pred = model(ts_crop)
+
+                # Older versions might return a tuple
+                if isinstance(pred, tuple):
+                    pred = {"prob": pred[0], "descriptors": pred[1]}
+
+                prob = pred["prob"]          # (1, 1, Hc, Wc) or similar
+                desc_map = pred["descriptors"]  # (1, D, Hc, Wc)
+
+                # NMS to get keypoints + scores
+                kpts_all, scores_all = fast_nms(prob, config, top_k=top_k)
+
+                if len(kpts_all) == 0 or len(kpts_all[0]) == 0:
+                    # No keypoints in this frame
+                    np.savez_compressed(
+                        out_path,
+                        keypoints=np.empty((0, 2), dtype=np.float32),
+                        scores=np.empty((0,), dtype=np.float32),
+                        descriptors=np.empty((0, desc_map.shape[1]), dtype=np.float32),
+                        image_shape=np.array([H, W], dtype=np.int32),
+                    )
+                    continue
+
+                kpts = kpts_all[0]        # (N, 2) (y,x) in cropped coords
+                scores = scores_all[0]    # (N,)
+
+                # Sample descriptors at kpts
+                desc_sampled = self.sample_descriptors_at_kpts(kpts.float(), desc_map, Hc, Wc)
+
+                # Undo crop: back to original full image coords
+                kpts_np = kpts.float().cpu().numpy()
+                kpts_np[:, 0] += off_top   # y
+                kpts_np[:, 1] += off_left  # x
+
+                xs = kpts_np[:, 1]
+                ys = kpts_np[:, 0]
+                kpts_xy = np.stack([xs, ys], axis=-1).astype(np.float32)  # (N, 2), (x,y)
+
+                np.savez_compressed(
+                    out_path,
+                    keypoints=kpts_xy,
+                    scores=scores.cpu().numpy(),
+                    descriptors=desc_sampled.cpu().numpy(),
+                    image_shape=np.array([H, W], dtype=np.int32),
+                )
+
     def extract_keypoints(self):
-        pass
+        """
+        Run SuperEvent on the reference and query MCTS sequences
+        and write mcts_*.feat.npz into self.reference_keypoints / self.query_keypoints.
+        """
+        device = self.device  # already set in __init__
+
+        # Resolve SuperEvent config/weights.
+        # Adjust these paths to match your repo layout.
+        superevent_root = Path(THIS_DIR) / "external" / "superevent"
+        config_path = superevent_root / "config" / "super_event.yaml"
+        weights_path = superevent_root / "saved_models" / "super_event_weights.pth"
+
+        if not config_path.exists():
+            raise FileNotFoundError(f"SuperEvent config not found at {config_path}")
+        if not weights_path.exists():
+            raise FileNotFoundError(f"SuperEvent weights not found at {weights_path}")
+
+        # Build model + config
+        model, se_config = self.build_superevent_model(config_path, weights_path, device)
+
+        # MCTS directories (where gen_mcts wrote frames)
+        root = Path(self.data_root)
+        ref_mcts_dir = root / self.dataset / f"mcts_{self.reference}"
+        query_mcts_dir = root / self.dataset / f"mcts_{self.query}"
+
+        if not ref_mcts_dir.exists():
+            raise FileNotFoundError(f"Reference MCTS directory not found: {ref_mcts_dir}")
+        if not query_mcts_dir.exists():
+            raise FileNotFoundError(f"Query MCTS directory not found: {query_mcts_dir}")
+
+        # Output directories for keypoints (already used by rerank/keypoint_inference)
+        self.reference_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.reference}")
+        self.query_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.query}")
+
+        ref_kp_dir = Path(self.reference_keypoints)
+        query_kp_dir = Path(self.query_keypoints)
+
+        # Optional knobs - if you add these to args, they will be on self.
+        max_frames = getattr(self, "max_kp_frames", None)
+        top_k_arg = getattr(self, "kp_top_k", None)
+        force_reextract = getattr(self, "force_kp_reextract", False)
+
+        # Reference
+        self.extract_superevent_features_for_dir(
+            mcts_dir=ref_mcts_dir,
+            out_dir=ref_kp_dir,
+            model=model,
+            config=se_config,
+            device=device,
+            max_frames=max_frames,
+            top_k_arg=top_k_arg,
+            force_reextract=force_reextract,
+        )
+
+        # Query
+        self.extract_superevent_features_for_dir(
+            mcts_dir=query_mcts_dir,
+            out_dir=query_kp_dir,
+            model=model,
+            config=se_config,
+            device=device,
+            max_frames=max_frames,
+            top_k_arg=top_k_arg,
+            force_reextract=force_reextract,
+        )
 
     def rerank(self, kp_pattern="mcts_{:04d}.feat.npz"):
         R, Q = self.distance_matrix.shape
@@ -164,7 +468,6 @@ class EventGeM:
         for q_idx, new_col in results:
             self.new_dist_matrix[:, q_idx] = new_col
 
-
     def keypoint_inference(self):
         # Check if the similarity matrix for specified dataset exists
         sim_matrix_path = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}", f"{self.dataset}_{self.reference}_{self.query}_similarity.pt")
@@ -181,10 +484,10 @@ class EventGeM:
         self.reference_path = os.path.join(root, self.reference, f"mcts_{self.reference}")
         self.query_path = os.path.join(root, self.query, f"mcts_{self.query}")
 
-        if not os.path.exists(self.reference_path):
-            raise FileNotFoundError(f"Reference directory '{self.reference_path}' does not exist.")
-        if not os.path.exists(self.query_path):
-            raise FileNotFoundError(f"Query directory '{self.query_path}' does not exist.")
+        if not os.path.exists(self.reference_path) or not os.path.exists(self.query_path):
+            # Generate MCTS features
+            gen_mcts(root, self.dataset, self.reference, self.query, self.mcts_time)
+            self.extract_keypoints()
         
         # Check if keypoints have been pre-computed
         self.reference_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.reference}")
