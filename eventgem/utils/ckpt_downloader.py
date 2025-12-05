@@ -1,34 +1,25 @@
-import os
-import requests
-import torch
-
-def _get_confirm_token(response):
-    for key, value in response.cookies.items():
-        if key.startswith("download_warning"):
-            return value
-    return None
+import os, requests
+BACKBONE_URL = ("https://drive.usercontent.google.com/download?id=1kH9GAzNHvEBXIcM69TuCgk9VQ9psQYhe&export=download&authuser=0&confirm=t&uuid=80e16a3c-c7a1-48e0-91a6-ea5be2e9c1f9&at=ALWLOp6BrFTh9Q8kE9jGHzFEID6z%3A1764913935890"
+)
 
 
-def _save_response_content(response, destination, chunk_size=32768):
-    with open(destination, "wb") as f:
-        for chunk in response.iter_content(chunk_size):
-            if chunk:  # filter out keep-alive chunks
+def download_backbone_ckpt(dest_path: str, url: str = BACKBONE_URL, chunk_size: int = 1 << 20):
+    """
+    Download the backbone checkpoint from a direct URL into dest_path.
+    Creates parent directories if needed.
+    """
+    dest_dir = os.path.dirname(dest_path)
+    if dest_dir and not os.path.exists(dest_dir):
+        os.makedirs(dest_dir, exist_ok=True)
+
+    # If it already exists, do nothing
+    if os.path.exists(dest_path):
+        return
+
+    resp = requests.get(url, stream=True)
+    resp.raise_for_status()
+
+    with open(dest_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=chunk_size):
+            if chunk:
                 f.write(chunk)
-
-
-def download_file_from_google_drive(destination, file_id="1kH9GAzNHvEBXIcM69TuCgk9VQ9psQYhe"):
-    """
-    Download a file from Google Drive, handling the virus-scan confirmation
-    page for large files.
-    """
-    url = "https://docs.google.com/uc?export=download"
-    session = requests.Session()
-
-    response = session.get(url, params={"id": file_id}, stream=True)
-    token = _get_confirm_token(response)
-
-    if token:
-        params = {"id": file_id, "confirm": token}
-        response = session.get(url, params=params, stream=True)
-
-    _save_response_content(response, destination)
