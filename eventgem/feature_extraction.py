@@ -6,6 +6,7 @@ import sys
 import torch
 import yaml
 import math
+import requests
 
 import numpy as np
 import torch.nn.functional as F
@@ -16,6 +17,7 @@ from joblib import Parallel, delayed
 from eventgem.dataset import EventGeMData
 from eventgem.utils.generate_mcts import gen_mcts
 from eventgem.utils.eventlab_config import update_config
+from eventgem.utils.ckpt_downloader import download_file_from_google_drive
 from eventgem.utils.rerank_utils import load_event_features, process_single_query
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,6 +69,16 @@ class EventGeM:
     def extract_features(self):
         # Define backbone model
         backbone = vit_contrastive_patch16_small(mask_ratio=0.0, in_chans=2, num_classes=512)
+        # Ensure the backbone checkpoint exists
+        if not os.path.exists(self.backbone_ckpt):
+            ckpt_dir = os.path.dirname(self.backbone_ckpt)
+            if ckpt_dir and not os.path.exists(ckpt_dir):
+                os.makedirs(ckpt_dir, exist_ok=True)
+
+            print(f"[EventGeM] Downloading backbone checkpoint to {self.backbone_ckpt}...")
+            download_file_from_google_drive(self.backbone_ckpt)
+            print("[EventGeM] Download complete.")
+
         checkpoint = torch.load(self.backbone_ckpt, map_location='cpu')
 
         # Load checkpoint
