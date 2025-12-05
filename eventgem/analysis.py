@@ -35,7 +35,7 @@ def recall(original, reranked, gt, k=[1, 5, 10, 20, 25]):
     # Ensure shapes match
     if gt.shape != original.shape:
         gt = resize(gt, original.shape, order=0, preserve_range=True, anti_aliasing=False)
-    gt_tol = create_GTtol(gt, tolerance=200)
+    gt_tol = create_GTtol(gt, tolerance=100)
 
     table = PrettyTable()
     table.field_names = ["K", "Recall (Base)", "Recall (Geometric)"]

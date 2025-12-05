@@ -117,15 +117,13 @@ class EventGeM:
     def feature_inference(self):
         # Check that the specified datasets exist - need frame reconstructued directories
         root = self.data_root
-        self.reference_path = os.path.join(root, self.reference, f"{self.reference}-frames-{self.recon_msec}")
-        self.query_path = os.path.join(root, self.query, f"{self.query}-frames-{self.recon_msec}")
+        self.reference_path = os.path.join(root, self.dataset, self.reference, f"{self.reference}-frames-{self.recon_msec}")
+        self.query_path = os.path.join(root, self.dataset, self.query, f"{self.query}-frames-{self.recon_msec}")
 
-        if not os.path.exists(self.reference_path):
+        if not os.path.exists(self.reference_path) or not os.path.exists(self.query_path):
             # Updat the eventlab config and generate the data
             update_config(root, self.dataset, self.reference, self.query, time=self.recon_msec)
             eventlab_data() # generates the data with specified arguments
-        if not os.path.exists(self.query_path):
-            raise FileNotFoundError(f"Query directory '{self.query_path}' does not exist - something went wrong with the Event-LAB Data generation.")
         
         # Check if features have been pre-computed
         outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")

@@ -9,7 +9,7 @@ def main():
     
     # Dataset parameters
     parser.add_argument("--dataset", "-d", type=str, required=True, 
-                            choices=["brisbane-event", "nsavp", "qcr-event", "fast-slow"],
+                            choices=["brisbane_event", "nsavp", "qcr-event", "fast-slow"],
                             help="Dataset to use for evaluation")
     parser.add_argument("--reference", "-r", type=str, required=True, 
                             help="Reference directory to use for evaluation")
