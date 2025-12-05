@@ -12,6 +12,7 @@ from tqdm import tqdm
 from pathlib import Path
 from joblib import Parallel, delayed
 from eventgem.dataset import EventGeMData
+from eventgem.utils.eventlab_config import update_config, eventlab_data
 from eventgem.utils.rerank_utils import load_event_features, process_single_query
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -120,9 +121,11 @@ class EventGeM:
         self.query_path = os.path.join(root, self.query, f"{self.query}-frames-{self.recon_msec}")
 
         if not os.path.exists(self.reference_path):
-            raise FileNotFoundError(f"Reference directory '{self.reference_path}' does not exist.")
+            # Updat the eventlab config and generate the data
+            update_config(root, self.dataset, self.reference, self.query, time=self.recon_msec)
+            eventlab_data() # generates the data with specified arguments
         if not os.path.exists(self.query_path):
-            raise FileNotFoundError(f"Query directory '{self.query_path}' does not exist.")
+            raise FileNotFoundError(f"Query directory '{self.query_path}' does not exist - something went wrong with the Event-LAB Data generation.")
         
         # Check if features have been pre-computed
         outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")

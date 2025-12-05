@@ -19,6 +19,7 @@ superevent = ["superevent"]
 prettytable = "*"
 scikit-image = "*"
 matplotlib = "*"
+yaml = "*"
 
 [feature.backbone.dependencies]
 python = ">3.8"
