@@ -11,6 +11,9 @@ cuda = "12"
 [tasks]
 demo = {cmd = "pixi run -e backbone python3 main.py -d brisbane_event -r sunrise -q sunset2 --mode feature-extract && pixi run -e superevent python3 main.py -d brisbane_event -r sunrise -q sunset2 --mode keypoints"}
 
+features = {cmd = "pixi run -e backbone python3 main.py --mode feature-extract"}
+keypoints = {cmd = "pixi run -e superevent python3 main.py --mode keypoints"}
+
 [environments]
 backbone = ["backbone"]
 superevent = ["superevent"]

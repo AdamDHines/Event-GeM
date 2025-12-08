@@ -95,9 +95,9 @@ def mcts_numpy(
     if x.size == 0:
         return mcts
 
-    # Sort by time (ascending)
-    order = np.argsort(t)
-    x, y, t, p = x[order], y[order], t[order], p[order]
+    # # Sort by time (ascending)
+    # order = np.argsort(t)
+    # x, y, t, p = x[order], y[order], t[order], p[order]
 
     # Split by polarity: p>0 -> positive, p<=0 -> negative
     for pol_idx, pol_sign in enumerate((1, -1)):
@@ -312,12 +312,13 @@ def gen_mcts(root, dataset, reference, query, mcts_time, chunk_size=500_000, max
         config = yaml.safe_load(open(config_path, 'r'))
         ref_start = config['other']['offset'][reference]
         query_start = config['other']['offset'][query]
-    else:
-        time_scale = 1e-6  # microseconds to seconds
+    elif dataset == "nsavp":
+        time_scale = 1e-9  # microseconds to seconds
         ref_start = 0.0
         query_start = 0.0
-        # TODO: set H, W for other datasets
-        raise ValueError(f"Unknown dataset {dataset}, please set H/W and time_scale.")
+        H, W = 480, 640
+    else:
+        raise NotImplementedError(f"Dataset not supported for MCTS generation: {dataset}")
 
     # Reference sequence
     if not os.path.exists(ref_dir):

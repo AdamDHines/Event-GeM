@@ -9,30 +9,32 @@ def main():
     parser = argparse.ArgumentParser(description="Event-GeM: Pre-trained feature extraction and 2D-homology re-reanking for visual place recognition")
     
     # Dataset parameters
-    parser.add_argument("--dataset", "-d", type=str, required=True, 
+    parser.add_argument("--dataset", "-d", type=str,  
                             choices=["brisbane_event", "nsavp", "qcr-event", "fast-slow"],
                             help="Dataset to use for evaluation")
-    parser.add_argument("--reference", "-r", type=str, required=True, 
+    parser.add_argument("--reference", "-r", type=str, 
                             help="Reference directory to use for evaluation")
-    parser.add_argument("--query", "-q", type=str, required=True, 
+    parser.add_argument("--query", "-q", type=str, 
                             help="Query directory to use for evaluation")
     parser.add_argument("--recon-msec", type=int, default=50,
                             help="Reconstruction time window in milliseconds for event datasets")
     parser.add_argument("--mcts-time", type=float, nargs='+', default=[1e-3, 1e-2, 3e-2, 4e-2, 5e-2],
                             help="Space-separated list of temporal window sizes in seconds.")
-    parser.add_argument("--data-root", type=str, default="./dataset", 
+    parser.add_argument("--data-root", type=str, default="/media/adam/vprdatasets/eventgem", 
                             help="Root directory for datasets")
     
     # Model parameters
     parser.add_argument("--backbone-ckpt", type=str, default="./eventgem/ckpt/pr.pt",
                             help="Path to the backbone checkpoint")
-    parser.add_argument("--top-k", type=int, default=100,
+    parser.add_argument("--top-k", type=int, default=50,
                             help="Number of top candidates to re-rank using 2D-homology")
     parser.add_argument("--ransac-thresh", type=float, default=5.0, 
                             help="RANSAC pixel threshold (e.g. 3-5 px)")
     parser.add_argument("--inlier-weight", type=float, default=0.05, 
                             help="Distance subtraction per inlier")
-    parser.add_argument("--batch-size", type=int, default=32,
+    parser.add_argument("--backbone_batch-size", type=int, default=32,
+                            help="Batch size for feature extraction")
+    parser.add_argument("--keypoint_batch-size", type=int, default=16,
                             help="Batch size for feature extraction")
     parser.add_argument("--feature-out", type=str, default="./eventgem/features",
                             help="Directory to save extracted features")
@@ -42,8 +44,6 @@ def main():
     # Togglable operation
     parser.add_argument("--mode", type=str, default="feature-extract", choices=["feature-extract", "keypoints"],
                             help="Operation mode: feature extraction or keypoint detection")
-    parser.add_argument("--re-extract", action="store_true",
-                            help="Re-extract features/keypoints even if they already exist")
     args = parser.parse_args()
 
     # Initialize and run Event-GeM inference

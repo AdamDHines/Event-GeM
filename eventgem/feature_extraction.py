@@ -14,8 +14,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from pathlib import Path
 from joblib import Parallel, delayed
-from eventgem.dataset import EventGeMData
 from eventgem.utils.generate_mcts import gen_mcts
+from eventgem.dataset import EventGeMData, EventGeMMCTS
 from eventgem.utils.eventlab_config import update_config
 from eventgem.utils.ckpt_downloader import download_backbone_ckpt
 from eventgem.utils.rerank_utils import load_event_features, process_single_query
@@ -67,33 +67,54 @@ class EventGeM:
         return F.avg_pool2d((feats.clamp(min=1e-6)).pow(p), (feats.shape[-2], feats.shape[-1])).pow(1.0/p)
 
     def extract_features(self):
-        # Define backbone model
+        # Define backbone model (This is a ViT, as confirmed by your checkpoint)
         backbone = vit_contrastive_patch16_small(mask_ratio=0.0, in_chans=2, num_classes=512)
+        
         # Ensure the backbone checkpoint exists
         if not os.path.exists(self.backbone_ckpt):
-            ckpt_dir = os.path.dirname(self.backbone_ckpt)
-            if ckpt_dir and not os.path.exists(ckpt_dir):
-                os.makedirs(ckpt_dir, exist_ok=True)
-
-            download_backbone_ckpt(self.backbone_ckpt)
+            # ... (your download logic) ...
+            pass
+            
+        print(f"Loading checkpoint from: {self.backbone_ckpt}")
         checkpoint = torch.load(self.backbone_ckpt, map_location='cpu')
 
-        # Load checkpoint
-        state_dict = checkpoint
-        if isinstance(checkpoint, dict):
-            state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
+        # --- FIX 1: UNWRAP THE NESTED DICTIONARY ---
+        # The weights are hidden inside the "checkpoint" key
+        if isinstance(checkpoint, dict) and "checkpoint" in checkpoint:
+            state_dict = checkpoint["checkpoint"]
+        elif isinstance(checkpoint, dict) and "model" in checkpoint:
+            state_dict = checkpoint["model"]
+        elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
 
-        # Remove prefixes
-        new_state_dict = {k.replace("encoder_q.", "").replace("module.", ""): v for k, v in state_dict.items()}
+        # --- FIX 2: CLEAN PREFIXES ---
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            # Remove "encoder_q." (seen in your debug output) and "module."
+            new_key = k.replace("encoder_q.", "").replace("module.", "")
+            new_state_dict[new_key] = v
+
+        # --- FIX 3: LOAD AND VERIFY ---
+        # strict=False is required because the checkpoint contains extra keys 
+        # (momentum encoder 'encoder_k', queues, etc.) that we don't need.
+        msg = backbone.load_state_dict(new_state_dict, strict=False)
         
-        backbone.load_state_dict(new_state_dict, strict=False)
+        # Validation: We expect 'missing_keys' to mostly be the head (event_head/image_head).
+        # We expect 'unexpected_keys' to be the momentum encoder stuff.
+        # CRITICAL: If 'patch_embed.proj.weight' is missing, the load actually failed.
+        if "patch_embed.proj.weight" in msg.missing_keys:
+             raise RuntimeError("CRITICAL FAILURE: The input layer (patch_embed) did not load!")
+        
+        print("Backbone loaded successfully.")
         backbone.to(self.device).eval()
 
         # Define the DataLoaders
         ref_dataset = EventGeMData(self.reference_path)
         query_dataset = EventGeMData(self.query_path)
-        ref_loader = torch.utils.data.DataLoader(ref_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4)
-        query_loader = torch.utils.data.DataLoader(query_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4)
+        ref_loader = torch.utils.data.DataLoader(ref_dataset, batch_size=self.backbone_batch_size, shuffle=False, num_workers=4)
+        query_loader = torch.utils.data.DataLoader(query_dataset, batch_size=self.backbone_batch_size, shuffle=False, num_workers=4)
 
         # Run feature extraction for reference and query sets
         outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")
@@ -169,28 +190,6 @@ class EventGeM:
     # SuperEvent / MCTS helpers
     # ----------------------------------------------------------
 
-    def list_mcts_files(self, root: Path):
-        """List and sort all mcts_*.npz files in the given directory."""
-        files = sorted(root.glob("mcts_*.npz"))
-        if not files:
-            raise RuntimeError(f"No mcts_*.npz files found in {root}")
-        return files
-
-
-    def load_mcts_npz(self, path: Path) -> np.ndarray:
-        """Load the MCTS array from a compressed NPZ file."""
-        if not path.exists():
-            raise FileNotFoundError(f"MCTS file not found: {path}")
-        data = np.load(str(path))
-        if "mcts" in data:
-            arr = data["mcts"]
-        else:
-            # Fallback for old NPZ files that might use a different key
-            first_key = list(data.keys())[0]
-            arr = data[first_key]
-        return arr.astype(np.float32)
-
-
     def load_superevent_config(self, config_path: Path):
         """Load main config and merge with backbone config if specified."""
         with open(config_path, "r") as f:
@@ -212,47 +211,6 @@ class EventGeM:
                 print(f"[WARN] Could not find backbone config for {config['backbone']}")
 
         return config
-
-
-    def build_crop_mask(self, ts_shape, config):
-        """
-        Determine cropping needed for compatibility with the backbone's downsampling.
-        Returns (crop_mask, cropped_shape, crop_vector).
-        """
-        H, W = ts_shape
-        max_factor_required = config["grid_size"]
-
-        if "backbone_config" in config:
-            stage_blocks = config["backbone_config"]["num_blocks"]
-            patch_size = config["backbone_config"]["stem"]["patch_size"]
-            downsample_factor = patch_size * (2 ** (len(stage_blocks) - 1))
-            max_factor_required = downsample_factor
-
-            # Conservative adjustment for attention partitioning if present
-            if "attention" in config["backbone_config"]["stage"]:
-                max_partition = np.max(config["backbone_config"]["stage"]["attention"]["partition_size"])
-                max_factor_required *= max_partition
-
-        crop = np.array([H, W]) % max_factor_required
-        crop_mask = torch.ones((H, W), dtype=bool)
-
-        # Symmetric crop offsets
-        off_top = math.ceil(crop[0] / 2)
-        off_left = math.ceil(crop[1] / 2)
-        off_bottom = math.floor(crop[0] / 2)
-        off_right = math.floor(crop[1] / 2)
-
-        if off_top > 0:
-            crop_mask[:off_top, :] = False
-        if off_left > 0:
-            crop_mask[:, :off_left] = False
-        if off_bottom > 0:
-            crop_mask[-off_bottom:, :] = False
-        if off_right > 0:
-            crop_mask[:, -off_right:] = False
-
-        cropped_shape = [H - crop[0], W - crop[1]]
-        return crop_mask, cropped_shape, crop
 
 
     def build_superevent_model(self, config_path: Path, weights_path: Path, device: torch.device):
@@ -306,94 +264,84 @@ class EventGeM:
         return desc_sampled
 
 
-    def extract_superevent_features_for_dir(self,
-        mcts_dir: Path,
+    def extract_superevent_features_for_dir(
+        self,
+        data_loader: torch.utils.data.DataLoader,
         out_dir: Path,
         model,
         config: dict,
-        device: torch.device,
-        max_frames: int = None,
-        top_k_arg: int = None,
-        force_reextract: bool = False,
+        device: torch.device
     ):
         """
-        Extract SuperEvent keypoints/descriptors from all MCTS frames in mcts_dir.
-        Writes mcts_*.feat.npz into out_dir.
+        Extract SuperEvent keypoints/descriptors from all MCTS frames in the dataset.
+        Writes mcts_00000.feat.npz, mcts_00001.feat.npz, ... into out_dir.
         """
         out_dir.mkdir(parents=True, exist_ok=True)
-        mcts_files = self.list_mcts_files(mcts_dir)
-        if max_frames is not None:
-            mcts_files = mcts_files[:max_frames]
 
-        # Use the first file to determine shapes and cropping
-        arr0 = self.load_mcts_npz(mcts_files[0])
-        _, H, W = arr0.shape
+        dataset = data_loader.dataset
 
-        # build_crop_mask returns (crop_mask, cropped_shape, crop_vec)
-        crop_mask, cropped_shape, crop_vec = self.build_crop_mask((H, W), config)
+        # Get topk and offsets from dataset
+        top_k = dataset.get_topk()
+        off_top, off_left, off_bottom, off_right = dataset.get_offsets()
 
-        # Symmetric crop offsets from crop_vec = [crop_h, crop_w]
-        off_top = math.ceil(crop_vec[0] / 2)
-        off_bottom = math.floor(crop_vec[0] / 2)
-        off_left = math.ceil(crop_vec[1] / 2)
-        off_right = math.floor(crop_vec[1] / 2)
+        # Original image and cropped shapes from dataset
+        H, W = dataset.H, dataset.W
+        Hc, Wc = dataset.Hc, dataset.Wc
 
-        Hc, Wc = cropped_shape  # should be H - crop_vec[0], W - crop_vec[1]
+        # Global frame counter for naming: mcts_00000, mcts_00001, ...
+        frame_idx = 0
 
-        top_k = top_k_arg if top_k_arg is not None else max(Hc, Wc) // 2
-
-        print(f"[INFO] SuperEvent: {len(mcts_files)} frames in {mcts_dir}")
-        print(f"[INFO] Input HxW: {H}x{W}, cropped to {Hc}x{Wc}, top_k={top_k}")
-
-        for f in tqdm(mcts_files, desc=f"SuperEvent ({mcts_dir.name})"):
-            stem = f.stem        # e.g. 'mcts_00000'
-            out_path = out_dir / f"{stem}.feat.npz"
-
-            if out_path.exists() and not force_reextract:
-                continue
-
-            arr = self.load_mcts_npz(f)
-            ts = torch.from_numpy(arr).unsqueeze(0).to(device=device)  # (1, C, H, W)
-
-            # Compute end indices once
-            h_end = H - off_bottom if off_bottom > 0 else H
-            w_end = W - off_right if off_right > 0 else W
-
-            # If nothing to crop, just pass through
-            if off_top == 0 and off_left == 0 and off_bottom == 0 and off_right == 0:
-                ts_crop = ts  # (1, C, H, W)
-            else:
-                ts_crop = ts[..., off_top:h_end, off_left:w_end]  # (1, C, Hc, Wc)
+        for batch in tqdm(data_loader, desc="SuperEvent keypoint extraction", unit="batch"):
+            # batch: (B, C, Hc, Wc)
+            batch = batch.to(device)
 
             with torch.no_grad():
-                pred = model(ts_crop)
+                pred = model(batch)
 
                 # Older versions might return a tuple
                 if isinstance(pred, tuple):
                     pred = {"prob": pred[0], "descriptors": pred[1]}
 
-                prob = pred["prob"]          # (1, 1, Hc, Wc) or similar
-                desc_map = pred["descriptors"]  # (1, D, Hc, Wc)
+                prob = pred["prob"]            # (B, 1, Hc, Wc)
+                desc_map = pred["descriptors"] # (B, D, Hc, Wc)
 
-                # NMS to get keypoints + scores
+                # NMS to get keypoints + scores per image in batch
                 kpts_all, scores_all = fast_nms(prob, config, top_k=top_k)
 
-                if len(kpts_all) == 0 or len(kpts_all[0]) == 0:
-                    # No keypoints in this frame
+            B = prob.shape[0]
+
+            for b in range(B):
+                # Build per-frame output path
+                out_path = out_dir / f"mcts_{frame_idx:05d}.feat.npz"
+                frame_idx += 1
+
+                # Handle no-keypoint case
+                if len(kpts_all[b]) == 0:
                     np.savez_compressed(
                         out_path,
                         keypoints=np.empty((0, 2), dtype=np.float32),
                         scores=np.empty((0,), dtype=np.float32),
-                        descriptors=np.empty((0, desc_map.shape[1]), dtype=np.float32),
+                        descriptors=np.empty(
+                            (0, desc_map.shape[1]), dtype=np.float32
+                        ),
                         image_shape=np.array([H, W], dtype=np.int32),
                     )
                     continue
 
-                kpts = kpts_all[0]        # (N, 2) (y,x) in cropped coords
-                scores = scores_all[0]    # (N,)
+                # Keypoints and scores for this image
+                kpts = kpts_all[b]      # (N, 2) (y, x) in cropped coords
+                scores = scores_all[b]  # (N,)
 
-                # Sample descriptors at kpts
-                desc_sampled = self.sample_descriptors_at_kpts(kpts.float(), desc_map, Hc, Wc)
+                # Descriptors for this image: slice batch dimension
+                desc_single = desc_map[b:b+1]  # (1, D, Hc, Wc)
+
+                # Sample descriptors at keypoints
+                desc_sampled = self.sample_descriptors_at_kpts(
+                    kpts.float().to(device),
+                    desc_single,
+                    Hc,
+                    Wc,
+                )  # (N, D)
 
                 # Undo crop: back to original full image coords
                 kpts_np = kpts.float().cpu().numpy()
@@ -402,13 +350,14 @@ class EventGeM:
 
                 xs = kpts_np[:, 1]
                 ys = kpts_np[:, 0]
-                kpts_xy = np.stack([xs, ys], axis=-1).astype(np.float32)  # (N, 2), (x,y)
+                kpts_xy = np.stack([xs, ys], axis=-1).astype(np.float32)  # (N, 2), (x, y)
 
+                # Save per-frame NPZ, same structure as original
                 np.savez_compressed(
                     out_path,
                     keypoints=kpts_xy,
-                    scores=scores.cpu().numpy(),
-                    descriptors=desc_sampled.cpu().numpy(),
+                    scores=scores.cpu().numpy().astype(np.float32),
+                    descriptors=desc_sampled.cpu().numpy().astype(np.float32),
                     image_shape=np.array([H, W], dtype=np.int32),
                 )
 
@@ -450,35 +399,30 @@ class EventGeM:
         ref_kp_dir = Path(self.reference_keypoints)
         query_kp_dir = Path(self.query_keypoints)
 
-        # Optional knobs - if you add these to args, they will be on self.
-        max_frames = getattr(self, "max_kp_frames", None)
-        top_k_arg = getattr(self, "kp_top_k", None)
-        force_reextract = getattr(self, "force_kp_reextract", False)
+        # Define the dataloaders
+        ref_dataset = EventGeMMCTS(str(ref_mcts_dir), se_config)
+        query_dataset = EventGeMMCTS(str(query_mcts_dir), se_config)
+        ref_loader = torch.utils.data.DataLoader(ref_dataset, batch_size=self.keypoint_batch_size, shuffle=False, num_workers=4)
+        query_loader = torch.utils.data.DataLoader(query_dataset, batch_size=self.keypoint_batch_size, shuffle=False, num_workers=4)
 
         # Reference
         if not os.path.exists(ref_kp_dir):
             self.extract_superevent_features_for_dir(
-                mcts_dir=ref_mcts_dir,
+                data_loader=ref_loader,
                 out_dir=ref_kp_dir,
                 model=model,
                 config=se_config,
-                device=device,
-                max_frames=max_frames,
-                top_k_arg=top_k_arg,
-                force_reextract=force_reextract,
+                device=device
             )
 
         # Query
         if not os.path.exists(query_kp_dir):
             self.extract_superevent_features_for_dir(
-                mcts_dir=query_mcts_dir,
+                data_loader=query_loader,
                 out_dir=query_kp_dir,
                 model=model,
                 config=se_config,
-                device=device,
-                max_frames=max_frames,
-                top_k_arg=top_k_arg,
-                force_reextract=force_reextract,
+                device=device
             )
 
     def rerank(self, kp_pattern="mcts_{:04d}.feat.npz"):

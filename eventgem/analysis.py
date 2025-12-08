@@ -16,7 +16,7 @@ def create_GTtol(GT: np.ndarray, tolerance: int) -> np.ndarray:
         GTtol[r0:r1, c0:c1] = 1
     return GTtol
 
-def recall(original, reranked, gt, k=[1, 5, 10, 20, 25]):
+def recall(original, reranked, gt, k=[1, 5, 10]):
     """
     Computes Recall@K for original and re-ranked results.
     Args:
@@ -35,14 +35,14 @@ def recall(original, reranked, gt, k=[1, 5, 10, 20, 25]):
     # Ensure shapes match
     if gt.shape != original.shape:
         gt = resize(gt, original.shape, order=0, preserve_range=True, anti_aliasing=False)
-    gt_tol = create_GTtol(gt, tolerance=100)
+    # gt_tol = create_GTtol(gt, tolerance=200)
 
     table = PrettyTable()
     table.field_names = ["K", "Recall (Base)", "Recall (Geometric)"]
     
-    for k in [1, 5, 10, 20, 25]:
-        r_b = recallAtK((1-original), gt_tol, k)
-        r_n = recallAtK((1-reranked), gt_tol, k)
+    for k in [1, 5, 10]:
+        r_b = recallAtK((1-original), gt, k)
+        r_n = recallAtK((1-reranked), gt, k)
         table.add_row([k, f"{r_b:.4f}", f"{r_n:.4f}"])
 
     print(table)
