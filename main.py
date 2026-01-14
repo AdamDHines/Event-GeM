@@ -1,4 +1,3 @@
-from html import parser
 import os
 import argparse
 import numpy as np
@@ -10,7 +9,7 @@ def main():
     
     # Dataset parameters
     parser.add_argument("--dataset", "-d", type=str,  
-                            choices=["brisbane_event", "nsavp", "qcr-event", "fast-slow"],
+                            choices=["brisbane_event", "nsavp", "fast_slow"],
                             help="Dataset to use for evaluation")
     parser.add_argument("--reference", "-r", type=str, 
                             help="Reference directory to use for evaluation")
@@ -18,9 +17,9 @@ def main():
                             help="Query directory to use for evaluation")
     parser.add_argument("--recon-msec", type=int, default=50,
                             help="Reconstruction time window in milliseconds for event datasets")
-    parser.add_argument("--mcts-time", type=float, nargs='+', default=[1e-3, 1e-2, 3e-2, 4e-2, 5e-2],
-                            help="Space-separated list of temporal window sizes in seconds.")
-    parser.add_argument("--data-root", type=str, default="/media/adam/vprdatasets/eventgem", 
+    parser.add_argument("--mcts-time", type=float, nargs='+', default=[10000, 20000, 30000, 40000, 50000],
+                            help="Space-separated list of temporal window sizes in nsec.")
+    parser.add_argument("--data-root", type=str, default="./datasets", 
                             help="Root directory for datasets")
     
     # Model parameters
@@ -54,6 +53,7 @@ def main():
         original, reranked = eventgem.keypoint_inference()
         # Run Recall@K evaluation
         gt = np.load(os.path.join(args.data_root, args.dataset, "ground_truth", f"{args.reference}_{args.query}_GT.npy"))
+        # gt = None
         recall(original, reranked, gt)
 
 if __name__ == "__main__":

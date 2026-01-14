@@ -8,15 +8,67 @@ import os
 
 # ---------- HDF5 helpers ----------
 
+
+EVENT_T_KEYS = ("t", "timestamp", "timestamps", "time", "times")
+EVENT_X_KEYS = ("x", "x_coordinate", "x_coordinates", "u", "col", "column")
+EVENT_Y_KEYS = ("y", "y_coordinate", "y_coordinates", "v", "row")
+EVENT_P_KEYS = ("p", "polarity", "polarities", "pol", "polarity_bit", "polarity_bits")
+
+
+def _find_first_dataset(g: h5py.Group, candidates: tuple[str, ...], logical_name: str):
+    """
+    Return the first dataset in `g` (or any of its subgroups) whose name matches
+    one of `candidates`.
+
+    This handles layouts like:
+      /x, /y, /t, /p
+    as well as:
+      /columns/x, /columns/y, /columns/t, /columns/p
+    or deeper trees under 'events'.
+    """
+
+    # 1) Try direct children first (original behaviour)
+    for key in candidates:
+        if key in g:
+            obj = g[key]
+            if isinstance(obj, h5py.Dataset):
+                return obj
+
+    # 2) If not found, search recursively in sub-groups
+    for name, obj in g.items():
+        if isinstance(obj, h5py.Group):
+            try:
+                return _find_first_dataset(obj, candidates, logical_name)
+            except RuntimeError:
+                # No match in this subgroup, keep looking
+                continue
+
+    raise RuntimeError(
+        f"Could not find {logical_name} dataset under group '{g.name}'. "
+        f"Tried names: {', '.join(candidates)}"
+    )
+
+
 def find_event_datasets(f: h5py.File):
-    """Return (x, y, t, p) datasets from an HDF5 file with group 'events'."""
-    if "events" not in f or not isinstance(f["events"], h5py.Group):
-        raise RuntimeError("Expected a group 'events' in the HDF5 file.")
-    g = f["events"]
-    for key in ["x", "y", "t", "p"]:
-        if key not in g:
-            raise RuntimeError(f"Expected dataset 'events/{key}' in the HDF5 file.")
-    return g["x"], g["y"], g["t"], g["p"]
+    """
+    Return (x, y, t, p) datasets from an HDF5 file.
+
+    Looks in group 'events' if it exists (and is a group), otherwise
+    falls back to the file root. For each component, tries multiple
+    possible key names defined in EVENT_*_KEYS.
+    """
+    if "events" in f and isinstance(f["events"], h5py.Group):
+        g = f["events"]
+    else:
+        # Some datasets store x/y/t/p directly at the root
+        g = f
+
+    x_ds = _find_first_dataset(g, EVENT_X_KEYS, "x")
+    y_ds = _find_first_dataset(g, EVENT_Y_KEYS, "y")
+    t_ds = _find_first_dataset(g, EVENT_T_KEYS, "t")
+    p_ds = _find_first_dataset(g, EVENT_P_KEYS, "p")
+
+    return x_ds, y_ds, t_ds, p_ds
 
 
 def binary_search_event_index(t_dset, target_time_sec, time_scale):
@@ -165,18 +217,178 @@ def _generate_mcts_for_file(
     chunk_size: int = 500_000,
     max_frames = None,
     start_time_sec: float = 0.0,
+    use_event_counts: bool = False,   # <-- NEW FLAG
 ):
-    """Generate MCTS frames for a single HDF5 file."""
+    """Generate MCTS frames for a single HDF5 file.
+
+    If use_event_counts is False:
+        - Behaves as before: time_windows are in seconds, frames step by DT_MAX.
+
+    If use_event_counts is True:
+        - time_windows are interpreted as event counts.
+        - The largest window (time_windows[-1]) is the number of events per frame.
+        - Frames are generated every E_MAX events, starting after start_time_sec.
+        - 'Time' in mcts_numpy is replaced by event indices.
+    """
     if not h5_path.exists():
         raise FileNotFoundError(f"HDF5 file not found: {h5_path}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    DT_MAX = float(time_windows[-1])  # max window size in seconds
-
     with h5py.File(h5_path, "r") as f:
         x_dset, y_dset, t_dset, p_dset = find_event_datasets(f)
         N = len(t_dset)
+
+        if N == 0:
+            print(f"[WARN] No events in file: {h5_path}")
+            return
+
+        # -----------------------------
+        # EVENT-COUNT-BASED MODE
+        # -----------------------------
+        if use_event_counts:
+            event_windows = np.array(time_windows, dtype=np.int64)
+            if np.any(event_windows <= 0):
+                raise ValueError(f"All event windows must be > 0 in event-count mode, got: {event_windows}")
+
+            E_MAX = int(event_windows[-1])
+            if E_MAX <= 0:
+                raise ValueError("Largest event window (E_MAX) must be > 0.")
+
+            # Respect start_time_sec by converting it to an event index
+            seek_idx = binary_search_event_index(t_dset, start_time_sec, time_scale)
+            read_idx = seek_idx + 1  # start just AFTER the start_time_sec
+
+            if read_idx >= N:
+                print(f"[WARN] Start time is beyond the end of the file or file is empty: {h5_path}")
+                return
+
+            first_idx = read_idx
+            remaining_events = N - first_idx
+            if remaining_events < E_MAX:
+                print(
+                    f"[WARN] Not enough events after start_time_sec for even one MCTS frame "
+                    f"(needed {E_MAX}, have {remaining_events}) in file: {h5_path}"
+                )
+                return
+
+            # Step size in events between frames (analogous to stepping by DT_MAX in time)
+            step_events = E_MAX
+
+            # Estimate number of frames
+            est_frames = (remaining_events - E_MAX) // step_events + 1
+            total_frames = est_frames if max_frames is None else min(est_frames, max_frames)
+
+            print(f"[INFO] File: {h5_path}")
+            print(f"[INFO] Mode: EVENT-COUNT-BASED")
+            print(f"[INFO] Total events: {N}, starting at index {first_idx}")
+            print(f"[INFO] Event windows: {event_windows}")
+            print(f"[INFO] E_MAX (events per frame): {E_MAX}")
+            print(f"[INFO] Estimated frames: {est_frames}, generating: {total_frames}")
+
+            # Streaming buffers for x, y, p
+            buf_x = np.empty(0, dtype=np.int64)
+            buf_y = np.empty(0, dtype=np.int64)
+            buf_p = np.empty(0, dtype=np.int8)
+
+            buffer_start_idx = first_idx  # global index of buf_x[0]
+            read_idx = first_idx
+
+            # First frame reference index (global)
+            ref_idx = first_idx + E_MAX - 1
+
+            frame_idx = 0
+            pbar = tqdm(total=total_frames, desc=f"MCTS frames ({h5_path.name}) [events]")
+
+            while frame_idx < total_frames:
+                # 1. Make sure we have all events up to ref_idx in the buffer
+                while (buffer_start_idx + buf_x.size - 1) < ref_idx and read_idx < N:
+                    end_idx = min(N, read_idx + chunk_size)
+
+                    c_x = x_dset[read_idx:end_idx].astype(np.int64)
+                    c_y = y_dset[read_idx:end_idx].astype(np.int64)
+                    c_p = p_dset[read_idx:end_idx].astype(np.int8)
+
+                    if buf_x.size == 0:
+                        buf_x, buf_y, buf_p = c_x, c_y, c_p
+                        buffer_start_idx = read_idx
+                    else:
+                        buf_x = np.concatenate([buf_x, c_x])
+                        buf_y = np.concatenate([buf_y, c_y])
+                        buf_p = np.concatenate([buf_p, c_p])
+
+                    read_idx = end_idx
+
+                # If we still don't have enough, we are done
+                if (buffer_start_idx + buf_x.size - 1) < ref_idx:
+                    print(f"[INFO] Reached end of file earlier than expected at frame {frame_idx}.")
+                    break
+
+                # 2. Define the window [win_start_global, win_end_global] (inclusive)
+                win_end_global = ref_idx
+                win_start_global = win_end_global - (E_MAX - 1)
+
+                if win_start_global < buffer_start_idx:
+                    # This shouldn't normally happen if we prune correctly, but guard anyway
+                    win_start_global = buffer_start_idx
+                    # Adjust to maintain E_MAX length if possible
+                    win_end_global = min(win_start_global + E_MAX - 1, buffer_start_idx + buf_x.size - 1)
+
+                start_local = win_start_global - buffer_start_idx
+                end_local = win_end_global - buffer_start_idx
+
+                x_win = buf_x[start_local:end_local + 1]
+                y_win = buf_y[start_local:end_local + 1]
+                p_win = buf_p[start_local:end_local + 1]
+
+                # Pseudo-time = event indices, used as "t"
+                t_win = np.arange(win_start_global, win_end_global + 1, dtype=np.float64)
+                t_ref = float(win_end_global)
+
+                # 3. Compute MCTS using event-index "time"
+                mcts = mcts_numpy(
+                    x_win,
+                    y_win,
+                    t_win,
+                    p_win,
+                    height=H,
+                    width=W,
+                    t_ref=t_ref,
+                    time_windows=event_windows.astype(np.float64),
+                )
+
+                # 4. Save and step forward in event index
+                out_path = out_dir / f"mcts_{frame_idx:05d}.npz"
+                np.savez_compressed(out_path, mcts=mcts, t_ref=t_ref)
+
+                frame_idx += 1
+                pbar.update(1)
+
+                # Next frame
+                ref_idx += step_events
+                if ref_idx >= N:
+                    # No more full windows
+                    break
+
+                # 5. Prune buffer events that are no longer needed:
+                #    for the *next* window, earliest index will be ref_idx - (E_MAX - 1)
+                next_win_start_global = ref_idx - (E_MAX - 1)
+                if next_win_start_global > buffer_start_idx:
+                    drop = next_win_start_global - buffer_start_idx
+                    if drop > 0:
+                        buf_x = buf_x[drop:]
+                        buf_y = buf_y[drop:]
+                        buf_p = buf_p[drop:]
+                        buffer_start_idx = next_win_start_global
+
+            pbar.close()
+            print(f"[INFO] Completed (event-count mode). Generated {frame_idx} MCTS frames into {out_dir}")
+            return
+
+        # -----------------------------
+        # TIME-BASED MODE (ORIGINAL)
+        # -----------------------------
+        DT_MAX = float(time_windows[-1])  # max window size in seconds
 
         # 1. Determine Start Index via Binary Search (efficient seek)
         seek_idx = binary_search_event_index(t_dset, start_time_sec, time_scale)
@@ -201,6 +413,7 @@ def _generate_mcts_for_file(
             current_t_ref = t_end_sec  # Fallback if range is tiny
 
         print(f"[INFO] File: {h5_path}")
+        print(f"[INFO] Mode: TIME-BASED")
         print(f"[INFO] Time Range (s): [{t_start_sec:.3f}, {t_end_sec:.3f}]")
         print(f"[INFO] Seek Index: {seek_idx}. Reading from event index: {read_idx}")
         print(f"[INFO] First MCTS frame t_ref: {current_t_ref:.3f} s")
@@ -222,7 +435,7 @@ def _generate_mcts_for_file(
         buf_p = np.empty(0, dtype=np.int8)
 
         frame_idx = 0
-        pbar = tqdm(total=total_frames, desc=f"MCTS frames ({h5_path.name})")
+        pbar = tqdm(total=total_frames, desc=f"MCTS frames ({h5_path.name}) [time]")
 
         # --- Main Streaming Loop ---
         while current_t_ref < t_end_sec and frame_idx < total_frames:
@@ -286,12 +499,21 @@ def _generate_mcts_for_file(
             pbar.update(1)
 
         pbar.close()
-        print(f"[INFO] Completed. Generated {frame_idx} MCTS frames into {out_dir}")
+        print(f"[INFO] Completed (time-based mode). Generated {frame_idx} MCTS frames into {out_dir}")
 
 
 # ---------- Public entry: ref + query ----------
 
-def gen_mcts(root, dataset, reference, query, mcts_time, chunk_size=500_000, max_frames=None):
+def gen_mcts(
+    root,
+    dataset,
+    reference,
+    query,
+    mcts_time,
+    chunk_size=500_000,
+    max_frames=None,
+    use_event_counts: bool = False,  # <-- NEW FLAG
+):
     root = Path(root)
     time_windows = np.array(mcts_time, dtype=np.float64)
     DT_MAX = float(time_windows[-1])
@@ -300,8 +522,8 @@ def gen_mcts(root, dataset, reference, query, mcts_time, chunk_size=500_000, max
     query_path = root / dataset / query / f"{query}.hdf5"
 
     # NOTE: keeping your original out_dir behaviour (same dir for ref and query)
-    ref_dir = root / dataset / reference / f"mcts_{reference}"
-    qry_dir = root / dataset / query / f"mcts_{query}"
+    ref_dir = root / dataset / reference / f"mcts_{reference}_{int(mcts_time[-1]/1000)}"
+    qry_dir = root / dataset / query / f"mcts_{query}_{int(mcts_time[-1]/1000)}"
 
     # Time scale and sensor size
     if dataset == "brisbane_event":
@@ -313,13 +535,18 @@ def gen_mcts(root, dataset, reference, query, mcts_time, chunk_size=500_000, max
         ref_start = config['other']['offset'][reference]
         query_start = config['other']['offset'][query]
     elif dataset == "nsavp":
-        time_scale = 1e-9  # microseconds to seconds
+        time_scale = 1e-9  # nanoseconds to seconds
         ref_start = 0.0
         query_start = 0.0
         H, W = 480, 640
+    elif dataset == "fast_slow" or dataset == "qcr_event":
+        time_scale = 1  # microseconds to seconds
+        ref_start = 0.0
+        query_start = 0.0
+        H, W = 240, 346
     else:
         raise NotImplementedError(f"Dataset not supported for MCTS generation: {dataset}")
-
+    
     # Reference sequence
     if not os.path.exists(ref_dir):
         _generate_mcts_for_file(
@@ -332,6 +559,7 @@ def gen_mcts(root, dataset, reference, query, mcts_time, chunk_size=500_000, max
             chunk_size=chunk_size,
             max_frames=max_frames,
             start_time_sec=ref_start,
+            use_event_counts=use_event_counts,  # <-- PASS FLAG
         )
 
     # Query sequence
@@ -346,4 +574,5 @@ def gen_mcts(root, dataset, reference, query, mcts_time, chunk_size=500_000, max
             chunk_size=chunk_size,
             max_frames=max_frames,
             start_time_sec=query_start,
+            use_event_counts=use_event_counts,  # <-- PASS FLAG
         )

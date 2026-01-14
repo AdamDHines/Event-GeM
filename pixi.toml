@@ -14,6 +14,8 @@ demo = {cmd = "pixi run -e backbone python3 main.py -d brisbane_event -r sunrise
 features = {cmd = "pixi run -e backbone python3 main.py --mode feature-extract"}
 keypoints = {cmd = "pixi run -e superevent python3 main.py --mode keypoints"}
 
+rerank = {cmd = "pixi run -e superevent python3 eventgem/rerank.py"}
+
 [environments]
 backbone = ["backbone"]
 superevent = ["superevent"]
@@ -43,6 +45,7 @@ opencv = "*"
 tqdm = "*"
 scikit-learn = "*"
 pynmea2 = "*"
+pyarrow = "*"
 
 [feature.superevent.dependencies]
 cmapy = "*"

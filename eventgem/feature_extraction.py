@@ -63,7 +63,7 @@ class EventGeM:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
-    def GeM(self, feats, p=3.0):
+    def GeM(self, feats, p=2.5):
         return F.avg_pool2d((feats.clamp(min=1e-6)).pow(p), (feats.shape[-2], feats.shape[-1])).pow(1.0/p)
 
     def extract_features(self):
@@ -174,17 +174,17 @@ class EventGeM:
         self.reference_path = os.path.join(root, self.dataset, self.reference, f"{self.reference}-frames-{self.recon_msec}")
         self.query_path = os.path.join(root, self.dataset, self.query, f"{self.query}-frames-{self.recon_msec}")
 
-        if not os.path.exists(self.reference_path) or not os.path.exists(self.query_path):
+        # if not os.path.exists(self.reference_path) or not os.path.exists(self.query_path):
             # Updat the eventlab config and generate the data
-            update_config(root, self.dataset, self.reference, self.query, time=self.recon_msec)
+        update_config(root, self.dataset, self.reference, self.query, time=self.recon_msec)
         
         # Check if features have been pre-computed
         outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")
         feat_ref_path = os.path.join(outdir, f"{self.dataset}_{self.reference}_features.pt")
         feat_query_path = os.path.join(outdir, f"{self.dataset}_{self.query}_features.pt")
-        if not os.path.exists(feat_ref_path) and not os.path.exists(feat_query_path):
+        # if not os.path.exists(feat_ref_path) and not os.path.exists(feat_query_path):
             # Perform feature extraction
-            self.extract_features()
+        self.extract_features()
 
     # ----------------------------------------------------------
     # SuperEvent / MCTS helpers
@@ -461,7 +461,7 @@ class EventGeM:
 
         # Load the similarity matrix
         self.sim_matrix = torch.load(sim_matrix_path)
-        # Convert to distance matrix
+        # # Convert to distance matrix
         self.distance_matrix = (1.0 - self.sim_matrix).numpy()
 
         # Check that specified datasets exist - need MCTS reconstructued directories
@@ -469,19 +469,16 @@ class EventGeM:
         self.reference_path = os.path.join(root, self.reference, f"mcts_{self.reference}")
         self.query_path = os.path.join(root, self.query, f"mcts_{self.query}")
 
-        if not os.path.exists(self.reference_path) or not os.path.exists(self.query_path):
+        if not os.path.exists(self.reference_path):
             # Generate MCTS features
             gen_mcts(root, self.dataset, self.reference, self.query, self.mcts_time)
             self.extract_keypoints()
         
-        # Check if keypoints have been pre-computed
-        self.reference_keypoints = os.path.join(self.keypoint_out, self.dataset, self.reference, f"kps_{self.reference}")
-        self.query_keypoints = os.path.join(self.keypoint_out, self.dataset, self.query, f"kps_{self.query}")
-
-        if not os.path.exists(self.reference_keypoints) or not os.path.exists(self.query_keypoints):
-            # Perform keypoint extraction
+        if not os.path.exists(self.query_path):
+            # Generate MCTS features
+            gen_mcts(root, self.dataset, self.reference, self.query, self.mcts_time)
             self.extract_keypoints()
-
+        
         # Re-rank the top-k candidates using 2D-homology
         self.rerank()
 
