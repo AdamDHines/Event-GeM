@@ -70,6 +70,43 @@ def find_event_datasets(f: h5py.File):
 
     return x_ds, y_ds, t_ds, p_ds
 
+NS_PER_S = 1_000_000_000
+
+def sec_to_ns(t_sec: float) -> int:
+    return int(round(float(t_sec) * NS_PER_S))
+
+def ns_to_sec(t_ns: int) -> float:
+    return float(t_ns) / NS_PER_S
+
+def binary_search_event_index_ns(t_dset, target_ns: int) -> int:
+    """
+    Binary search on integer nanosecond timestamps (epoch ns).
+    Returns index closest to (but not exceeding) target_ns.
+    Returns 0 if target is before first event, N if after last event.
+    """
+    N = len(t_dset)
+    if N == 0:
+        return 0
+
+    t_first = int(t_dset[0])
+    if target_ns <= t_first:
+        return 0
+
+    t_last = int(t_dset[-1])
+    if target_ns >= t_last:
+        return N
+
+    low, high = 0, N - 1
+    best_idx = 0
+    while low <= high:
+        mid = (low + high) // 2
+        t_mid = int(t_dset[mid])
+        if t_mid < target_ns:
+            best_idx = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best_idx
 
 def binary_search_event_index(t_dset, target_time_sec, time_scale):
     """
@@ -215,9 +252,10 @@ def _generate_mcts_for_file(
     H: int,
     W: int,
     chunk_size: int = 500_000,
-    max_frames = None,
+    max_frames=None,
     start_time_sec: float = 0.0,
-    use_event_counts: bool = False,   # <-- NEW FLAG
+    use_event_counts: bool = False,
+    t_is_epoch_ns: bool = False,   # <-- NEW: Brisbane-Event uses epoch ns
 ):
     """Generate MCTS frames for a single HDF5 file.
 
@@ -256,7 +294,11 @@ def _generate_mcts_for_file(
                 raise ValueError("Largest event window (E_MAX) must be > 0.")
 
             # Respect start_time_sec by converting it to an event index
-            seek_idx = binary_search_event_index(t_dset, start_time_sec, time_scale)
+            if t_is_epoch_ns:
+                seek_idx = binary_search_event_index_ns(t_dset, sec_to_ns(start_time_sec))
+            else:
+                seek_idx = binary_search_event_index(t_dset, start_time_sec, time_scale)
+
             read_idx = seek_idx + 1  # start just AFTER the start_time_sec
 
             if read_idx >= N:
@@ -389,6 +431,130 @@ def _generate_mcts_for_file(
         # TIME-BASED MODE (ORIGINAL)
         # -----------------------------
         DT_MAX = float(time_windows[-1])  # max window size in seconds
+                # -----------------------------
+        # TIME-BASED MODE: EPOCH-NS (Brisbane-Event)
+        # -----------------------------
+        if t_is_epoch_ns:
+            DT_MAX = float(time_windows[-1])
+            DT_MAX_NS = int(round(DT_MAX * NS_PER_S))
+
+            # Convert start_time_sec (epoch seconds) -> epoch ns
+            start_ns = sec_to_ns(start_time_sec)
+
+            # Efficient seek using integer ns
+            seek_idx = binary_search_event_index_ns(t_dset, start_ns)
+            read_idx = seek_idx + 1
+            if read_idx >= N:
+                print(f"[WARN] Start time is beyond the end of the file or file is empty: {h5_path}")
+                return
+
+            # File time range in epoch ns (integers)
+            t_start_ns = int(t_dset[0])
+            t_end_ns   = int(t_dset[N - 1])
+
+            # First reference time: must have at least DT_MAX history available,
+            # and must be after the requested start time.
+            first_t_ref_candidate_ns = max(t_start_ns + DT_MAX_NS, start_ns + DT_MAX_NS)
+
+            if t_end_ns > first_t_ref_candidate_ns:
+                num_steps = math.ceil((first_t_ref_candidate_ns - t_start_ns) / DT_MAX_NS)
+                current_t_ref_ns = t_start_ns + num_steps * DT_MAX_NS
+            else:
+                current_t_ref_ns = t_end_ns
+
+            print(f"[INFO] File: {h5_path}")
+            print(f"[INFO] Mode: TIME-BASED (epoch ns)")
+            print(f"[INFO] File Range (s): [{ns_to_sec(t_start_ns):.6f}, {ns_to_sec(t_end_ns):.6f}]")
+            print(f"[INFO] Offset start_time_sec: {start_time_sec:.6f} "
+                  f"(offset - file_start = {start_time_sec - ns_to_sec(t_start_ns):.6f} s)")
+            print(f"[INFO] Seek Index: {seek_idx}. Reading from event index: {read_idx}")
+            print(f"[INFO] First MCTS frame t_ref: {ns_to_sec(current_t_ref_ns):.6f} s")
+            print(f"[INFO] MCTS window ΔT_max = {DT_MAX*1000:.1f} ms")
+
+            # Estimate frames
+            if t_end_ns > current_t_ref_ns:
+                est_frames = int(np.ceil((t_end_ns - current_t_ref_ns) / DT_MAX_NS)) + 1
+            else:
+                est_frames = 1
+
+            total_frames = est_frames if max_frames is None else min(est_frames, max_frames)
+            print(f"[INFO] Estimated frames: {est_frames}, generating: {total_frames}")
+
+            # Buffers (keep timestamps as int64 ns)
+            buf_x = np.empty(0, dtype=np.int64)
+            buf_y = np.empty(0, dtype=np.int64)
+            buf_t = np.empty(0, dtype=np.int64)   # <-- epoch ns
+            buf_p = np.empty(0, dtype=np.int8)
+
+            frame_idx = 0
+            pbar = tqdm(total=total_frames, desc=f"MCTS frames ({h5_path.name}) [epoch-ns]")
+
+            while current_t_ref_ns < t_end_ns and frame_idx < total_frames:
+                t_history_start_ns = current_t_ref_ns - DT_MAX_NS
+
+                # Fill buffer until we have events at/after current_t_ref_ns
+                while (buf_t.size == 0 or buf_t[-1] < current_t_ref_ns) and read_idx < N:
+                    end_idx = min(N, read_idx + chunk_size)
+
+                    c_x = x_dset[read_idx:end_idx].astype(np.int64)
+                    c_y = y_dset[read_idx:end_idx].astype(np.int64)
+                    c_t = t_dset[read_idx:end_idx].astype(np.int64)   # <-- no scaling
+                    c_p = p_dset[read_idx:end_idx].astype(np.int8)
+
+                    if buf_t.size == 0:
+                        buf_x, buf_y, buf_t, buf_p = c_x, c_y, c_t, c_p
+                    else:
+                        buf_x = np.concatenate([buf_x, c_x])
+                        buf_y = np.concatenate([buf_y, c_y])
+                        buf_t = np.concatenate([buf_t, c_t])
+                        buf_p = np.concatenate([buf_p, c_p])
+
+                    read_idx = end_idx
+
+                # Extract window [t_history_start_ns, current_t_ref_ns)
+                if buf_t.size > 0:
+                    keep_mask = (buf_t >= t_history_start_ns) & (buf_t < current_t_ref_ns)
+
+                    x_win = buf_x[keep_mask]
+                    y_win = buf_y[keep_mask]
+                    t_win_ns = buf_t[keep_mask]
+                    p_win = buf_p[keep_mask]
+
+                    # Prune everything older than history start
+                    keep_next = buf_t >= t_history_start_ns
+                    buf_x = buf_x[keep_next]
+                    buf_y = buf_y[keep_next]
+                    buf_t = buf_t[keep_next]
+                    buf_p = buf_p[keep_next]
+                else:
+                    x_win = y_win = p_win = np.empty(0)
+                    t_win_ns = np.empty(0, dtype=np.int64)
+
+                # Convert to RELATIVE seconds for MCTS calc (stable; no epoch floats)
+                # Events are before ref => negative / <= 0 values.
+                t_win_sec_rel = (t_win_ns.astype(np.int64) - current_t_ref_ns) * 1e-9
+                t_ref_rel = 0.0
+
+                mcts = mcts_numpy(
+                    x_win, y_win, t_win_sec_rel, p_win,
+                    height=H, width=W,
+                    t_ref=t_ref_rel,
+                    time_windows=time_windows,   # still seconds
+                )
+
+                # Save absolute t_ref in seconds (epoch seconds) for downstream traceability
+                t_ref_abs_sec = ns_to_sec(current_t_ref_ns)
+                out_path = out_dir / f"mcts_{frame_idx:05d}.npz"
+                np.savez_compressed(out_path, mcts=mcts, t_ref=t_ref_abs_sec)
+
+                frame_idx += 1
+                current_t_ref_ns += DT_MAX_NS
+                pbar.update(1)
+
+            pbar.close()
+            print(f"[INFO] Completed (epoch-ns mode). Generated {frame_idx} MCTS frames into {out_dir}")
+            return
+
 
         # 1. Determine Start Index via Binary Search (efficient seek)
         seek_idx = binary_search_event_index(t_dset, start_time_sec, time_scale)
@@ -516,20 +682,21 @@ def gen_mcts(
 ):
     root = Path(root)
     time_windows = np.array(mcts_time, dtype=np.float64)
-    DT_MAX = float(time_windows[-1])
+    # convert to seconds from msec
+    time_windows = time_windows * 1e-3
 
     ref_path = root / dataset / reference / f"{reference}.hdf5"
     query_path = root / dataset / query / f"{query}.hdf5"
 
     # NOTE: keeping your original out_dir behaviour (same dir for ref and query)
-    ref_dir = root / dataset / reference / f"mcts_{reference}_{int(mcts_time[-1]/1000)}"
-    qry_dir = root / dataset / query / f"mcts_{query}_{int(mcts_time[-1]/1000)}"
+    ref_dir = root / dataset / reference / f"mcts_{reference}_{mcts_time[-1]}"
+    qry_dir = root / dataset / query / f"mcts_{query}_{mcts_time[-1]}"
 
     # Time scale and sensor size
     if dataset == "brisbane_event":
-        time_scale = 1e-9  # nanoseconds to seconds
+        time_scale = 1e-9  # (not used in epoch-ns branch, but keep)
+        t_is_epoch_ns = True
         H, W = 240, 346
-        # load the event lab config for the brisbane event to get the start time
         config_path = "./eventgem/external/eventlab/datasets/brisbane_event.yaml"
         config = yaml.safe_load(open(config_path, 'r'))
         ref_start = config['other']['offset'][reference]
@@ -560,6 +727,7 @@ def gen_mcts(
             max_frames=max_frames,
             start_time_sec=ref_start,
             use_event_counts=use_event_counts,  # <-- PASS FLAG
+            t_is_epoch_ns=t_is_epoch_ns
         )
 
     # Query sequence
@@ -574,5 +742,6 @@ def gen_mcts(
             chunk_size=chunk_size,
             max_frames=max_frames,
             start_time_sec=query_start,
-            use_event_counts=use_event_counts,  # <-- PASS FLAG
+            use_event_counts=use_event_counts,
+            t_is_epoch_ns=t_is_epoch_ns
         )

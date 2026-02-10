@@ -63,7 +63,7 @@ class EventGeM:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
-    def GeM(self, feats, p=2.5):
+    def GeM(self, feats, p=5):
         return F.avg_pool2d((feats.clamp(min=1e-6)).pow(p), (feats.shape[-2], feats.shape[-1])).pow(1.0/p)
 
     def extract_features(self):
@@ -173,17 +173,8 @@ class EventGeM:
         root = self.data_root
         self.reference_path = os.path.join(root, self.dataset, self.reference, f"{self.reference}-frames-{self.recon_msec}")
         self.query_path = os.path.join(root, self.dataset, self.query, f"{self.query}-frames-{self.recon_msec}")
-
-        # if not os.path.exists(self.reference_path) or not os.path.exists(self.query_path):
-            # Updat the eventlab config and generate the data
         update_config(root, self.dataset, self.reference, self.query, time=self.recon_msec)
-        
-        # Check if features have been pre-computed
-        outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")
-        feat_ref_path = os.path.join(outdir, f"{self.dataset}_{self.reference}_features.pt")
-        feat_query_path = os.path.join(outdir, f"{self.dataset}_{self.query}_features.pt")
-        # if not os.path.exists(feat_ref_path) and not os.path.exists(feat_query_path):
-            # Perform feature extraction
+
         self.extract_features()
 
     # ----------------------------------------------------------
@@ -384,8 +375,8 @@ class EventGeM:
 
         # MCTS directories (where gen_mcts wrote frames)
         root = Path(self.data_root)
-        ref_mcts_dir = root / self.dataset / self.reference / f"mcts_{self.reference}"
-        query_mcts_dir = root / self.dataset / self.query / f"mcts_{self.query}"
+        ref_mcts_dir = root / self.dataset / self.reference / f"mcts_{self.reference}_{self.mcts_time[-1]}"
+        query_mcts_dir = root / self.dataset / self.query / f"mcts_{self.query}_{self.mcts_time[-1]}"
 
         if not ref_mcts_dir.exists():
             raise FileNotFoundError(f"Reference MCTS directory not found: {ref_mcts_dir}")
@@ -466,8 +457,8 @@ class EventGeM:
 
         # Check that specified datasets exist - need MCTS reconstructued directories
         root = self.data_root
-        self.reference_path = os.path.join(root, self.reference, f"mcts_{self.reference}")
-        self.query_path = os.path.join(root, self.query, f"mcts_{self.query}")
+        self.reference_path = os.path.join(root, self.reference, f"mcts_{self.reference}_{self.mcts_time[-1]}")
+        self.query_path = os.path.join(root, self.query, f"mcts_{self.query}_{self.mcts_time[-1]}")
 
         if not os.path.exists(self.reference_path):
             # Generate MCTS features
