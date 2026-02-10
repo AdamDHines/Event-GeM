@@ -24,7 +24,7 @@ _For more information, please see the [pixi documentation](https://pixi.sh/lates
 Next, clone our repository **with all the required submodules** and navigate to the project directory by running the following in your command terminal:
 
 ```console
-git clone git@github.com:AdamDHines/Event-GeM.git eventgem --recurse-sumodules && cd eventgem
+git clone git@github.com:AdamDHines/Event-GeM.git eventgem --recurse-submodules && cd eventgem
 ```
 
 Once installed, you can quickly try Event-GeM with our demo by running the following in your command terminal:
