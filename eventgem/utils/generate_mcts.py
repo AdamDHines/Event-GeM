@@ -706,6 +706,7 @@ def gen_mcts(
         ref_start = 0.0
         query_start = 0.0
         H, W = 480, 640
+        t_is_epoch_ns = True
     elif dataset == "fast_slow" or dataset == "qcr_event":
         time_scale = 1  # microseconds to seconds
         ref_start = 0.0

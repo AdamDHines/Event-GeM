@@ -16,13 +16,15 @@ def create_GTtol(GT: np.ndarray, tolerance: int) -> np.ndarray:
         GTtol[r0:r1, c0:c1] = 1
     return GTtol
 
-def recall(original, reranked, gt, k=[1, 5, 10]):
+def recall(original, keypoint, depth, gt, k=[1, 5, 10]):
     """
     Computes Recall@K for original and re-ranked results.
     Args:
         original: List of lists containing original ranked indices for each query.
-        reranked: List of lists containing re-ranked indices for each query.
-        ks: List of K values for Recall@K computation.
+        keypoint: List of lists containing keypoint re-ranked indices for each query.
+        depth: List of lists containing depth re-ranked indices for each query.
+        gt: Ground truth array.
+        k: List of K values for Recall@K computation.
     Returns:
         Two dictionaries with Recall@K values for original and re-ranked results.
     """
@@ -37,12 +39,55 @@ def recall(original, reranked, gt, k=[1, 5, 10]):
         gt = resize(gt, original.shape, order=0, preserve_range=True, anti_aliasing=False)
     # gt_tol = create_GTtol(gt, tolerance=200)
 
-    table = PrettyTable()
-    table.field_names = ["K", "Recall (Base)", "Recall (Geometric)"]
-    
-    for k in [1, 5, 10]:
-        r_b = recallAtK((1-original), gt, k)
-        r_n = recallAtK((1-reranked), gt, k)
-        table.add_row([k, f"{r_b:.4f}", f"{r_n:.4f}"])
+    ks = [1, 5, 10]
 
-    print(table)
+    # ---- Base always ----
+    rec_base = {k: recallAtK((1 - original), gt, k) for k in ks}
+
+    has_kp = keypoint is not None
+    has_depth = depth is not None
+
+    # ---- 1) Keypoint-only table ----
+    if has_kp and not has_depth:
+        table = PrettyTable()
+        table.field_names = ["K", "Recall (Base)", "Recall (Keypoint)"]
+
+        for k in ks:
+            r_b = rec_base[k]
+            r_kp = recallAtK((1 - keypoint), gt, k)
+            table.add_row([k, f"{r_b:.4f}", f"{r_kp:.4f}"])
+
+        print(table)
+
+    # ---- 2) Depth-only table ----
+    elif has_depth and not has_kp:
+        table = PrettyTable()
+        table.field_names = ["K", "Recall (Base)", "Recall (Depth)"]
+
+        for k in ks:
+            r_b = rec_base[k]
+            r_d = recallAtK((1 - depth), gt, k)
+            table.add_row([k, f"{r_b:.4f}", f"{r_d:.4f}"])
+
+        print(table)
+
+    # ---- 3) Both table ----
+    elif has_kp and has_depth:
+        table = PrettyTable()
+        table.field_names = ["K", "Recall (Base)", "Recall (Keypoint)", "Recall (Depth)"]
+
+        for k in ks:
+            r_b = rec_base[k]
+            r_kp = recallAtK((1 - keypoint), gt, k)
+            r_d = recallAtK((1 - depth), gt, k)
+            table.add_row([k, f"{r_b:.4f}", f"{r_kp:.4f}", f"{r_d:.4f}"])
+
+        print(table)
+
+    # ---- Nothing to compare ----
+    else:
+        table = PrettyTable()
+        table.field_names = ["K", "Recall (Base)"]
+        for k in ks:
+            table.add_row([k, f"{rec_base[k]:.4f}"])
+        print(table)

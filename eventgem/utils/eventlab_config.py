@@ -48,6 +48,12 @@ def update_config(root, dataset, reference, query, time=50,
     # 4. Make sure the frame_accumulator method is set to polarity
     config['frame_accumulator'] = 'polarity'
 
+    # Change the tolerance based on the dataset for ground truth
+    if dataset == "brisbane_event" or dataset == "nsavp":
+        config['ground_truth_tolerance'] = 70
+    else:
+        config['ground_truth_tolerance'] = 3 # for fast_slow
+
     # Where to save
     if out_path is None:
         out_path = config_path  # overwrite in-place
@@ -83,7 +89,7 @@ def update_config(root, dataset, reference, query, time=50,
             query,
             ref_data,
             query_data,
-            timewindow=1000,
+            timewindow=time,
             gps_available=gps_available,
         )
     finally:

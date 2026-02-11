@@ -10,7 +10,8 @@ import requests
 
 import numpy as np
 import torch.nn.functional as F
-
+import cv2
+from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 from pathlib import Path
 from joblib import Parallel, delayed
@@ -312,9 +313,7 @@ class EventGeM:
                         out_path,
                         keypoints=np.empty((0, 2), dtype=np.float32),
                         scores=np.empty((0,), dtype=np.float32),
-                        descriptors=np.empty(
-                            (0, desc_map.shape[1]), dtype=np.float32
-                        ),
+                        descriptors=np.empty((0, desc_map.shape[1]), dtype=np.float32),
                         image_shape=np.array([H, W], dtype=np.int32),
                     )
                     continue
@@ -360,7 +359,6 @@ class EventGeM:
         device = self.device  # already set in __init__
 
         # Resolve SuperEvent config/weights.
-        # Adjust these paths to match your repo layout.
         superevent_root = Path(THIS_DIR) / "external" / "superevent"
         config_path = superevent_root / "config" / "super_event.yaml"
         weights_path = superevent_root / "saved_models" / "super_event_weights.pth"
@@ -397,7 +395,7 @@ class EventGeM:
         query_loader = torch.utils.data.DataLoader(query_dataset, batch_size=self.keypoint_batch_size, shuffle=False, num_workers=4)
 
         # Reference
-        if not os.path.exists(ref_kp_dir):
+        if not ref_kp_dir.exists():
             self.extract_superevent_features_for_dir(
                 data_loader=ref_loader,
                 out_dir=ref_kp_dir,
@@ -407,7 +405,7 @@ class EventGeM:
             )
 
         # Query
-        if not os.path.exists(query_kp_dir):
+        if not query_kp_dir.exists():
             self.extract_superevent_features_for_dir(
                 data_loader=query_loader,
                 out_dir=query_kp_dir,
@@ -416,20 +414,106 @@ class EventGeM:
                 device=device
             )
 
-    def rerank(self, kp_pattern="mcts_{:04d}.feat.npz"):
-        R, Q = self.distance_matrix.shape
+    # ----------------------------------------------------------
+    # Depth helpers (kept consistent)
+    # ----------------------------------------------------------
 
-        # Pre-load queries exactly like before
+    class _DepthLRUCache:
+        """Tiny LRU cache for *downsampled* reference depth maps."""
+        def __init__(self, max_items: int = 512):
+            from collections import OrderedDict
+            self.max_items = int(max_items)
+            self._d = OrderedDict()
+
+        def get(self, key: int):
+            if key in self._d:
+                self._d.move_to_end(key)
+                return self._d[key]
+            return None
+
+        def put(self, key: int, value: np.ndarray):
+            self._d[key] = value
+            self._d.move_to_end(key)
+            if len(self._d) > self.max_items:
+                self._d.popitem(last=False)
+
+    def _load_depth_map(self, depth_dir: Path, idx: int, pattern: str, index_offset: int = 0, down_hw=None):
+        """
+        Load a single depth PNG (expected 16-bit), return float32.
+        Optionally downsamples to down_hw=(H,W) for speed.
+        """
+        import cv2
+        path = depth_dir / pattern.format(idx + index_offset)
+        if not path.exists():
+            return None
+        D = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if D is None:
+            return None
+        if D.ndim == 3:
+            D = D[..., 0]
+        D = D.astype(np.float32)
+        if down_hw is not None:
+            Ht, Wt = int(down_hw[0]), int(down_hw[1])
+            D = cv2.resize(D, (Wt, Ht), interpolation=cv2.INTER_AREA)
+        return D
+
+    def _huber_mean(self, x: np.ndarray, delta: float) -> float:
+        ax = np.abs(x)
+        quad = np.minimum(ax, delta)
+        lin = ax - quad
+        return float(np.mean(0.5 * quad * quad + delta * lin))
+
+    def _depth_affine_distance_resized(self, Rr: np.ndarray, Qr: np.ndarray) -> float:
+        """
+        Per-pair scale+shift align Q->R and compute robust residual.
+        Assumes Rr and Qr are already resized to the same shape.
+        """
+        if Rr is None or Qr is None:
+            return np.inf
+
+        valid = np.isfinite(Rr) & np.isfinite(Qr) & (Rr > 0) & (Qr > 0)
+        if valid.sum() < 500:
+            return np.inf
+
+        r = Rr[valid].reshape(-1)
+        q = Qr[valid].reshape(-1)
+
+        A = np.stack([q, np.ones_like(q)], axis=1)
+        (s, t), *_ = np.linalg.lstsq(A, r, rcond=None)
+
+        diff = (s * Qr + t - Rr)[valid]
+
+        spread = float(np.percentile(r, 95) - np.percentile(r, 5))
+        delta = max(1e-6, 0.05 * spread)
+        return self._huber_mean(diff, delta)
+
+    # ----------------------------------------------------------
+    # Keypoint rerank (memory-safe)
+    # ----------------------------------------------------------
+
+# ----------------------------------------------------------
+    # Keypoint rerank (Parallelized)
+    # ----------------------------------------------------------
+
+    def rerank(self, kp_pattern="mcts_{:05d}.feat.npz"):
+        """
+        Re-rank the top-k candidates using 2D-homology/inliers.
+        Parallelized using joblib for speed.
+        """
+        R, Q = self.original.shape
+
+        # Pre-load all query features into memory to avoid redundant disk I/O in workers
         queries_data = []
-        for i in tqdm(range(Q)):
+        for i in tqdm(range(Q), desc="Pre-loading query features"):
             queries_data.append(
                 load_event_features(Path(self.query_keypoints), i, kp_pattern)
             )
 
+        # Run parallel re-ranking
         results = Parallel(n_jobs=-1)(
             delayed(process_single_query)(
                 q_idx=i,
-                base_dists=self.distance_matrix[:, i],
+                base_dists=self.original[:, i],
                 top_k=self.top_k,
                 q_data=queries_data[i],
                 ref_kp_dir=Path(self.reference_keypoints),
@@ -437,40 +521,194 @@ class EventGeM:
                 ransac_thresh=self.ransac_thresh,
                 inlier_weight=self.inlier_weight,
             )
-            for i in tqdm(range(Q), desc="Re-ranking")
+            for i in tqdm(range(Q), desc="Re-ranking (Keypoints)")
         )
 
-        self.new_dist_matrix = self.distance_matrix.copy()
+        # Assemble results
+        self.keypoint_reranked = self.original.copy()
         for q_idx, new_col in results:
-            self.new_dist_matrix[:, q_idx] = new_col
+            self.keypoint_reranked[:, q_idx] = new_col
+
+    # ----------------------------------------------------------
+    # Updated Depth Helpers
+    # ----------------------------------------------------------
+
+    def _compute_robust_depth_distance(self, Rr: np.ndarray, Qr: np.ndarray) -> float:
+        """
+        Computes a structural distance between two depth maps.
+        Uses SSIM on normalized, masked depth to handle viewpoint shifts.
+        """
+        if Rr is None or Qr is None:
+            return np.inf
+
+        # 1. Create a mask of valid pixels (non-zero in both)
+        mask = (Rr > 0) & (Qr > 0)
+        
+        # Safety check: if overlap is non-existent, it's a mismatch
+        if np.sum(mask) < 100: 
+            return 1.0
+
+        # 2. Normalize intensity to [0, 1] based on valid percentiles
+        def normalize_depth(D, m):
+            vals = D[m]
+            if len(vals) == 0: return D
+            v_min, v_max = np.percentile(vals, [1, 99])
+            # Avoid division by zero
+            denom = v_max - v_min if v_max > v_min else 1.0
+            return np.clip((D - v_min) / denom, 0, 1)
+
+        Rr_n = normalize_depth(Rr, mask)
+        Qr_n = normalize_depth(Qr, mask)
+
+        # 3. Compute SSIM
+        # mssim: the global average (scalar)
+        # ssim_map: the per-pixel similarity map (array)
+        mssim, ssim_map = ssim(Rr_n, Qr_n, full=True, data_range=1.0, win_size=7)
+        
+        # 4. Correctly index the MAP, not the scalar
+        valid_scores = ssim_map[mask]
+        
+        if valid_scores.size == 0:
+            return 1.0
+            
+        avg_structural_sim = np.mean(valid_scores)
+        
+        # Return 1.0 (worst) to 0.0 (perfect structural match)
+        return 1.0 - float(avg_structural_sim)
+    # ----------------------------------------------------------
+    # Updated rerank_depth
+    # ----------------------------------------------------------
+
+    def rerank_depth(self):
+        """
+        Improved depth rerank using Structural Similarity and 
+        absolute thresholding to prevent R@1 degradation.
+        """
+        R, Q = self.original.shape
+
+        ref_depth_dir = Path(getattr(self, "reference_depth_dir"))
+        qry_depth_dir = Path(getattr(self, "query_depth_dir"))
+
+        depth_pattern = getattr(self, "depth_pattern", "depth_{:06d}.png")
+        depth_index_offset = int(getattr(self, "depth_index_offset", 0))
+        depth_weight = float(getattr(self, "depth_weight", 0.15))
+        depth_down_hw = getattr(self, "depth_down_hw", (28, 28))
+        depth_query_batch_size = int(getattr(self, "depth_query_batch_size", 64))
+        depth_ref_cache_size = int(getattr(self, "depth_ref_cache_size", 512))
+
+        outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")
+        os.makedirs(outdir, exist_ok=True)
+        out_path = os.path.join(outdir, f"{self.dataset}_{self.reference}_{self.query}_rerank_depth_dist.npy")
+
+        new_dist = np.memmap(out_path, dtype=np.float32, mode="w+", shape=(R, Q))
+        K = int(self.top_k)
+        cache = self._DepthLRUCache(max_items=depth_ref_cache_size)
+
+        # if the re-rank is both
+        if self.rerank_mode == "both":
+            original = self.keypoint_reranked.copy()
+        else:
+            original = self.original.copy()
+
+        for q0 in tqdm(range(0, Q, depth_query_batch_size), desc="Re-ranking (depth)", unit="batch"):
+            q1 = min(Q, q0 + depth_query_batch_size)
+            B = q1 - q0
+
+            base_block = original[:, q0:q1].astype(np.float32, copy=False)
+            new_dist[:, q0:q1] = base_block
+
+            # Top-K indices
+            part = np.argpartition(base_block, kth=K - 1, axis=0)[:K, :].astype(np.int32)
+            topk_idx = np.empty_like(part)
+            for bi in range(B):
+                inds = part[:, bi]
+                topk_idx[:, bi] = inds[np.argsort(base_block[inds, bi])]
+
+            # Load query depths
+            q_depths = [self._load_depth_map(qry_depth_dir, qi, depth_pattern, depth_index_offset, depth_down_hw) 
+                        for qi in range(q0, q1)]
+
+            for bi, qi in enumerate(range(q0, q1)):
+                qD = q_depths[bi]
+                if qD is None: continue
+
+                refs = topk_idx[:, bi]
+                errs = np.zeros(len(refs), dtype=np.float32)
+
+                for j, r_idx in enumerate(refs):
+                    r_idx_int = int(r_idx)
+                    rD = cache.get(r_idx_int)
+                    if rD is None:
+                        rD = self._load_depth_map(ref_depth_dir, r_idx_int, depth_pattern, depth_index_offset, depth_down_hw)
+                        if rD is not None: cache.put(r_idx_int, rD)
+                    
+                    # Use the new robust distance
+                    errs[j] = self._compute_robust_depth_distance(rD, qD)
+
+                # --- IMPROVED SCORING LOGIC ---
+                # Using a fixed tau (0.2 - 0.5) ensures we only boost matches that are 
+                # actually structurally similar, rather than just 'the best of a bad bunch'.
+                tau = 0.3 
+                sims = np.exp(-errs / tau).astype(np.float32)
+
+                # Optional: Only apply boost if SSIM distance is reasonably low (e.g. < 0.7)
+                mask_good = errs < 0.7
+                new_dist[refs[mask_good], qi] = base_block[refs[mask_good], bi] - (depth_weight * sims[mask_good])
+
+        new_dist.flush()
+        self.depth_reranked = new_dist
 
     def keypoint_inference(self):
-        # Check if the similarity matrix for specified dataset exists
-        sim_matrix_path = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}", f"{self.dataset}_{self.reference}_{self.query}_similarity.pt")
+        """
+        Orchestrates the re-ranking pipeline based on self.rerank_mode.
+        """
+        # 1. Load Global Similarity Matrix
+        sim_matrix_path = os.path.join(
+            self.feature_out, 
+            self.dataset, 
+            f"{self.reference}-{self.query}", 
+            f"{self.dataset}_{self.reference}_{self.query}_similarity.pt"
+        )
+        
         if not os.path.exists(sim_matrix_path):
-            raise FileNotFoundError(f"Similarity matrix '{sim_matrix_path}' not found. Please run feature extraction first.")
+            raise FileNotFoundError(f"Similarity matrix not found: {sim_matrix_path}")
 
-        # Load the similarity matrix
-        self.sim_matrix = torch.load(sim_matrix_path)
-        # # Convert to distance matrix
-        self.distance_matrix = (1.0 - self.sim_matrix).numpy()
+        sim = torch.load(sim_matrix_path, map_location="cpu")
+        self.original = (1.0 - sim.float()).numpy()
+        del sim # Free memory
 
-        # Check that specified datasets exist - need MCTS reconstructued directories
+        mode = getattr(self, "rerank_mode", "keypoints") # "keypoints" | "depth" | "both"
+
+        # 2. Handle Depth-Only Mode
+        if mode == "depth":
+            self.rerank_depth()
+            return self.original, None, self.depth_reranked
+
+        # 3. Keypoint/Both Mode: Ensure MCTS files exist
         root = self.data_root
-        self.reference_path = os.path.join(root, self.reference, f"mcts_{self.reference}_{self.mcts_time[-1]}")
-        self.query_path = os.path.join(root, self.query, f"mcts_{self.query}_{self.mcts_time[-1]}")
+        self.reference_path = os.path.join(root, self.dataset, self.reference, f"mcts_{self.reference}_{self.mcts_time[-1]}")
+        self.query_path = os.path.join(root, self.dataset, self.query, f"mcts_{self.query}_{self.mcts_time[-1]}")
 
-        if not os.path.exists(self.reference_path):
-            # Generate MCTS features
+        # Ensure keypoints are extracted
+        if (not os.path.exists(self.reference_path)) or (not os.path.exists(self.query_path)):
             gen_mcts(root, self.dataset, self.reference, self.query, self.mcts_time)
-            self.extract_keypoints()
         
-        if not os.path.exists(self.query_path):
-            # Generate MCTS features
-            gen_mcts(root, self.dataset, self.reference, self.query, self.mcts_time)
+        # Ensure keypoint directories are defined
+        self.reference_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.reference}")
+        self.query_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.query}")
+
+        if (not os.path.exists(self.reference_keypoints)) or (not os.path.exists(self.query_keypoints)):
             self.extract_keypoints()
-        
-        # Re-rank the top-k candidates using 2D-homology
+
+        # 4. Perform Keypoint Re-ranking
         self.rerank()
 
-        return self.distance_matrix, self.new_dist_matrix
+        # 5. Optional: Chain Depth Re-ranking
+        if mode == "both":
+            # Use keypoint-refined distances as the base for depth refinement
+            self.distance_matrix = self.keypoint_reranked.copy()
+            self.rerank_depth()
+
+            return self.original, self.keypoint_reranked, self.depth_reranked
+        
+        return self.original, self.keypoint_reranked, None
