@@ -16,9 +16,12 @@ keypoints = {cmd = "pixi run -e superevent python3 main.py --mode keypoints"}
 
 rerank = {cmd = "pixi run -e superevent python3 eventgem/rerank.py"}
 
+stream = {cmd = "pixi run -e stream python3 stream.py"}
+
 [environments]
 backbone = ["backbone"]
 superevent = ["superevent"]
+stream = ["stream"]
 
 [dependencies]
 prettytable = "*"
@@ -29,6 +32,58 @@ h5py = "*"
 numpy = "<2"
 scipy = "*"
 pandas = "*"
+
+[feature.stream.dependencies]
+python = ">3.8"
+numpy = "*"
+pytorch = "*"
+torchvision = "*"
+pytorch-lightning  = "*"
+einops = "*"
+timm = "*"
+pyyaml = "*"
+flatten-dict = "*"
+torch-scatter = "*"
+opencv = "*"
+tqdm = "*"
+scikit-learn = "*"
+pynmea2 = "*"
+pyarrow = "*"
+cmapy = "*"
+contourpy = "*"
+cycler = "*"
+filelock = "*"
+fonttools = "*" 
+fsspec = "*"
+h5py = "*"
+hdf5plugin = "*"
+imageio = "*"
+Jinja2 = "*"
+joblib = "*"
+kiwisolver = "*"
+kornia = "*"
+kornia-rs = "*"
+lazy_loader = "*"
+llvmlite = "*"
+MarkupSafe = "*"
+matplotlib = "*"
+mpmath = "*"
+networkx = "*"
+numba = "*"
+packaging = "*"
+pillow = "*"
+pyparsing = "*"
+python-dateutil = "*"
+scikit-image = "*"
+scipy = "*"
+six = "*"
+sympy = "*"
+threadpoolctl = "*"
+tifffile = "*"
+torchaudio = "*"
+triton = "*"
+typing_extensions = "*"
+prettytable = "*"
 
 [feature.backbone.dependencies]
 python = ">3.8"

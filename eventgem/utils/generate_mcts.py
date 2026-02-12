@@ -708,10 +708,11 @@ def gen_mcts(
         H, W = 480, 640
         t_is_epoch_ns = True
     elif dataset == "fast_slow" or dataset == "qcr_event":
-        time_scale = 1  # microseconds to seconds
+        time_scale = 1e-6  # microseconds to seconds
         ref_start = 0.0
         query_start = 0.0
         H, W = 240, 346
+        t_is_epoch_ns = False
     else:
         raise NotImplementedError(f"Dataset not supported for MCTS generation: {dataset}")
     

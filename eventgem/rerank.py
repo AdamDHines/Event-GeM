@@ -184,6 +184,7 @@ def compute_inliers_2d(q_data, r_data, matcher, ransac_thresh):
 def rerank(distance_matrix_path, reference_keypoints, query_keypoints, ground_truth, output, top_k=100, 
            ransac_thresh=5.0, inlier_weight=0.5, k=[1,5,10], kp_pattern="mcts_{:05d}.feat.npz"):
     distance_matrix = np.load(distance_matrix_path)
+    # distance_matrix = 1-distance_matrix
     R, Q = distance_matrix.shape
     # load the ground truth file
     gt = np.load(ground_truth)
