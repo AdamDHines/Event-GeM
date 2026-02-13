@@ -255,6 +255,26 @@ class EventGeM:
         desc_sampled = F.normalize(desc_sampled, p=2, dim=1)
         return desc_sampled
 
+    def debug_plot_keypoints(self, mcts_img, kpts_yx, save_path="debug_kpts.png"):
+        """
+        mcts_img: The tensor or numpy array [H, W] or [H, W, 3]
+        kpts_yx: The keypoints in [N, 2] format (y, x)
+        """
+        if torch.is_tensor(mcts_img):
+            img = mcts_img.detach().cpu().numpy()
+        else:
+            img = mcts_img
+
+        # Normalize image for visualization if it's raw event data
+        img = ((img - img.min()) / (img.max() - img.min() + 1e-8) * 255).astype(np.uint8)
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        for y, x in kpts_yx:
+            cv2.circle(img, (int(x), int(y)), 2, (0, 255, 0), -1)
+
+        cv2.imwrite(save_path, img)
+        print(f"[DEBUG] Keypoint visualization saved to {save_path}")
 
     def extract_superevent_features_for_dir(
         self,
@@ -289,6 +309,7 @@ class EventGeM:
 
             with torch.no_grad():
                 pred = model(batch)
+                print(pred.keys())  # Debug: print keys of the prediction dictionary
 
                 # Older versions might return a tuple
                 if isinstance(pred, tuple):
@@ -341,6 +362,8 @@ class EventGeM:
                 xs = kpts_np[:, 1]
                 ys = kpts_np[:, 0]
                 kpts_xy = np.stack([xs, ys], axis=-1).astype(np.float32)  # (N, 2), (x, y)
+
+                self.debug_plot_keypoints(batch[b], kpts_xy, save_path=f"debug_kpts_{frame_idx-1:05d}.png")
 
                 # Save per-frame NPZ, same structure as original
                 np.savez_compressed(
@@ -702,6 +725,8 @@ class EventGeM:
 
         # 4. Perform Keypoint Re-ranking
         self.rerank()
+        # save the self.keypoint_ranked matrix
+        np.save('keypoint_reranked.npy', self.keypoint_reranked)
 
         # 5. Optional: Chain Depth Re-ranking
         if mode == "both":

@@ -6,13 +6,13 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 from collections import OrderedDict
 
+import os
 import sys
 import yaml
 import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
-
 # Kornia is required for the Batched GPU RANSAC
 try:
     from kornia.geometry.transform import get_perspective_transform
@@ -36,7 +36,6 @@ EVENT_T_KEYS = ("t", "timestamp", "timestamps", "time", "times")
 EVENT_X_KEYS = ("x", "x_coordinate", "x_coordinates", "u", "col", "column")
 EVENT_Y_KEYS = ("y", "y_coordinate", "y_coordinates", "v", "row")
 EVENT_P_KEYS = ("p", "polarity", "polarities", "pol", "polarity_bit", "polarity_bits")
-
 
 def _find_first_dataset(g: h5py.Group, candidates: tuple[str, ...], logical_name: str):
     for key in candidates:
@@ -295,24 +294,55 @@ def gpu_polarity_frame_2ch(
 
     x = torch.from_numpy(x_np).to(device=device, dtype=torch.int64)
     y = torch.from_numpy(y_np).to(device=device, dtype=torch.int64)
-    p = torch.from_numpy(p_np).to(device=device, dtype=torch.int8)
+
+    # KEY FIX: keep p as-is, then promote safely before >0
+    p = torch.from_numpy(p_np).to(device=device)
+    if p.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+        p_cmp = p.to(torch.int16)   # prevents uint8 255 -> int8 -1 wrap
+    else:
+        p_cmp = p
 
     valid = (x >= 0) & (x < W) & (y >= 0) & (y < H)
     if not torch.any(valid):
         return torch.zeros((2, H, W), device=device, dtype=torch.float32), 0
 
-    x = x[valid]; y = y[valid]; p = p[valid]
+    x = x[valid]; y = y[valid]; p_cmp = p_cmp[valid]
     n_valid = int(x.numel())
 
     flat = H * W
     lin = y * W + x
-    ch = (p > 0).to(torch.int64)
+    ch = (p_cmp > 0).to(torch.int64)
+
     idx = lin + ch * flat
 
     counts = torch.bincount(idx, minlength=2 * flat).to(torch.float32)
     frame = counts.view(2, flat).view(2, H, W)
+
     return frame, n_valid
 
+@torch.no_grad()
+def vit_preprocess_like_dataloader(pol_2hw: torch.Tensor, out_hw=(224, 224)) -> torch.Tensor:
+    """
+    Match EventGeMData.__getitem__ preprocessing:
+      - input: (2,H,W) float counts on GPU
+      - output: (1,2,224,224) float in [-1, 1]
+    """
+    x = pol_2hw.unsqueeze(0)  # (1,2,H,W)
+    x = F.interpolate(x, size=out_hw, mode="bilinear", align_corners=False)
+
+    # Robust Norm (98th percentile) over all elements (matches dataloader)
+    flat = x.reshape(-1)
+    if flat.numel() > 0:
+        k = int(0.98 * flat.numel())
+        k = max(1, min(k, flat.numel()))
+        robust_max, _ = torch.kthvalue(flat, k)
+        robust_max = torch.clamp(robust_max, min=1.0)  # matches "if <1e-6 -> 1.0" behavior safely
+
+        x = torch.clamp(x, max=robust_max)
+        x = x / robust_max
+        x = x * 2.0 - 1.0
+
+    return x
 
 def normalize_frame(frame_2hw: torch.Tensor, mode: str) -> torch.Tensor:
     if mode == "none":
@@ -485,17 +515,19 @@ def load_ref_vit_db(ref_feats_path: str, device: torch.device, dtype: torch.dtyp
 
 
 @torch.no_grad()
-def retrieve_topk(ref_db: torch.Tensor, q_desc: torch.Tensor, k: int):
+def retrieve_topk(ref_db: torch.Tensor, q_desc: torch.Tensor, k: int, return_sims: bool = False):
     q = q_desc[0] if q_desc.ndim == 2 else q_desc
     q = q.to(dtype=ref_db.dtype)
     q = F.normalize(q, p=2, dim=0)
 
-    sims = torch.matmul(ref_db, q)
+    sims = torch.matmul(ref_db, q)  # [N_ref]
     kk = min(int(k), int(sims.numel()))
     top_sim, top_idx = torch.topk(sims, k=kk, largest=True)
     top_dist = (1.0 - top_sim).to(torch.float32)
-    return top_idx, top_dist
 
+    if return_sims:
+        return top_idx, top_dist, sims
+    return top_idx, top_dist
 
 # ---------------------------
 # Batch GPU Rerank Helpers
@@ -590,7 +622,7 @@ def batched_ransac_rerank(
     # Gather Top Matches
     s1_masked = top_val[:, :, 0].clone()
     s1_masked[~pass_ratio] = -10.0
-    
+
     # Select best 'max_matches' per candidate
     _, best_match_indices = torch.topk(s1_masked, k=max_matches, dim=1) 
     
@@ -599,22 +631,33 @@ def batched_ransac_rerank(
     ref_match_indices = torch.gather(top_idx[:,:,0], 1, best_match_indices) 
     dst_pts = torch.gather(r_kpts, 1, ref_match_indices.unsqueeze(-1).expand(-1, -1, 2))
 
-    # --- Sanitization ---
-    # Replace INVALID matches (failed ratio) with large random noise.
-    # This keeps the tensor shapes consistent but ensures "bad" matches 
-    # don't accidentally form collinear structures with "good" matches.
-    gathered_pass = torch.gather(pass_ratio, 1, best_match_indices) # [B, M]
-    valid_mask = gathered_pass.unsqueeze(-1) # [B, M, 1]
-
-    noise_src = torch.randn_like(src_pts) * 1000.0
-    noise_dst = torch.randn_like(dst_pts) * 1000.0
+# --- 1. Identify Valid Matches (WITHIN THE 512 LIMIT) ---
+    # pass_ratio was calculated on the full set, 
+    # but we only kept 'max_matches' (512) for src_pts/dst_pts.
+    # We must slice pass_ratio to match.
+    gathered_pass = torch.gather(pass_ratio, 1, best_match_indices) # [B, 512]
+    num_valid_per_cand = gathered_pass.sum(dim=1) # [B]
     
-    src_pts = torch.where(valid_mask, src_pts, noise_src)
-    dst_pts = torch.where(valid_mask, dst_pts, noise_dst)
-
-    # --- 2. Vectorized RANSAC ---
-    # Sample 4 random points per iteration: [B, iter, 4]
-    rand_idx = torch.randint(0, max_matches, (B, iterations, 4), device=device)
+    # Sort the 512 points so valid ones (1s) come before invalid ones (0s)
+    _, sort_idx = torch.sort(gathered_pass.float(), dim=1, descending=True)
+    
+    # Now gather from the ALREADY-CAPPED src_pts and dst_pts
+    src_pts = torch.gather(src_pts, 1, sort_idx.unsqueeze(-1).expand(-1, -1, 2))
+    dst_pts = torch.gather(dst_pts, 1, sort_idx.unsqueeze(-1).expand(-1, -1, 2))
+    
+    # --- 2. Vectorized Range-Bound Sampling ---
+    rand_floats = torch.rand((B, iterations, 4), device=device)
+    
+    # Scale by num_valid so we only pick from the "packed" valid matches at the front
+    # We clamp at 4 because RANSAC needs at least 4 points to run the DLT math
+    sampling_limit = num_valid_per_cand.view(B, 1, 1).clamp(min=4)
+    rand_idx = (rand_floats * sampling_limit).long()
+    
+    # --- 3. Global Indexing (Same as before but now restricted) ---
+    batch_offsets = torch.arange(B, device=device).view(B, 1, 1) * max_matches
+    global_rand_idx = (rand_idx + batch_offsets).view(-1)
+    
+    # ... rest of your DLT and inlier counting logic ...
     
     # Gather 4-point sets
     # Expand src_pts to [B, iter, M, 2] is too big memory-wise?
@@ -623,8 +666,8 @@ def batched_ransac_rerank(
     # flat_rand_idx: [B, iter, 4] -> values in 0..M-1
     # We need global indices into flattened [B*M, 2] array
     
-    batch_offsets = torch.arange(B, device=device).view(B, 1, 1) * max_matches
-    global_rand_idx = (rand_idx + batch_offsets).view(-1) # [B*iter*4]
+    # batch_offsets = torch.arange(B, device=device).view(B, 1, 1) * max_matches
+    # global_rand_idx = (rand_idx + batch_offsets).view(-1) # [B*iter*4]
     
     src_flat = src_pts.view(-1, 2) # [B*M, 2]
     dst_flat = dst_pts.view(-1, 2)
@@ -677,6 +720,32 @@ def batched_ransac_rerank(
     
     return best_counts.cpu().numpy().astype(np.int32)
 
+import matplotlib.pyplot as plt
+import cv2
+
+def debug_plot_keypoints(mcts_img, kpts_yx, save_path="debug_kpts.png"):
+    """
+    mcts_img: The tensor or numpy array [H, W] or [H, W, 3]
+    kpts_yx: The keypoints in [N, 2] format (y, x)
+    """
+    # print(mcts_img.shape, kpts_yx.shape)
+    if torch.is_tensor(mcts_img):
+        img = mcts_img.detach().cpu().numpy()
+    else:
+        img = mcts_img
+    
+    # print(img.shape)
+
+    # Normalize image for visualization if it's raw event data
+    img = ((img - img.min()) / (img.max() - img.min() + 1e-8) * 255).astype(np.uint8)
+    if len(img.shape) == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    for y, x in kpts_yx:
+        cv2.circle(img, (int(x), int(y)), 2, (0, 255, 0), -1)
+
+    cv2.imwrite(save_path, img)
+    print(f"[DEBUG] Keypoint visualization saved to {save_path}")
 
 # ---------------------------
 # Stats formatting
@@ -686,32 +755,213 @@ def summarize_ms(arr: np.ndarray, name: str) -> str:
         return f"{name}: (no data)"
     return f"{name} ms | mean {arr.mean():.2f}  med {np.median(arr):.2f}  p95 {np.percentile(arr,95):.2f}  max {arr.max():.2f}"
 
+def build_reranked_column_from_sims(
+    sims_t: torch.Tensor,
+    cand_ids: np.ndarray,
+    inlier_counts: np.ndarray,
+    inlier_weight: float,
+) -> np.ndarray:
+    """
+    Build a dense reranked distance column for ONE query.
+
+    - sims_t: torch tensor [N_ref] (cosine sims, higher is better) or any 1D similarity vector.
+    - cand_ids: np int array [B] candidate reference indices (e.g., top_idx_t from retrieve_topk).
+    - inlier_counts: np int/float array [B] inlier counts per candidate (same order as cand_ids).
+    - inlier_weight: float, applied as dist -= inlier_weight * inlier_count
+
+    Returns:
+      reranked_dist_col: np.ndarray [N_ref] float32, where non-candidates keep base dist (1-sim),
+      and candidates get adjusted distances.
+    """
+    # base distance column: lower is better
+    sims_np = sims_t.detach().float().cpu().numpy().reshape(-1)  # [N_ref]
+    base_dist = (1.0 - sims_np).astype(np.float32, copy=False)   # [N_ref]
+
+    # no candidates => identical to base
+    if cand_ids is None or len(cand_ids) == 0:
+        return base_dist
+
+    cand_ids = np.asarray(cand_ids, dtype=np.int64).reshape(-1)
+    inlier_counts = np.asarray(inlier_counts, dtype=np.float32).reshape(-1)
+
+    # defensive: align lengths
+    B = min(cand_ids.size, inlier_counts.size)
+    cand_ids = cand_ids[:B]
+    inlier_counts = inlier_counts[:B]
+
+    # adjusted distances for candidates
+    adj = (inlier_weight * inlier_counts).astype(np.float32, copy=False)
+    base_dist[cand_ids] = base_dist[cand_ids] - adj
+    return base_dist
+
+def recallAtK(S, GT, K=1):
+    """
+    Calculates the recall@K for a given similarity matrix S and ground truth matrix GT.
+    Note that this method does not support GTsoft - instead, please directly provide
+    the dilated ground truth matrix as GT.
+
+    The matrices S and GT are two-dimensional and should all have the same shape.
+    The matrix GT should be binary, where the entries are only zeros or ones.
+    The matrix S should have continuous values between -Inf and Inf. Higher values
+    indicate higher similarity.
+    The integer K>=1 defines the number of matching candidates that are selected and
+    that must contain an actually matching image pair.
+    """
+
+    assert (S.shape == GT.shape),"S and GT must have the same shape"
+    assert (S.ndim == 2),"S and GT must be two-dimensional"
+    assert (K >= 1),"K must be >=1"
+
+    # ensure logical datatype in GT
+    GT = GT.astype('bool')
+
+    # discard all query images without an actually matching database image
+    j = GT.sum(0) > 0 # columns with matches
+    S = S[:,j] # select columns with a match
+    GT = GT[:,j] # select columns with a match
+
+    # select K highest similarities
+    i = S.argsort(0)[-K:,:]
+    j = np.tile(np.arange(i.shape[1]), [K, 1])
+    GT = GT[i, j]
+
+    # recall@K
+    RatK = np.sum(GT.sum(0) > 0) / GT.shape[1]
+
+    return RatK
+
+def build_reranked_column_from_topdists(
+    N_ref: int,
+    sims_t: torch.Tensor,
+    cand_ids: np.ndarray,
+    cand_base_dist: np.ndarray,
+    inlier_counts: np.ndarray,
+    inlier_weight: float,
+    *,
+    fill_mode: str = "base",   # "base" uses (1-sims) for non-cands, "inf" sets non-cands to +inf
+) -> np.ndarray:
+    """
+    Alternative: if you already have cand_base_dist = top_dist_t (1 - top_sim) for the shortlist,
+    you can compute reranked values for shortlist and fill the rest either with base distances
+    from sims_t or +inf.
+
+    Returns:
+      reranked_dist_col: np.ndarray [N_ref] float32
+    """
+    cand_ids = np.asarray(cand_ids, dtype=np.int64).reshape(-1)
+    cand_base_dist = np.asarray(cand_base_dist, dtype=np.float32).reshape(-1)
+    inlier_counts = np.asarray(inlier_counts, dtype=np.float32).reshape(-1)
+
+    B = min(cand_ids.size, cand_base_dist.size, inlier_counts.size)
+    cand_ids = cand_ids[:B]
+    cand_base_dist = cand_base_dist[:B]
+    inlier_counts = inlier_counts[:B]
+
+    if fill_mode == "inf":
+        col = np.full((N_ref,), np.inf, dtype=np.float32)
+    elif fill_mode == "base":
+        sims_np = sims_t.detach().float().cpu().numpy().reshape(-1)
+        col = (1.0 - sims_np).astype(np.float32, copy=False)
+        if col.size != N_ref:
+            raise ValueError(f"sims_t has {col.size} refs but N_ref={N_ref}")
+    else:
+        raise ValueError("fill_mode must be 'base' or 'inf'")
+
+    col[cand_ids] = cand_base_dist - (inlier_weight * inlier_counts)
+    return col
 
 # ---------------------------
 # Main
 # ---------------------------
 def main():
+    # ap = argparse.ArgumentParser()
+    # ap.add_argument("--hdf5", type=str, required=True)
+    # ap.add_argument("--backbone-ckpt", type=str, required=True)
+    # ap.add_argument("--norm", type=str, default="logmax", choices=["none", "max", "logmax"])
+    # ap.add_argument("--resize", type=str, default="nearest", choices=["nearest", "bilinear"])
+    # ap.add_argument("--amp", action="store_true")
+
+    # ap.add_argument("--ref-feats", type=str, required=True)
+    # ap.add_argument("--retrieval-k", type=int, default=33)
+
+    # ap.add_argument("--se-config", type=str, required=True)
+    # ap.add_argument("--se-weights", type=str, required=True)
+    # ap.add_argument("--se-topk", type=int, default=170)
+
+    # ap.add_argument("--do-rerank", action="store_true")
+    # ap.add_argument("--ref-kp-dir", type=str, default=None)
+    # ap.add_argument("--ref-kp-pattern", type=str, default="mcts_{:05d}.feat.npz")
+    # ap.add_argument("--ref-kp-preload", action="store_true")
+    # ap.add_argument("--ref-kp-cache", type=int, default=2048)
+    # ap.add_argument("--ransac-thresh", type=float, default=5.0)
+    # ap.add_argument("--inlier-weight", type=float, default=0.05)
+    # ap.add_argument("--match-ratio", type=float, default=0.8)
+
+    # ap.add_argument("--mcts-windows-ms", type=int, nargs="+", default=[10, 20, 30, 40, 50])
+    # ap.add_argument("--dt-ms", type=float, default=50.0)
+    # ap.add_argument("--target-hz", type=float, default=20.0)
+    # ap.add_argument("--realtime", action="store_true")
+    # ap.add_argument("--chunk-size", type=int, default=250_000)
+    # ap.add_argument("--time-scale", type=float, default=1e-9)
+    # ap.add_argument("--start-time", type=float, default=None)
+    # ap.add_argument("--max-frames", type=int, default=None)
+
+    # ap.add_argument("--height", type=int, default=0)
+    # ap.add_argument("--width", type=int, default=0)
+    # ap.add_argument("--infer-full-scan", action="store_true")
+
+    # ap.add_argument("--warmup", type=int, default=50)
+    # ap.add_argument("--gt-file", type=str, default=None,
+    #                 help="Path to the ground truth file")
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--hdf5", type=str, required=True)
-    ap.add_argument("--backbone-ckpt", type=str, required=True)
+    ap.add_argument(
+        "--hdf5",
+        type=str,
+        default="/media/adam/vprdatasets/eventlab/brisbane_event/sunset1/sunset1.hdf5",
+    )
+    ap.add_argument(
+        "--backbone-ckpt",
+        type=str,
+        default="./eventgem/ckpt/pr.pt",
+    )
     ap.add_argument("--norm", type=str, default="logmax", choices=["none", "max", "logmax"])
     ap.add_argument("--resize", type=str, default="nearest", choices=["nearest", "bilinear"])
     ap.add_argument("--amp", action="store_true")
 
-    ap.add_argument("--ref-feats", type=str, required=True)
-    ap.add_argument("--retrieval-k", type=int, default=33)
+    ap.add_argument(
+        "--ref-feats",
+        type=str,
+        default="eventgem/features/brisbane_event/sunset2-sunset1/brisbane_event_sunset2_features.pt",
+    )
+    ap.add_argument("--retrieval-k", type=int, default=50)
 
-    ap.add_argument("--se-config", type=str, required=True)
-    ap.add_argument("--se-weights", type=str, required=True)
-    ap.add_argument("--se-topk", type=int, default=1024)
+    ap.add_argument(
+        "--se-config",
+        type=str,
+        default="./eventgem/external/superevent/config/super_event.yaml",
+    )
+    ap.add_argument(
+        "--se-weights",
+        type=str,
+        default="./eventgem/external/superevent/saved_models/super_event_weights.pth",
+    )
+    ap.add_argument("--se-topk", type=int, default=170)
 
-    ap.add_argument("--do-rerank", action="store_true")
-    ap.add_argument("--ref-kp-dir", type=str, default=None)
+    # default rerank ON, with an escape hatch flag to disable it
+    ap.add_argument("--do-rerank", dest="do_rerank", action="store_true", default=True)
+    ap.add_argument("--no-rerank", dest="do_rerank", action="store_false")
+
+    ap.add_argument(
+        "--ref-kp-dir",
+        type=str,
+        default="./eventgem/keypoints/brisbane_event/kps_sunset2",
+    )
     ap.add_argument("--ref-kp-pattern", type=str, default="mcts_{:05d}.feat.npz")
     ap.add_argument("--ref-kp-preload", action="store_true")
     ap.add_argument("--ref-kp-cache", type=int, default=2048)
     ap.add_argument("--ransac-thresh", type=float, default=5.0)
-    ap.add_argument("--inlier-weight", type=float, default=1e-3)
+    ap.add_argument("--inlier-weight", type=float, default=0.05)
     ap.add_argument("--match-ratio", type=float, default=0.8)
 
     ap.add_argument("--mcts-windows-ms", type=int, nargs="+", default=[10, 20, 30, 40, 50])
@@ -720,7 +970,7 @@ def main():
     ap.add_argument("--realtime", action="store_true")
     ap.add_argument("--chunk-size", type=int, default=250_000)
     ap.add_argument("--time-scale", type=float, default=1e-9)
-    ap.add_argument("--start-time", type=float, default=None)
+    ap.add_argument("--start-time", type=float, default=1587452582.35)
     ap.add_argument("--max-frames", type=int, default=None)
 
     ap.add_argument("--height", type=int, default=0)
@@ -728,6 +978,12 @@ def main():
     ap.add_argument("--infer-full-scan", action="store_true")
 
     ap.add_argument("--warmup", type=int, default=50)
+    ap.add_argument(
+        "--gt-file",
+        type=str,
+        default="/media/adam/vprdatasets/eventgem/ground_truth/sunset2_sunset1_GT.npy",
+        help="Path to the ground truth file",
+    )
 
     args = ap.parse_args()
 
@@ -799,6 +1055,8 @@ def main():
 
     print("[INFO] Starting Loop...", flush=True)
 
+    reranked_cols = []
+    sims = []
     with torch.inference_mode():
         for (w0_sec, w1_sec, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms) in stream_event_windows_raw(
             hdf5_path, args.dt_ms, args.chunk_size, args.time_scale, args.start_time, args.max_frames
@@ -813,9 +1071,9 @@ def main():
             with torch.cuda.stream(stream_vit):
                 vit0.record(stream_vit)
                 pol_2hw, _ = gpu_polarity_frame_2ch(x, y, p, H, W, device)
-                pol_2hw = normalize_frame(pol_2hw, args.norm)
+                # pol_2hw = normalize_frame(pol_2hw, args.norm)
 
-                inp = pol_2hw.unsqueeze(0)
+                inp = vit_preprocess_like_dataloader(pol_2hw, out_hw=(vitH, vitW))
                 if (H != vitH) or (W != vitW):
                     mode = "nearest" if args.resize == "nearest" else "bilinear"
                     inp = F.interpolate(inp, size=(vitH, vitW), mode=mode, align_corners=False if mode=="bilinear" else None)
@@ -827,9 +1085,10 @@ def main():
                     q_desc_vit = vit_gem_descriptor(vit, inp)
 
                 ret0.record(stream_vit)
-                top_idx_t, top_dist_t = retrieve_topk(ref_db, q_desc_vit, k=int(args.retrieval_k))
+                top_idx_t, top_dist_t, sims_t = retrieve_topk(ref_db, q_desc_vit, k=int(args.retrieval_k), return_sims=True)
                 ret1.record(stream_vit)
                 vit1.record(stream_vit)
+                sims.append(sims_t.cpu())
 
             with torch.cuda.stream(stream_se):
                 se0.record(stream_se)
@@ -837,14 +1096,13 @@ def main():
                 mcts = mcts[:, off_top:h_end, off_left:w_end] 
                 
                 pred = se_model(mcts.unsqueeze(0))
-                if isinstance(pred, tuple): 
-                    prob, desc_map = pred[0], pred[1]
-                else: 
-                    prob, desc_map = pred['prob'], pred['descriptors']
+                prob, desc_map = pred['prob'], pred['descriptors']
                 
                 kpts_all, _ = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
                 kpts_yx = kpts_all[0]
-                
+
+                # debug_plot_keypoints(mcts[0], kpts_yx.cpu().numpy(), save_path=f"debug_kpts_{frame_idx}.png")
+
                 q_k_desc = sample_descriptors_at_kpts(kpts_yx.float(), desc_map)
                 se1.record(stream_se)
 
@@ -870,9 +1128,19 @@ def main():
                 
                 inlier_counts = batched_ransac_rerank(
                     q_xy, q_k_desc, ref_store, cand_ids, 
-                    max_matches=512, ratio_thresh=float(args.match_ratio)
+                    max_matches=170, ratio_thresh=float(args.match_ratio)
                 )
-                
+
+                # after you compute inlier_counts for cand_ids, build the new column:
+                new_col = build_reranked_column_from_sims(
+                    sims_t=sims_t,
+                    cand_ids=cand_ids,
+                    inlier_counts=inlier_counts,
+                    inlier_weight=float(args.inlier_weight),
+                )
+                # then stash it for later matrix assembly (or write to disk)
+                reranked_cols.append(new_col)
+
                 final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
                 best_arg = np.argmin(final_scores)
                 best_idx = cand_ids[best_arg]
@@ -899,7 +1167,7 @@ def main():
 
     wall_s = time.perf_counter() - wall0
     n_frames = len(t_total_list)
-    
+
     print("\n========== SUMMARY ==========")
     print(f"Frames: {n_frames} | Wall: {wall_s:.2f}s | Avg FPS: {n_frames/wall_s:.2f}")
     t_total_np = np.array(t_total_list)
@@ -910,6 +1178,30 @@ def main():
     print(summarize_ms(t_total_np, "Total End2End"))
     print(f"Over budget ({args.dt_ms}ms): {np.sum(t_total_np > args.dt_ms)}/{n_frames}")
 
+    S_vit = np.stack(sims, axis=0).squeeze()  # [N_ref] or [N_ref, N_queries]
+    S_vit = S_vit.T  # [N_queries, N_ref]
+    np.save("S_vit_nonorm.npy", S_vit)
+    # stack the reranked cols
+    if args.gt_file is not None:
+        reranked_cols_stack = np.stack(reranked_cols, axis=0)
+        reranked_cols_stack = reranked_cols_stack.T
+        S_in = 1-reranked_cols_stack
+        print(S_in.shape)
+        np.save("S_in.npy", S_in)
+        K = [1, 5, 10]
+        # load ground truth file
+        gt = np.load(args.gt_file)
+        # resize to match shape of reranked_cols_stack if needed
+        from skimage.transform import resize
+        gt_resized = resize(gt, S_in.shape, order=0, preserve_range=True, anti_aliasing=False)
+        from prettytable import PrettyTable
+        table = PrettyTable()
+
+        # add columns for each K
+        for k in K:
+            table.add_column(f"Recall@{k}", [recallAtK(S_in, gt_resized, K=k)])
+
+        print(table)
 
 if __name__ == "__main__":
     main()
