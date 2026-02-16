@@ -1,7 +1,7 @@
 [workspace]
 authors = ["Adam Hines <adam.hines@qut.edu.au>"]
 channels = ["conda-forge"]
-name = "Event-GeM"
+name = "EventGeM"
 platforms = ["linux-64"]
 version = "0.1.0"
 
