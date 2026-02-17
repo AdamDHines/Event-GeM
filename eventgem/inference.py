@@ -9,7 +9,7 @@ import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
-
+from tqdm import tqdm
 from external.depthanyevent.models import fetch_model  # from the DepthAnyEvent repo
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -29,7 +29,7 @@ def main():
     ap.add_argument("--backbone-ckpt", type=str, required=True)
     ap.add_argument("--resize", type=str, default="nearest", choices=["nearest", "bilinear"])
     ap.add_argument("--amp", action="store_true")
-    ap.add_argument("--method", type=str,  default="eventgem", choices=["eventgem", "eventgem-d", "ecdpt", "superevent", "lens", "sparse", "netvlad"],
+    ap.add_argument("--method", type=str,  default="eventgem", choices=["eventgem", "eventgem-d", "ecdpt", "superevent", "lens", "sparse", "eventvlad"],
                     help="Which method to run (for ablation or comparison)")
     ap.add_argument("--se-max", default=None, type=int,
                     help="Max number of frames to compute runtime")
@@ -91,7 +91,7 @@ def main():
         
         t0_raw = int(t_dset[0]); tN_raw = int(t_dset[-1])
         print(f"[INFO] Sensor: {H}x{W}")
-
+    print(args.method)
     # Load the corresponding model to run the inference on
     if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
         vit = stream.load_vit_backbone(args.backbone_ckpt, device)
@@ -120,6 +120,52 @@ def main():
         stream_d = torch.cuda.Stream()
         prev_states=None
 
+    if args.method == "lens":
+        # model name
+        model_name = '/home/adam/repo/Event-GeM/sunset2-frames-50_LENS_IN784_FN1568_DB12824.pth'
+        lens_model = stream.LENS()
+        lens_model.load_state_dict(torch.load(model_name), strict=False)
+        stream_lens = torch.cuda.Stream()
+
+    if args.method == "sparse":
+        stream_sparse = torch.cuda.Stream()
+        ref_dir = '/media/adam/vprdatasets/eventgem/brisbane_event/sunset2/sunset2-frames-50'
+        # preload frames
+        ref_npy = sorted(list(Path(ref_dir).glob("*.npy")))
+        frames = np.array([np.load(p) for p in ref_npy])
+
+        reference_data = [arr.sum(axis=2) for arr in frames]
+        reference_data = np.array(reference_data)
+        del frames
+        reference_data_noburst = stream.remove_random_bursts(reference_data, threshold=10)
+        reference_event_means = reference_data_noburst.mean(axis=0)
+
+        prob_to_draw_from = stream.adjust_and_normalize_probabilities(reference_event_means)
+        random_pixels = np.array(stream.get_random_pixels(100, 
+                                            im_width=346, 
+                                            im_height=260, 
+                                            local_suppression_radius=7, 
+                                            prob_to_draw_from=prob_to_draw_from))
+        x_coords = random_pixels[:, 1]
+        y_coords = random_pixels[:, 0]
+        sparse_reference_data = reference_data[:, y_coords, x_coords]
+        print(sparse_reference_data.shape)
+        del reference_data
+    
+    if args.method == "eventvlad":
+        stream_vlad = torch.cuda.Stream()
+        # preload the reference descriptors
+        ref_desc = np.load('/media/adam/vprdatasets/eventgem/brisbane_event/sunset2/sunset2_eventvlad.npy')
+        denoise_model = stream.build_model('event_denoiser', dep_u=5, dep_s=5, slope=0.2).to(device)
+        ckpt_path = '/home/adam/repo/Event-GeM/eventgem/external/eventlab/baselines/EventVLAD/denoiser_brisbane'
+        denoise_model = stream.load_checkpoint_into_model(denoise_model, ckpt_path)
+        query = None
+        netvlad_model = stream.build_eventvlad_model_from_tar(
+            weights_path="/home/adam/repo/Event-LAB/baselines/EventVLAD/vgg16_eventvlad.tar",
+            num_clusters=64,
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+
     ref_store = None
     if args.do_rerank or args.method in ["superevent"]:
         if args.ref_kp_dir is None:
@@ -139,13 +185,20 @@ def main():
     if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
         vit0 = torch.cuda.Event(True); vit1 = torch.cuda.Event(True)
         ret0 = torch.cuda.Event(True); ret1 = torch.cuda.Event(True)
-    if args.method in ["superevent", "eventgem", "eventgem-d"]:
+    elif args.method in ["superevent", "eventgem", "eventgem-d"]:
         se0 = torch.cuda.Event(True);  se1 = torch.cuda.Event(True)
-    if args.method == "eventgem-d":
+    elif args.method == "eventgem-d":
         d0 = torch.cuda.Event(True);   d1 = torch.cuda.Event(True)
+    elif args.method == "lens":
+        lens0 = torch.cuda.Event(True); lens1 = torch.cuda.Event(True)
+    elif args.method == "sparse":
+         sparse0 = torch.cuda.Event(True); sparse1 = torch.cuda.Event(True)
+    else:
+        vlad0 = torch.cuda.Event(True); vlad1 = torch.cuda.Event(True)
+
     j0 = torch.cuda.Event(True);   j1 = torch.cuda.Event(True)
 
-    t_read_list, t_vit_list, t_se_list, t_rerank_list, t_total_list = [], [], [], [], []
+    t_read_list, t_vit_list, t_se_list, t_rerank_list, t_total_list, t_vlad_list = [], [], [], [], [], []
     n_events_list = []
 
     target_period = 1.0 / max(1e-6, args.target_hz)
@@ -155,6 +208,7 @@ def main():
 
     reranked_cols = []
     sims = []
+    queries = []
     with torch.inference_mode():
         for (_, _, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms) in stream.stream_event_windows_raw(
             hdf5_path, args.dt_ms, args.chunk_size, args.time_scale, args.start_time, args.max_frames
@@ -188,7 +242,7 @@ def main():
                     vit1.record(stream_vit)
                     sims.append(sims_t.cpu())
 
-            if args.method in ["superevent", "eventgem", "eventgem-d"]:
+            elif args.method in ["superevent", "eventgem", "eventgem-d"]:
                 with torch.cuda.stream(stream_se):
                     se0.record(stream_se)
                     mcts = stream.gpu_mcts(x, y, t_raw, p, H, W, int(t_ref_raw), float(args.time_scale), windows_sec, device)
@@ -203,7 +257,7 @@ def main():
                     q_k_desc = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)
                     se1.record(stream_se)
             
-            if args.method == "eventgem-d":
+            elif args.method == "eventgem-d":
                 with torch.cuda.stream(stream_d):
                     d0.record(stream_d)
                     tencode = stream.tencode(x, y, t_raw, p, height=H, width=W, white_frame=False, normalize=True, device=device)
@@ -217,21 +271,68 @@ def main():
                             raise ValueError(f"Model {model_name} not implemented in this script.")
                     d1.record(stream_d)
 
+            elif args.method == "lens":
+                with torch.cuda.stream(stream_lens):
+                    lens0.record(stream_lens)
+                    pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
+                    # combine polarities by summating
+                    pol_combined = pol_2hw.sum(dim=0, keepdim=True)
+                    lens_model.evaluate(pol_combined)
+                    lens1.record(stream_lens)
+            elif args.method == "sparse":
+                sparse0.record(stream_sparse)
+                pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
+                pol_combined = pol_2hw.sum(dim=0, keepdim=True)
+                # sample at random pixels
+                sampled_events = pol_combined[:, y_coords, x_coords]
+                # run a sum of absolute differences
+                stream.get_distance_matrix(sparse_reference_data, sampled_events)
+                sparse1.record(stream_sparse)
+            else:
+                vlad0.record(join_stream)
+                pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
+                pol_combined = pol_2hw.sum(dim=0).cpu().numpy()
+                # we need to wait for 3 inputs to denoise
+                if len(queries) < 3:
+                    queries.append(pol_combined)
+                    continue
+                else:
+                    queries.append(pol_combined)
+                    denoise_query = stream.stream_vlad_denoise(queries, denoise_model)
+                    q_desc_vlad = stream.extract_eventvlad_features(netvlad_model, denoise_query)
+                    vlad1.record(join_stream)
+                    # remove first queries index
+                    queries.pop(0)
+
+
             if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
                 join_stream.wait_stream(stream_vit)
-            if args.method in ["superevent", "eventgem", "eventgem-d"]:
+            elif args.method in ["superevent", "eventgem", "eventgem-d"]:
                 join_stream.wait_stream(stream_se)
-            if args.method == "eventgem-d":
+            elif args.method == "eventgem-d":
                 join_stream.wait_stream(stream_d)
+            elif args.method == "lens":
+                join_stream.wait_stream(stream_lens)
+            elif args.method == "sparse":
+                join_stream.wait_stream(stream_sparse)
+            else:
+                join_stream.wait_stream(stream_vlad)
+
             j1.record(join_stream)
             torch.cuda.synchronize()
             
             if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
                 vit_ms = vit0.elapsed_time(vit1)
-            if args.method in ["superevent", "eventgem", "eventgem-d"]:
+            elif args.method in ["superevent", "eventgem", "eventgem-d"]:
                 se_ms = se0.elapsed_time(se1)
-            if args.method == "eventgem-d":
+            elif args.method == "eventgem-d":
                 d_ms = d0.elapsed_time(d1)
+            elif args.method == "lens":
+                lens_ms = lens0.elapsed_time(lens1)
+            elif args.method == "sparse":
+                sparse_ms = sparse0.elapsed_time(sparse1)
+            else:
+                vlad_ms = vlad0.elapsed_time(vlad1)
 
             t_rerank0 = time.perf_counter()
             if args.do_rerank:
@@ -279,8 +380,6 @@ def main():
                 # Run brute force matching on superevent points
                 dist = []
                 dist.append(stream.bruteforce(q_k_desc, ref_descs))
-            else:
-                continue
 
             # End of processing for this frame, record total time
             t_total = (time.perf_counter() - cpu0) * 1000.0
@@ -295,6 +394,8 @@ def main():
                     t_vit_list.append(vit_ms)
                 if args.method in ["superevent", "eventgem", "eventgem-d"]:
                     t_se_list.append(se_ms)
+                if args.method == "eventvlad":
+                    t_vlad_list.append(vlad_ms)
                 if args.do_rerank:
                     t_rerank_list.append(t_rerank)
                 t_total_list.append(t_total)
@@ -308,8 +409,12 @@ def main():
                     print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} vit={vit_ms:.1f} se={se_ms:.1f} d={d_ms:.1f} rerank={t_rerank:.1f} total={t_total:.1f}ms ({hz:.1f} Hz) best={best_idx} inl={best_inl}", flush=True)
                 elif args.method == "superevent":
                     print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} se={se_ms:.1f} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
+                elif args.method == "lens":
+                    print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} lens={lens_ms:.1f} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
+                elif args.method == "sparse":
+                    print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} sparse={sparse_ms:.1f} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
                 else:
-                    pass
+                    print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} vlad={vlad_ms:.1f} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
 
     wall_s = time.perf_counter() - wall0
     n_frames = len(t_total_list)
@@ -334,8 +439,24 @@ def main():
         print(stream.summarize_ms(np.array(t_rerank_list), "Rerank (Batch GPU)"))
         print(stream.summarize_ms(t_total_np, "Total End2End"))
         print(f"Over budget ({args.dt_ms}ms): {np.sum(t_total_np > args.dt_ms)}/{n_frames}")
-    else:
-        pass
+    elif args.method == "sparse":
+        print("\n========== SUMMARY ==========")
+        print(f"Frames: {n_frames} | Wall: {wall_s:.2f}s | Avg FPS: {n_frames/wall_s:.2f}")
+        t_total_np = np.array(t_total_list)
+        print(stream.summarize_ms(np.array(t_read_list), "Read"))
+        print(stream.summarize_ms(np.array(sparse_ms), "Sparse (GPU)"))
+        print(stream.summarize_ms(t_total_np, "Total End2End"))
+        print(f"Over budget ({args.dt_ms}ms): {np.sum(t_total_np > args.dt_ms)}/{n_frames}")
+    else: # print eventvlad summary
+        print("\n========== SUMMARY ==========")
+        print(f"Frames: {n_frames} | Wall: {wall_s:.2f}s | Avg FPS: {n_frames/wall_s:.2f}")
+        t_total_np = np.array(t_total_list)
+        print(stream.summarize_ms(np.array(t_read_list), "Read"))
+        # vlad ms
+        print(stream.summarize_ms(np.array(t_vlad_list), "VLAD (GPU)"))
+        print(stream.summarize_ms(np.array(t_rerank_list), "Rerank (Batch GPU)"))
+        print(stream.summarize_ms(t_total_np, "Total End2End"))
+        print(f"Over budget ({args.dt_ms}ms): {np.sum(t_total_np > args.dt_ms)}/{n_frames}")
 
     # stack the reranked cols
     if args.gt_file is not None:

@@ -37,6 +37,7 @@ pandas = "*"
 python = ">3.8"
 numpy = "*"
 pytorch = "*"
+sinabs = "*"
 torchvision = "*"
 pytorch-lightning  = "*"
 einops = "*"
@@ -84,6 +85,9 @@ torchaudio = "*"
 triton = "*"
 typing_extensions = "*"
 prettytable = "*"
+
+[pypi-dependencies]
+samna = ">=0.46.0.0"
 
 [feature.backbone.dependencies]
 python = ">3.8"

@@ -13,7 +13,12 @@ import time
 import json
 import os
 from skimage.metrics import structural_similarity as ssim
-
+import sinabs.layers as sl
+from tqdm import tqdm
+import logging
+from streamutils.EventVLAD import Imagenet_vgg
+from streamutils.netvlad import NetVLAD, EmbedNet, TripletNet
+import stat
 # ---------------------------
 # HDF5 helpers
 # ---------------------------
@@ -1257,3 +1262,1078 @@ def bruteforce(query_desc, ref_descs):
         distMat[0, j] = avg_dist
 
     return distMat
+
+# ---------------------------
+# LENS Helpers
+# ---------------------------
+import torch.nn as nn
+class LENS(nn.Module):
+    def __init__(self):
+        super(LENS, self).__init__()
+
+        # Set the arguments
+        input_neurons = 784
+        feature_multiplier = 2
+
+
+        # Change to CPU if selected
+        self.device = torch.device('cpu')
+
+        # Layer dict to keep track of layer names and their order
+        self.layer_dict = {}
+        self.layer_counter = 0
+
+        # Define layer architecture
+        self.input = int(input_neurons)
+        self.feature = int(self.input*feature_multiplier)
+        self.output = int(12824)
+
+        """
+        Define trainable layers here
+        """
+        self.add_layer(
+            'feature_layer',
+            dims=[self.input, self.feature],
+            device=self.device,
+            inference=True
+        )
+        self.add_layer(
+            'output_layer',
+            dims=[self.feature, self.output],
+            device=self.device,
+            inference=True
+        )
+
+        if not hasattr(self, 'matrix'):
+            self.matrix = None
+
+                    # Define convolutional kernel to select the center pixel
+        def _init_kernel():
+            kernel = torch.zeros(1, 1, 9, 12)
+            # Calculate center coordinates for height and width separately
+            center_h = 3 // 2
+            center_w = 3 // 2
+            kernel[0, 0, center_h, center_w] = 1
+            return kernel
+        
+        # Define the Conv2d selection layer
+        self.conv = nn.Conv2d(1, 1, kernel_size=(9, 12), stride=(9, 12), padding=0, bias=False).to(self.device)
+        self.conv.weight = nn.Parameter(_init_kernel(), requires_grad=False) # Set the kernel weights
+
+        # Define the inferencing forward pass
+        self.inference = nn.Sequential(
+            self.conv,
+            nn.ReLU(),
+            nn.Flatten(),
+            self.feature_layer.w,
+            nn.ReLU(),
+            self.output_layer.w,
+        )
+
+        # Define the sinabs model, this converts torch model to sinabs model
+        from sinabs.from_torch import from_model
+        input_shape = (1, 260, 346)
+        self.sinabs_model = from_model(
+                                self.inference.to(self.device), 
+                                input_shape=input_shape,
+                                num_timesteps=1000,
+                                add_spiking_output=True
+        )
+
+
+    def add_layer(self, name, **kwargs):
+        """
+        Dynamically add a layer with given name and keyword arguments.
+        
+        :param name: Name of the layer to be added
+        :type name: str
+        :param kwargs: Hyperparameters for the layer
+        """
+        # Check for layer name duplicates
+        if name in self.layer_dict:
+            raise ValueError(f"Layer with name {name} already exists.")
+        
+        # Add a new SNNLayer with provided kwargs
+        import streamutils.blitnet as bn
+        setattr(self, name, bn.SNNLayer(**kwargs))
+        
+        # Add layer name and index to the layer_dict
+        self.layer_dict[name] = self.layer_counter
+        self.layer_counter += 1          
+
+    def make_spikes(self, input):
+        torch.manual_seed(50)
+        img_shape = input.shape
+
+        gen_device = torch.device("cuda") if torch.cuda.is_available() else input.device
+
+        inp = input.to(gen_device)
+        r = torch.rand((1000, *inp.shape), device=gen_device, dtype=inp.dtype)
+        image = (r < inp).float()
+
+        # (T, 1, H, W)
+        image = image.view(1000, img_shape[-2], img_shape[-1]).unsqueeze(1)
+
+        # IMPORTANT: move spikes to the model/device you actually run on (CPU if weights are CPU)
+        return image.to(self.device)   # or: return image.cpu()     
+
+    def evaluate(self, spikes):
+        """
+        Run the inferencing model and calculate the accuracy.
+
+        :param test_loader: Testing data loader
+        :param model: Pre-trained network model
+        """
+        # Run inference for event stream or pre-recorded DVS data
+        with torch.no_grad(): 
+            spikes= spikes.to(self.device)
+            spikes = self.make_spikes(spikes/255)
+            spikes = sl.FlattenTime()(spikes)
+            # Forward pass
+            spikes = self.sinabs_model(spikes.unsqueeze(1))
+            output = spikes.sum(dim=0).squeeze()
+
+# ---------------------------
+# Sparse Helpers
+# ---------------------------
+def remove_random_bursts(event_frames, threshold):
+    event_frames[event_frames > threshold] = threshold
+    return event_frames
+
+def adjust_and_normalize_probabilities(event_data, apply_outlier_correction=True):
+    adjusted_probs = np.copy(event_data)
+
+    if apply_outlier_correction:  # Reduce probability for potential outliers
+        outlier_threshold = event_data.mean() + 2 * event_data.std()
+        adjusted_probs[adjusted_probs > outlier_threshold] = 0.01
+
+    total_prob = adjusted_probs.sum()
+    normalized_probs = adjusted_probs / total_prob
+    return normalized_probs
+
+def get_random_pixels(num_pixels, im_width, im_height, local_suppression_radius, prob_to_draw_from=None):
+    """
+    Generate a list of random pixels within an image.
+
+    Args:
+        num_pixels (int): The number of random pixels to generate.
+        im_width (int): The width of the image.
+        im_height (int): The height of the image.
+        local_suppression_radius (float): The radius for local suppression.
+        prob_to_draw_from (ndarray, optional): The probability distribution to draw from. Defaults to None.
+
+    Returns:
+        list: A list of random pixels, each represented as a tuple (y, x).
+
+    Raises:
+        ValueError: If a new random pixel cannot be found after 100 iterations.
+    """
+    random_pixels = []
+    num_subsequent_rejections = 0
+    with tqdm(total=num_pixels, desc="Pick random pixels") as pbar:
+        while len(random_pixels) < num_pixels:
+            random_idx_flat = np.random.choice(
+                np.arange(0, im_height * im_width),
+                p=prob_to_draw_from.reshape(-1) if prob_to_draw_from is not None else None,
+            )
+            random_pixel = np.unravel_index(random_idx_flat, (im_height, im_width))
+            if len(random_pixels) == 0 or np.all(np.linalg.norm(np.array(random_pixels) - np.array(random_pixel), axis=1) > local_suppression_radius):
+                random_pixels.append(random_pixel)
+                num_subsequent_rejections = 0
+                pbar.update(1)
+            else:
+                num_subsequent_rejections = num_subsequent_rejections + 1
+                if num_subsequent_rejections > 100:
+                    raise ValueError("Could not find new random pixel after 100 iterations")
+
+    # check that number of unique elements equals the number of requested pixels
+    assert len(list(set(random_pixels))) == num_pixels
+
+    return random_pixels
+
+def get_distance_matrix(ref_traverse: np.ndarray, qry_traverse: np.ndarray, metric="cosine", device='cuda'):
+    dev = device
+
+    a = torch.from_numpy(ref_traverse.reshape(ref_traverse.shape[0], -1).astype(np.float32)).unsqueeze(0).to(dev)
+    b = qry_traverse.reshape(qry_traverse.shape[0], -1).float().unsqueeze(0).to(dev)
+    if metric == "cityblock":
+        torch_dist = torch.cdist(a, b, 1)[0]
+    elif metric == "euclidean":
+        torch_dist = torch.cdist(a, b, 2)[0]
+    elif metric == "cosine":
+        def cosine_distance_torch(x1, x2=None, eps=1e-8):
+            x2 = x1 if x2 is None else x2
+            w1 = x1.norm(p=2, dim=1, keepdim=True)
+            w2 = w1 if x2 is x1 else x2.norm(p=2, dim=1, keepdim=True)
+            return 1 - torch.mm(x1, x2.t()) / (w1 * w2.t()).clamp(min=eps)
+
+        torch_dist = cosine_distance_torch(a.squeeze(0), b.squeeze(0))
+    else:
+        raise ValueError("Distance not supported")
+
+    if device == torch.device("mps"):
+        torch_dist = torch_dist.to(device)
+
+    return torch_dist
+
+# ---------------------------
+# EventVLAD Helpers
+# ---------------------------
+class DnCNN(nn.Module):
+    def __init__(self, in_channels, out_channels, dep=20, num_filters=64, slope=0.2):
+        '''
+        Reference:
+        K. Zhang, W. Zuo, Y. Chen, D. Meng and L. Zhang, "Beyond a Gaussian Denoiser: Residual
+        Learning of Deep CNN for Image Denoising," TIP, 2017.
+
+        Args:
+            in_channels (int): number of input channels
+            out_channels (int): number of output channels
+            dep (int): depth of the network, Default 20
+            num_filters (int): number of filters in each layer, Default 64
+        '''
+        super(DnCNN, self).__init__()
+        self.conv1 = conv3x3(in_channels, num_filters, bias=True)
+        self.relu = nn.LeakyReLU(slope, inplace=True)
+        mid_layer = []
+        for ii in range(1, dep-1):
+            mid_layer.append(conv3x3(num_filters, num_filters, bias=True))
+            mid_layer.append(nn.LeakyReLU(slope, inplace=True))
+        self.mid_layer = nn.Sequential(*mid_layer)
+        self.conv_last = conv3x3(num_filters, out_channels, bias=True)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.mid_layer(x)
+        out = self.conv_last(x)
+
+        return out
+
+def weight_init_kaiming(net):
+    for m in net.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+            if not m.bias is None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+    return net
+
+class EventDenoiser(nn.Module):
+    def __init__(self, input_images, dep_S=5, dep_U=4, slope=0.2):
+        super(EventDenoiser, self).__init__()
+        config = {'num_bins' : 3}
+        self.ReconNet = RecurrUNet(num_bins = 3, in_channels = 1, out_channels = 1, depth=dep_U, slope=slope)
+        self.ErrorNet = DnCNN(in_channels = 3, out_channels = 1, dep=dep_S, num_filters=64, slope=slope)
+
+    def forward(self, x):
+        img_estim = self.ReconNet(x)
+        err_estim = self.ErrorNet(x)
+        evterr = torch.cat((img_estim,err_estim),dim=1)
+        return evterr
+
+def conv3x3(in_chn, out_chn, bias=True):
+    layer = nn.Conv2d(in_chn, out_chn, kernel_size=3, stride=1, padding=1, bias=bias)
+    return layer
+
+class BaseModel(nn.Module):
+    """
+    Base class for all models
+    """
+    def __init__(self, config):
+        super(BaseModel, self).__init__()
+        self.config = config
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    def forward(self, *input):
+        """
+        Forward pass logic
+
+        :return: Model output
+        """
+        raise NotImplementedError
+
+    def summary(self):
+        """
+        Model summary
+        """
+        model_parameters = filter(lambda p: p.requires_grad, self.parameters())
+        params = sum([np.prod(p.size()) for p in model_parameters])
+        self.logger.info('Trainable parameters: {}'.format(params))
+        self.logger.info(self)
+
+class BaseE2VID(BaseModel):
+    def __init__(self, config):
+        super().__init__(config)
+
+        try:
+            self.skip_type = str(config['skip_type'])
+        except KeyError:
+            self.skip_type = 'sum'
+
+        try:
+            self.num_encoders = int(config['num_encoders'])
+        except KeyError:
+            self.num_encoders = 4
+
+        try:
+            self.base_num_channels = int(config['base_num_channels'])
+        except KeyError:
+            self.base_num_channels = 32
+
+        try:
+            self.num_residual_blocks = int(config['num_residual_blocks'])
+        except KeyError:
+            self.num_residual_blocks = 2
+
+        try:
+            self.norm = str(config['norm'])
+        except KeyError:
+            self.norm = None
+
+        try:
+            self.use_upsample_conv = bool(config['use_upsample_conv'])
+        except KeyError:
+            self.use_upsample_conv = True
+
+class RecurrUNet(BaseE2VID):
+    """
+    Recurrent, UNet-like architecture where each encoder is followed by a ConvLSTM or ConvGRU.
+    """
+
+    def __init__(self, num_bins = 3, in_channels=1, out_channels=2, depth=4, slope=0.2):
+        self.output_channels = out_channels
+        self.num_encoders = depth
+        self.base_num_channels = out_channels
+        self.num_residual_blocks = depth
+        self.in_channels = in_channels
+        self.num_bins = num_bins  # number of bins in the voxel grid event tensor
+        config = {}
+        super(RecurrUNet, self).__init__(config)
+
+        try:
+            self.recurrent_block_type = str(config['recurrent_block_type'])
+        except KeyError:
+            self.recurrent_block_type = 'convgru'  # or 'convlstm'
+
+#        self.unetrecurrent = UNet(num_input_channels=self.in_channels,
+#                                           num_output_channels=self.output_channels,
+#                                           skip_type='sum',
+#                                           activation='sigmoid',
+#                                           num_encoders=self.num_encoders,
+#                                           base_num_channels=self.base_num_channels,
+#                                           num_residual_blocks=self.num_residual_blocks,
+#                                           norm=self.norm,
+#                                           use_upsample_conv=self.use_upsample_conv)
+        self.unetrecurrent = UNetRecurrent(num_input_channels=self.in_channels,
+                                           num_output_channels=self.output_channels,
+                                           skip_type='sum',
+                                           recurrent_block_type=self.recurrent_block_type,
+                                           activation='sigmoid',
+                                           num_encoders=self.num_encoders,
+                                           base_num_channels=self.base_num_channels,
+                                           num_residual_blocks=self.num_residual_blocks,
+                                           norm=self.norm,
+                                           use_upsample_conv=self.use_upsample_conv)
+
+    def forward(self, event_tensor):
+        """
+        :param event_tensor: N x num_bins x H x W
+        :param prev_states: previous ConvLSTM state for each encoder module
+        :return: reconstructed image, taking values in [0,1].
+        """
+#        img_pred = self.unetrecurrent.forward(event_tensor)
+        states = None
+        num_bins = event_tensor.shape[1]
+        for nth in range(num_bins):
+            eventimg = event_tensor[:,nth,]
+            eventimg = eventimg[:,np.newaxis,]
+            img_pred, states = self.unetrecurrent.forward(eventimg, states)
+        return img_pred
+
+def skip_sum(x1, x2):
+    return torch.add(x1,x2)
+
+class BaseUNet(nn.Module):
+    def __init__(self, num_input_channels, num_output_channels=1, skip_type='sum', activation='sigmoid',
+                 num_encoders=4, base_num_channels=32, num_residual_blocks=2, norm=None, use_upsample_conv=True):
+        super(BaseUNet, self).__init__()
+
+        self.num_input_channels = num_input_channels
+        self.num_output_channels = num_output_channels
+        self.skip_type = skip_type
+        self.apply_skip_connection = skip_sum
+        self.activation = activation
+        self.norm = norm
+
+        if use_upsample_conv:
+            print('Using UpsampleConvLayer (slow, but no checkerboard artefacts)')
+            self.UpsampleLayer = UpsampleConvLayer
+        else:
+            print('Using TransposedConvLayer (fast, with checkerboard artefacts)')
+            self.UpsampleLayer = TransposedConvLayer
+
+        self.num_encoders = num_encoders
+        self.base_num_channels = base_num_channels
+        self.num_residual_blocks = num_residual_blocks
+        self.max_num_channels = self.base_num_channels * pow(2, self.num_encoders)
+
+        assert(self.num_input_channels > 0)
+        assert(self.num_output_channels > 0)
+
+        self.encoder_input_sizes = []
+        for i in range(self.num_encoders):
+            self.encoder_input_sizes.append(self.base_num_channels * pow(2, i))
+
+        self.encoder_output_sizes = [self.base_num_channels * pow(2, i + 1) for i in range(self.num_encoders)]
+
+        self.activation = getattr(torch, self.activation, 'sigmoid')
+
+    def build_resblocks(self):
+        self.resblocks = nn.ModuleList()
+        for i in range(self.num_residual_blocks):
+            self.resblocks.append(ResidualBlock(self.max_num_channels, self.max_num_channels, norm=self.norm))
+
+    def build_decoders(self):
+        decoder_input_sizes = list(reversed([self.base_num_channels * pow(2, i + 1) for i in range(self.num_encoders)]))
+
+        self.decoders = nn.ModuleList()
+        for input_size in decoder_input_sizes:
+            self.decoders.append(self.UpsampleLayer(input_size if self.skip_type == 'sum' else 2 * input_size,
+                                                    input_size // 2,
+                                                    kernel_size=5, padding=2, norm=self.norm))
+
+    def build_prediction_layer(self):
+        self.pred = ConvLayer(self.base_num_channels if self.skip_type == 'sum' else 2 * self.base_num_channels,
+                              self.num_output_channels, 1, activation=None, norm=self.norm)
+
+class UNetRecurrent(BaseUNet):
+    """
+    Recurrent UNet architecture where every encoder is followed by a recurrent convolutional block,
+    such as a ConvLSTM or a ConvGRU.
+    Symmetric, skip connections on every encoding layer.
+    """
+
+    def __init__(self, num_input_channels, num_output_channels=1, skip_type='sum',
+                 recurrent_block_type='convlstm', activation='sigmoid', num_encoders=4, base_num_channels=32,
+                 num_residual_blocks=2, norm=None, use_upsample_conv=True):
+        super(UNetRecurrent, self).__init__(num_input_channels, num_output_channels, skip_type, activation,
+                                            num_encoders, base_num_channels, num_residual_blocks, norm,
+                                            use_upsample_conv)
+
+        self.head = ConvLayer(self.num_input_channels, self.base_num_channels,
+                              kernel_size=5, stride=1, padding=2)  # N x C x H x W -> N x 32 x H x W
+
+        self.encoders = nn.ModuleList()
+        for input_size, output_size in zip(self.encoder_input_sizes, self.encoder_output_sizes):
+            self.encoders.append(RecurrentConvLayer(input_size, output_size,
+                                                    kernel_size=5, stride=2, padding=2,
+                                                    recurrent_block_type=recurrent_block_type,
+                                                    norm=self.norm))
+
+        self.build_resblocks()
+        self.build_decoders()
+        self.build_prediction_layer()
+
+    def forward(self, x, prev_states):
+        """
+        :param x: N x num_input_channels x H x W
+        :param prev_states: previous LSTM states for every encoder layer
+        :return: N x num_output_channels x H x W
+        """
+
+        # head
+        x = self.head(x)
+        head = x
+
+        if prev_states is None:
+            prev_states = [None] * self.num_encoders
+
+        # encoder
+        blocks = []
+        states = []
+        for i, encoder in enumerate(self.encoders):
+            x, state = encoder(x, prev_states[i])
+            blocks.append(x)
+            states.append(state)
+
+        # residual blocks
+        for resblock in self.resblocks:
+            x = resblock(x)
+
+        # decoder
+        for i, decoder in enumerate(self.decoders):
+            x = decoder(self.apply_skip_connection(x, blocks[self.num_encoders - i - 1]))
+
+        # tail
+#        img = self.activation(self.pred(self.apply_skip_connectiomn(x, head)))
+        img = self.pred(self.apply_skip_connection(x, head))
+
+        return img, states
+    
+import torch
+import torch.nn as nn
+import torch.nn.functional as f
+from torch.nn import init
+
+
+class ConvLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, activation='relu', norm=None):
+        super(ConvLayer, self).__init__()
+
+        bias = False if norm == 'BN' else True
+        self.conv2d = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=bias)
+        nn.init.xavier_uniform_(self.conv2d.weight)
+        
+        if activation is not None:
+            self.activation = getattr(torch, activation, 'relu')
+        else:
+            self.activation = None
+
+        self.norm = norm
+        if norm == 'BN':
+            self.norm_layer = nn.BatchNorm2d(out_channels)
+        elif norm == 'IN':
+            self.norm_layer = nn.InstanceNorm2d(out_channels, track_running_stats=True)
+
+    def forward(self, x):
+        out = self.conv2d(x)
+
+        if self.norm in ['BN', 'IN']:
+            out = self.norm_layer(out)
+
+        if self.activation is not None:
+            out = self.activation(out)
+
+        return out
+
+
+class TransposedConvLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, activation='relu', norm=None):
+        super(TransposedConvLayer, self).__init__()
+
+        bias = False if norm == 'BN' else True
+        self.transposed_conv2d = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, stride=2, padding=padding, output_padding=1, bias=bias)
+
+        if activation is not None:
+            self.activation = getattr(torch, activation, 'relu')
+        else:
+            self.activation = None
+
+        self.norm = norm
+        if norm == 'BN':
+            self.norm_layer = nn.BatchNorm2d(out_channels)
+        elif norm == 'IN':
+            self.norm_layer = nn.InstanceNorm2d(out_channels, track_running_stats=True)
+
+    def forward(self, x):
+        out = self.transposed_conv2d(x)
+
+        if self.norm in ['BN', 'IN']:
+            out = self.norm_layer(out)
+
+        if self.activation is not None:
+            out = self.activation(out)
+
+        return out
+
+
+class UpsampleConvLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, activation='relu', norm=None):
+        super(UpsampleConvLayer, self).__init__()
+
+        bias = False if norm == 'BN' else True
+        self.conv2d = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=bias)
+        
+        nn.init.xavier_uniform_(self.conv2d.weight)
+
+        if activation is not None:
+            self.activation = getattr(torch, activation, 'relu')
+        else:
+            self.activation = None
+
+        self.norm = norm
+        if norm == 'BN':
+            self.norm_layer = nn.BatchNorm2d(out_channels)
+        elif norm == 'IN':
+            self.norm_layer = nn.InstanceNorm2d(out_channels, track_running_stats=True)
+
+    def forward(self, x):
+        x_upsampled = f.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        out = self.conv2d(x_upsampled)
+
+        if self.norm in ['BN', 'IN']:
+            out = self.norm_layer(out)
+
+        if self.activation is not None:
+            out = self.activation(out)
+
+        return out
+
+
+class RecurrentConvLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0,
+                 recurrent_block_type='convlstm', activation='relu', norm=None):
+        super(RecurrentConvLayer, self).__init__()
+
+        assert(recurrent_block_type in ['convlstm', 'convgru'])
+        self.recurrent_block_type = recurrent_block_type
+        if self.recurrent_block_type == 'convlstm':
+            RecurrentBlock = ConvLSTM
+        else:
+            RecurrentBlock = ConvGRU
+        self.conv = ConvLayer(in_channels, out_channels, kernel_size, stride, padding, activation, norm)
+        self.recurrent_block = RecurrentBlock(input_size=out_channels, hidden_size=out_channels, kernel_size=3)
+
+    def forward(self, x, prev_state):
+        x = self.conv(x)
+        state = self.recurrent_block(x, prev_state)
+        x = state[0] if self.recurrent_block_type == 'convlstm' else state
+        return x, state
+
+
+class DownsampleRecurrentConvLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, recurrent_block_type='convlstm', padding=0, activation='relu'):
+        super(DownsampleRecurrentConvLayer, self).__init__()
+
+        self.activation = getattr(torch, activation, 'relu')
+
+        assert(recurrent_block_type in ['convlstm', 'convgru'])
+        self.recurrent_block_type = recurrent_block_type
+        if self.recurrent_block_type == 'convlstm':
+            RecurrentBlock = ConvLSTM
+        else:
+            RecurrentBlock = ConvGRU
+        self.recurrent_block = RecurrentBlock(input_size=in_channels, hidden_size=out_channels, kernel_size=kernel_size)
+
+    def forward(self, x, prev_state):
+        state = self.recurrent_block(x, prev_state)
+        x = state[0] if self.recurrent_block_type == 'convlstm' else state
+        x = f.interpolate(x, scale_factor=0.5, mode='bilinear', align_corners=False)
+        return self.activation(x), state
+
+
+# Residual block
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None, norm=None):
+        super(ResidualBlock, self).__init__()
+        bias = False if norm == 'BN' else True
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=bias)
+        self.norm = norm
+        if norm == 'BN':
+            self.bn1 = nn.BatchNorm2d(out_channels)
+            self.bn2 = nn.BatchNorm2d(out_channels)
+        elif norm == 'IN':
+            self.bn1 = nn.InstanceNorm2d(out_channels)
+            self.bn2 = nn.InstanceNorm2d(out_channels)
+
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
+        self.downsample = downsample
+        
+        nn.init.xavier_uniform_(self.conv1.weight)
+        nn.init.xavier_uniform_(self.conv2.weight)
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        if self.norm in ['BN', 'IN']:
+            out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        if self.norm in ['BN', 'IN']:
+            out = self.bn2(out)
+
+        if self.downsample:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class ConvLSTM(nn.Module):
+    """Adapted from: https://github.com/Atcold/pytorch-CortexNet/blob/master/model/ConvLSTMCell.py """
+
+    def __init__(self, input_size, hidden_size, kernel_size):
+        super(ConvLSTM, self).__init__()
+
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        pad = kernel_size // 2
+
+        # cache a tensor filled with zeros to avoid reallocating memory at each inference step if --no-recurrent is enabled
+        self.zero_tensors = {}
+
+        self.Gates = nn.Conv2d(input_size + hidden_size, 4 * hidden_size, kernel_size, padding=pad)
+
+    def forward(self, input_, prev_state=None):
+
+        # get batch and spatial sizes
+        batch_size = input_.data.size()[0]
+        spatial_size = input_.data.size()[2:]
+
+        # generate empty prev_state, if None is provided
+        if prev_state is None:
+
+            # create the zero tensor if it has not been created already
+            state_size = tuple([batch_size, self.hidden_size] + list(spatial_size))
+            if state_size not in self.zero_tensors:
+                # allocate a tensor with size `spatial_size`, filled with zero (if it has not been allocated already)
+                self.zero_tensors[state_size] = (
+                    torch.zeros(state_size).to(input_.device),
+                    torch.zeros(state_size).to(input_.device)
+                )
+
+            prev_state = self.zero_tensors[tuple(state_size)]
+
+        prev_hidden, prev_cell = prev_state
+
+        # data size is [batch, channel, height, width]
+        stacked_inputs = torch.cat((input_, prev_hidden), 1)
+        gates = self.Gates(stacked_inputs)
+
+        # chunk across channel dimension
+        in_gate, remember_gate, out_gate, cell_gate = gates.chunk(4, 1)
+
+        # apply sigmoid non linearity
+        in_gate = torch.sigmoid(in_gate)
+        remember_gate = torch.sigmoid(remember_gate)
+        out_gate = torch.sigmoid(out_gate)
+
+        # apply tanh non linearity
+        cell_gate = torch.tanh(cell_gate)
+
+        # compute current cell and hidden state
+        cell = (remember_gate * prev_cell) + (in_gate * cell_gate)
+        hidden = out_gate * torch.tanh(cell)
+
+        return hidden, cell
+
+
+class ConvGRU(nn.Module):
+    """
+    Generate a convolutional GRU cell
+    Adapted from: https://github.com/jacobkimmel/pytorch_convgru/blob/master/convgru.py
+    """
+
+    def __init__(self, input_size, hidden_size, kernel_size):
+        super().__init__()
+        padding = kernel_size // 2
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.reset_gate = nn.Conv2d(input_size + hidden_size, hidden_size, kernel_size, padding=padding)
+        self.update_gate = nn.Conv2d(input_size + hidden_size, hidden_size, kernel_size, padding=padding)
+        self.out_gate = nn.Conv2d(input_size + hidden_size, hidden_size, kernel_size, padding=padding)
+
+        init.orthogonal_(self.reset_gate.weight)
+        init.orthogonal_(self.update_gate.weight)
+        init.orthogonal_(self.out_gate.weight)
+        init.constant_(self.reset_gate.bias, 0.)
+        init.constant_(self.update_gate.bias, 0.)
+        init.constant_(self.out_gate.bias, 0.)
+
+    def forward(self, input_, prev_state):
+
+        # get batch and spatial sizes
+        batch_size = input_.data.size()[0]
+        spatial_size = input_.data.size()[2:]
+
+        # generate empty prev_state, if None is provided
+        if prev_state is None:
+            state_size = [batch_size, self.hidden_size] + list(spatial_size)
+            prev_state = torch.zeros(state_size).to(input_.device)
+
+        # data size is [batch, channel, height, width]
+        stacked_inputs = torch.cat([input_, prev_state], dim=1)
+        update = torch.sigmoid(self.update_gate(stacked_inputs))
+        reset = torch.sigmoid(self.reset_gate(stacked_inputs))
+        out_inputs = torch.tanh(self.out_gate(torch.cat([input_, prev_state * reset], dim=1)))
+        new_state = prev_state * (1 - update) + out_inputs * update
+
+        return new_state
+
+def build_model(model_type: str, dep_u: int, dep_s: int, slope: float) -> torch.nn.Module:
+    mt = model_type.lower()
+    if mt in ["event_denoiser", "denoiser", "default"]:
+        return EventDenoiser(3, slope=slope, dep_U=dep_u, dep_S=dep_s)
+    raise ValueError(f"Unknown model_type: {model_type}")
+
+def clean_state_dict(sd):
+    if any(k.startswith("module.") for k in sd.keys()):
+        return {k.replace("module.", "", 1): v for k, v in sd.items()}
+    return sd
+
+def load_checkpoint_into_model(model, ckpt_path, use_gpu=True):
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+    sd = clean_state_dict(sd)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing:
+        print(f"[warn] Missing keys: {missing[:8]}{' ...' if len(missing)>8 else ''}")
+    if unexpected:
+        print(f"[warn] Unexpected keys: {unexpected[:8]}{' ...' if len(unexpected)>8 else ''}")
+    if use_gpu and torch.cuda.is_available():
+        model = torch.nn.DataParallel(model).cuda()
+    model.eval()
+    return model
+
+def make_divisible(img, mult):
+    if mult <= 1:
+        return img
+    H, W = img.shape[:2]
+    return img[: H - (H % mult) if H % mult else H,
+               : W - (W % mult) if W % mult else W]
+
+def prep_input_triplet(i0: np.ndarray, i1: np.ndarray, i2: np.ndarray,
+                       size: int, dep_u: int, rotate180: bool) -> torch.Tensor:
+    """Prepare a 1x3xHxW tensor from three grayscale [0,1] images."""
+    m = 2 ** dep_u if dep_u > 0 else 1
+    i0 = make_divisible(i0, m)
+    i1 = make_divisible(i1, m)
+    i2 = make_divisible(i2, m)
+
+    if size and size > 0:
+        i0 = cv2.resize(i0, (size, size), interpolation=cv2.INTER_AREA)
+        i1 = cv2.resize(i1, (size, size), interpolation=cv2.INTER_AREA)
+        i2 = cv2.resize(i2, (size, size), interpolation=cv2.INTER_AREA)
+
+    if rotate180:
+        i0 = cv2.rotate(i0, cv2.ROTATE_180)
+        i1 = cv2.rotate(i1, cv2.ROTATE_180)
+        i2 = cv2.rotate(i2, cv2.ROTATE_180)
+
+    t0 = torch.from_numpy(i0[None, ...])  # (1,H,W)
+    t1 = torch.from_numpy(i1[None, ...])
+    t2 = torch.from_numpy(i2[None, ...])
+    x = torch.cat([t0, t1, t2], dim=0)[None, ...].contiguous().float()  # (1,3,H,W)
+    return x
+
+def tensor_to_uint8(img_t):
+    """Accepts (1,1,H,W) or (1,C,H,W) or (H,W), returns uint8 HxW image."""
+    if torch.is_tensor(img_t):
+        img = img_t.detach().cpu().numpy()
+    else:
+        img = np.asarray(img_t)
+    if img.ndim == 4:
+        img = img[:, 0, ...]
+    if img.ndim == 3:
+        img = img[0]
+    img = np.clip(img, 0.0, 1.0)
+    return (img * 255.0 + 0.5).astype(np.uint8)
+
+def stream_vlad_denoise(queries, model):
+    x = prep_input_triplet(queries[0], queries[1], queries[2], size=256, dep_u=5, rotate180=False)
+    if torch.cuda.is_available():
+        x = x.cuda(non_blocking=True)
+    with torch.no_grad():
+        out = model(x)
+    return tensor_to_uint8(out)
+
+def _device(dev=None):
+    if isinstance(dev, torch.device): return dev
+    if isinstance(dev, str): return torch.device(dev)
+    if torch.cuda.is_available(): return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+def _safe_torch_load(path):
+    # Prefer safe loading when available; fall back quietly on older torch.
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+def _strip_prefix(k, prefix):
+    return k[len(prefix):] if k.startswith(prefix) else k
+
+def _remap_state_for_triplet(state):
+    """
+    Map various checkpoint layouts to TripletNet(embed_net(base_model, net_vlad)) EXACT names:
+      - VGG:   embed_net.base_model.<layer>
+      - NetVLAD: embed_net.net_vlad.<param>
+    """
+    if "state_dict" in state: state = state["state_dict"]
+    if "model_state_dict" in state: state = state["model_state_dict"]
+
+    fixed = {}
+    for k, v in state.items():
+        # strip common wrappers
+        for pref in ("module.", "model.", "net.", "triplet.", "tripletnet.", "triplet_model.", "embed.", "embed_net."):
+            k = _strip_prefix(k, pref)
+
+        # normalize obvious roots
+        if k.startswith("base_model."):
+            k = "embed_net.base_model." + k[len("base_model."):]
+        elif k.startswith("net_vlad."):
+            k = "embed_net.net_vlad." + k[len("net_vlad."):]
+        elif k.startswith("encoder."):
+            # many checkpoints store VGG as "encoder.*"
+            k = "embed_net.base_model." + k[len("encoder."):]
+        elif k.startswith("vlad.") or k.startswith("netvlad."):
+            k = "embed_net.net_vlad." + k.split(".", 1)[1]
+        elif k.startswith("pool."):
+            # some store NetVLAD as "pool.*"
+            k = "embed_net.net_vlad." + k[len("pool."):]
+        elif k.startswith("embed_net.base_model.pool."):
+            # rare mis-save of vlad under base_model.pool.*
+            k = "embed_net.net_vlad." + k[len("embed_net.base_model.pool."):]
+        else:
+            # bare VGG layer names (convX_Y, reluX_Y, poolX, fc6/fc7/fc8)
+            if k.startswith(("conv1_","conv2_","conv3_","conv4_","conv5_","relu","pool","fc6","fc7","fc8")):
+                k = "embed_net.base_model." + k
+            # bare NetVLAD param names
+            elif k.startswith(("centroids", "conv.weight", "conv.bias", "lastfc.weight", "lastfc.bias")):
+                k = "embed_net.net_vlad." + k
+
+        fixed[k] = v
+    return fixed
+
+def _infer_vlad_dims(mapped_state):
+    """
+    Infer (K, D) for NetVLAD from the mapped state.
+    """
+    if "embed_net.net_vlad.centroids" in mapped_state:
+        w = mapped_state["embed_net.net_vlad.centroids"]  # [K, D]
+        return int(w.shape[0]), int(w.shape[1])
+    if "embed_net.net_vlad.conv.weight" in mapped_state:
+        w = mapped_state["embed_net.net_vlad.conv.weight"]  # [K, D, 1, 1]
+        return int(w.shape[0]), int(w.shape[1])
+    raise RuntimeError("Could not infer NetVLAD (K, D): no centroids or conv.weight in checkpoint.")
+
+def _ensure_required_vlad_params(mapped):
+    """
+    Some checkpoints omit NetVLAD conv.bias. If the model expects it,
+    synthesize a zero bias so strict=True can succeed.
+    """
+    need_bias_key = "embed_net.net_vlad.conv.bias"
+    if need_bias_key not in mapped:
+        # infer K (num_clusters)
+        if "embed_net.net_vlad.conv.weight" in mapped:
+            K = int(mapped["embed_net.net_vlad.conv.weight"].shape[0])
+            dtype = mapped["embed_net.net_vlad.conv.weight"].dtype
+        elif "embed_net.net_vlad.centroids" in mapped:
+            K = int(mapped["embed_net.net_vlad.centroids"].shape[0])
+            dtype = mapped["embed_net.net_vlad.centroids"].dtype
+        else:
+            raise RuntimeError("Cannot infer K to synthesize conv.bias.")
+
+        mapped[need_bias_key] = torch.zeros(K, dtype=dtype)  # CPU is fine
+    return mapped
+
+def isfile(path):
+    """Test whether a path is a regular file"""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISREG(st.st_mode)
+
+def build_eventvlad_model_from_tar(weights_path: str, num_clusters: int = 64, device=None):
+    """
+    Build TripletNet(EmbedNet(Imagenet_vgg, NetVLAD)) and load weights from .tar strictly.
+    NOTE: num_clusters is ignored if the checkpoint indicates a different K; we match the checkpoint.
+    """
+    assert isfile(weights_path), f"Missing weights file: {weights_path}"
+    dev = _device(device)
+
+    # Base (their MatConvNet-style VGG16 -> fc8:1000)
+    base = Imagenet_vgg(weights_path=None)  # we load from the .tar, not a separate .pth
+
+    # Load and map checkpoint FIRST so we can infer dims
+    raw = _safe_torch_load(weights_path)
+    mapped = _remap_state_for_triplet(raw)
+    K, D = _infer_vlad_dims(mapped)  # e.g., K=64, D=1000
+    mapped = _ensure_required_vlad_params(mapped)
+
+    # Build NetVLAD to EXACT dims from checkpoint
+    vlad = NetVLAD(num_clusters=K, dim=D, normalize_input=True)
+
+    embed = EmbedNet(base, vlad)
+    model = TripletNet(embed).to(dev).eval()
+
+    # Pre-validate to ensure strict=True will pass (no surprises)
+    model_keys = set(model.state_dict().keys())
+    mapped_keys = set(mapped.keys())
+    missing = sorted(model_keys - mapped_keys)
+    unexpected = sorted(mapped_keys - model_keys)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Key mismatch after mapping.\n"
+            f"Missing ({len(missing)}): {missing[:12]}{' ...' if len(missing)>12 else ''}\n"
+            f"Unexpected ({len(unexpected)}): {unexpected[:12]}{' ...' if len(unexpected)>12 else ''}"
+        )
+
+    model.load_state_dict(mapped, strict=True)
+    return model
+
+
+VGG_MEAN_RGB = np.array([122.7449417, 114.9440994, 101.6417770], dtype=np.float32)
+
+def preprocess_like_eventvgg(query_np, rgb_input=True, mean_rgb=VGG_MEAN_RGB):
+    """
+    Mimics _EventVGGPreprocess._load() for ndarray inputs.
+
+    Notes:
+    - If rgb_input=True, this assumes any 3-ch input is BGR and converts to RGB
+      (matching your dataset code's behavior).
+    - Does NOT divide by 255.
+    - Output: torch.FloatTensor [3, 224, 224]
+    """
+    x = query_np
+    if torch.is_tensor(x):
+        x = x.detach().cpu().numpy()
+    x = np.asarray(x)
+
+    # If CHW, convert to HWC (best-effort heuristic)
+    if x.ndim == 3 and x.shape[0] in (1, 2, 3, 4) and x.shape[-1] not in (1, 2, 3, 4):
+        x = np.transpose(x, (1, 2, 0))  # CHW -> HWC
+
+    if x.ndim == 2:
+        x = cv2.cvtColor(x, cv2.COLOR_GRAY2RGB)  # -> HWC, 3ch
+    elif x.ndim == 3:
+        if x.shape[2] == 1:
+            x = np.repeat(x, 3, axis=2)
+        elif x.shape[2] == 2:
+            # Your original pipeline likely never had 2ch here (cv2.cvtColor would choke).
+            # If it does happen, pad a 3rd channel with zeros to keep the VGG mean logic valid.
+            z = np.zeros_like(x[..., :1])
+            x = np.concatenate([x, z], axis=2)
+        elif x.shape[2] == 4:
+            x = cv2.cvtColor(x, cv2.COLOR_BGRA2BGR)
+            if rgb_input:
+                x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB)
+        elif x.shape[2] == 3:
+            if rgb_input:
+                # IMPORTANT: matches your Dataset behavior (treat ndarray as BGR)
+                x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB)
+        else:
+            raise ValueError(f"Unsupported channel count: {x.shape[2]}")
+    else:
+        raise ValueError(f"Unsupported query shape: {x.shape}")
+
+    x = cv2.resize(x, (224, 224), interpolation=cv2.INTER_AREA)
+
+    x = x.astype(np.float32)
+    x -= mean_rgb  # RGB means
+    x = np.transpose(x, (2, 0, 1))  # CHW
+
+    return torch.from_numpy(x)  # float32
+
+
+@torch.inference_mode()
+def extract_eventvlad_features(model, query, device='cuda'):
+    dev = _device(device)
+    model = model.to(dev).eval()
+
+    q = preprocess_like_eventvgg(query, rgb_input=True).to(dev)  # [3,224,224]
+    out = model.feature_extract(q.unsqueeze(0))                  # [1,D] (or sometimes [D])
+
+    if out.dim() == 1:
+        out = out.unsqueeze(0)
+
+    return out.detach().cpu().to(torch.float32).numpy()
