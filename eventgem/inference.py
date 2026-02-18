@@ -3,6 +3,7 @@ import argparse
 import time
 from pathlib import Path
 import streamutils.stream as stream
+import os
 
 import sys
 import h5py
@@ -25,7 +26,8 @@ sys.path.insert(0, str(BACKBONE_ROOT))
 # ---------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--hdf5", type=str, required=True)
+    ap.add_argument("--hdf5", type=str, default=None, 
+                    help="Path to the input hdf5 file containing events")
     ap.add_argument("--backbone-ckpt", type=str, required=True)
     ap.add_argument("--resize", type=str, default="nearest", choices=["nearest", "bilinear"])
     ap.add_argument("--amp", action="store_true")
@@ -33,6 +35,8 @@ def main():
                     help="Which method to run (for ablation or comparison)")
     ap.add_argument("--se-max", default=None, type=int,
                     help="Max number of frames to compute runtime")
+    ap.add_argument("--data-base", type=str, default=None,
+                    help="Base directory for data")
 
     ap.add_argument("--ref-feats", type=str, required=True)
     ap.add_argument("--retrieval-k", type=int, default=50)
@@ -50,8 +54,8 @@ def main():
     ap.add_argument("--inlier-weight", type=float, default=0.05)
     ap.add_argument("--match-ratio", type=float, default=0.8)
 
-    ap.add_argument("--mcts-windows-ms", type=int, nargs="+", default=[10, 20, 30, 40, 50])
-    ap.add_argument("--dt-ms", type=float, default=50.0)
+    ap.add_argument("--mcts-windows-ms", type=float, nargs="+", default=[10, 20, 30, 40, 50])
+    ap.add_argument("--dt-ms", type=float, default=50)
     ap.add_argument("--target-hz", type=float, default=20.0)
     ap.add_argument("--realtime", action="store_true")
     ap.add_argument("--chunk-size", type=int, default=250_000)
@@ -71,12 +75,25 @@ def main():
                         help='Path to config file. If not specified, config from model folder/checkpoint is used')
     ap.add_argument('--ref-depth-dir', type=str, default=None, 
                         help="Directory containing reference depth maps (if using depth-based re-ranking)")
+    ap.add_argument('--extract-reference', action='store_true', 
+                    help="Whether to extract reference information")
+    ap.add_argument('--live-davis', action='store_true',
+                    help="Whether to run on live DAVIS stream instead of hdf5")
 
     args = ap.parse_args()
 
-    hdf5_path = Path(args.hdf5)
-    if not hdf5_path.exists():
-        raise FileNotFoundError(hdf5_path)
+    # File path for hdf5
+    if not args.live_davis:
+        hdf5_path = Path(args.hdf5)
+        if not hdf5_path.exists():
+            raise FileNotFoundError(hdf5_path)
+
+    # Data paths
+    if args.data_base is None:
+        data_base = 'eventgem/data'
+        # Check if datapath exists
+        if not Path(data_base).exists():
+            os.makedirs(data_base, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
@@ -85,12 +102,17 @@ def main():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    with h5py.File(hdf5_path, "r") as f:
-        x_dset, y_dset, t_dset, p_dset = stream.find_event_datasets(f)
-        H, W = stream.infer_resolution(x_dset, y_dset, args.chunk_size, args.infer_full_scan)
-        
-        t0_raw = int(t_dset[0]); tN_raw = int(t_dset[-1])
-        print(f"[INFO] Sensor: {H}x{W}")
+    if not args.live_davis:
+        with h5py.File(hdf5_path, "r") as f:
+            x_dset, y_dset, t_dset, p_dset = stream.find_event_datasets(f)
+            H, W = stream.infer_resolution(x_dset, y_dset, args.chunk_size, args.infer_full_scan)
+            
+            t0_raw = int(t_dset[0]); tN_raw = int(t_dset[-1])
+            print(f"[INFO] Sensor: {H}x{W}")
+    else:
+        H, W = 260, 346  # default DAVIS resolution
+        stream_davis = torch.cuda.Stream()
+
     print(args.method)
     # Load the corresponding model to run the inference on
     if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
@@ -185,16 +207,18 @@ def main():
     if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
         vit0 = torch.cuda.Event(True); vit1 = torch.cuda.Event(True)
         ret0 = torch.cuda.Event(True); ret1 = torch.cuda.Event(True)
-    elif args.method in ["superevent", "eventgem", "eventgem-d"]:
+    if args.method in ["superevent", "eventgem", "eventgem-d"]:
         se0 = torch.cuda.Event(True);  se1 = torch.cuda.Event(True)
-    elif args.method == "eventgem-d":
+    if args.method == "eventgem-d":
         d0 = torch.cuda.Event(True);   d1 = torch.cuda.Event(True)
-    elif args.method == "lens":
+    if args.method == "lens":
         lens0 = torch.cuda.Event(True); lens1 = torch.cuda.Event(True)
-    elif args.method == "sparse":
+    if args.method == "sparse":
          sparse0 = torch.cuda.Event(True); sparse1 = torch.cuda.Event(True)
-    else:
+    if args.method == "eventvlad":
         vlad0 = torch.cuda.Event(True); vlad1 = torch.cuda.Event(True)
+    if args.live_davis:
+        davis0 = torch.cuda.Event(True); davis1 = torch.cuda.Event(True)
 
     j0 = torch.cuda.Event(True);   j1 = torch.cuda.Event(True)
 
@@ -210,9 +234,16 @@ def main():
     sims = []
     queries = []
     with torch.inference_mode():
-        for (_, _, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms) in stream.stream_event_windows_raw(
-            hdf5_path, args.dt_ms, args.chunk_size, args.time_scale, args.start_time, args.max_frames
-        ):
+        if args.live_davis:
+            with torch.cuda.stream(stream_davis):
+                davis0.record(stream_davis)
+                event_iter = stream.stream_event_windows_davis_live(args.dt_ms)
+                davis1.record(stream_davis)
+        else:
+            event_iter = stream.stream_event_windows_raw(
+                hdf5_path, args.dt_ms, args.chunk_size, args.time_scale, args.start_time, args.max_frames
+            )
+        for (_, _, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms) in event_iter:
             cpu0 = time.perf_counter()
             n_events = int(x.size)
             j0.record(join_stream)
@@ -224,7 +255,6 @@ def main():
                 with torch.cuda.stream(stream_vit):
                     vit0.record(stream_vit)
                     pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
-
                     inp = stream.vit_preprocess_like_dataloader(pol_2hw, out_hw=(vitH, vitW))
                     if (H != vitH) or (W != vitW):
                         mode = "nearest" if args.resize == "nearest" else "bilinear"
@@ -242,7 +272,7 @@ def main():
                     vit1.record(stream_vit)
                     sims.append(sims_t.cpu())
 
-            elif args.method in ["superevent", "eventgem", "eventgem-d"]:
+            if args.method in ["superevent", "eventgem", "eventgem-d"]:
                 with torch.cuda.stream(stream_se):
                     se0.record(stream_se)
                     mcts = stream.gpu_mcts(x, y, t_raw, p, H, W, int(t_ref_raw), float(args.time_scale), windows_sec, device)
@@ -257,7 +287,7 @@ def main():
                     q_k_desc = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)
                     se1.record(stream_se)
             
-            elif args.method == "eventgem-d":
+            if args.method == "eventgem-d":
                 with torch.cuda.stream(stream_d):
                     d0.record(stream_d)
                     tencode = stream.tencode(x, y, t_raw, p, height=H, width=W, white_frame=False, normalize=True, device=device)
@@ -271,7 +301,7 @@ def main():
                             raise ValueError(f"Model {model_name} not implemented in this script.")
                     d1.record(stream_d)
 
-            elif args.method == "lens":
+            if args.method == "lens":
                 with torch.cuda.stream(stream_lens):
                     lens0.record(stream_lens)
                     pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
@@ -279,7 +309,7 @@ def main():
                     pol_combined = pol_2hw.sum(dim=0, keepdim=True)
                     lens_model.evaluate(pol_combined)
                     lens1.record(stream_lens)
-            elif args.method == "sparse":
+            if args.method == "sparse":
                 sparse0.record(stream_sparse)
                 pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
                 pol_combined = pol_2hw.sum(dim=0, keepdim=True)
@@ -288,7 +318,7 @@ def main():
                 # run a sum of absolute differences
                 stream.get_distance_matrix(sparse_reference_data, sampled_events)
                 sparse1.record(stream_sparse)
-            else:
+            if args.method == "eventvlad":
                 vlad0.record(join_stream)
                 pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
                 pol_combined = pol_2hw.sum(dim=0).cpu().numpy()
@@ -307,32 +337,36 @@ def main():
 
             if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
                 join_stream.wait_stream(stream_vit)
-            elif args.method in ["superevent", "eventgem", "eventgem-d"]:
+            if args.method in ["superevent", "eventgem", "eventgem-d"]:
                 join_stream.wait_stream(stream_se)
-            elif args.method == "eventgem-d":
+            if args.method == "eventgem-d":
                 join_stream.wait_stream(stream_d)
-            elif args.method == "lens":
+            if args.method == "lens":
                 join_stream.wait_stream(stream_lens)
-            elif args.method == "sparse":
+            if args.method == "sparse":
                 join_stream.wait_stream(stream_sparse)
-            else:
+            if args.method == "eventvlad":
                 join_stream.wait_stream(stream_vlad)
+            if args.live_davis:
+                join_stream.wait_stream(stream_davis)
 
             j1.record(join_stream)
             torch.cuda.synchronize()
             
             if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
                 vit_ms = vit0.elapsed_time(vit1)
-            elif args.method in ["superevent", "eventgem", "eventgem-d"]:
+            if args.method in ["superevent", "eventgem", "eventgem-d"]:
                 se_ms = se0.elapsed_time(se1)
-            elif args.method == "eventgem-d":
+            if args.method == "eventgem-d":
                 d_ms = d0.elapsed_time(d1)
-            elif args.method == "lens":
+            if args.method == "lens":
                 lens_ms = lens0.elapsed_time(lens1)
-            elif args.method == "sparse":
+            if args.method == "sparse":
                 sparse_ms = sparse0.elapsed_time(sparse1)
-            else:
+            if args.method == "eventvlad":
                 vlad_ms = vlad0.elapsed_time(vlad1)
+            if args.live_davis:
+                davis_ms = davis0.elapsed_time(davis1)
 
             t_rerank0 = time.perf_counter()
             if args.do_rerank:
@@ -403,7 +437,9 @@ def main():
 
             if (frame_idx % 100) == 0:
                 hz = 1000.0 / max(1e-6, t_total)
-                if args.method == "eventgem":
+                if args.live_davis: # print davis information and vit, se, rerank times
+                    print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} davis={davis_ms:.1f}ms ({hz:.1f} Hz) vit={vit_ms:.1f}ms se={se_ms:.1f}ms rerank={t_rerank:.1f}ms total={t_total:.1f}ms", flush=True)
+                elif args.method == "eventgem":
                     print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} vit={vit_ms:.1f} se={se_ms:.1f} rerank={t_rerank:.1f} total={t_total:.1f}ms ({hz:.1f} Hz) best={best_idx} inl={best_inl}", flush=True)
                 elif args.method == "eventgem-d":
                     print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} vit={vit_ms:.1f} se={se_ms:.1f} d={d_ms:.1f} rerank={t_rerank:.1f} total={t_total:.1f}ms ({hz:.1f} Hz) best={best_idx} inl={best_inl}", flush=True)

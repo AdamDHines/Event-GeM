@@ -19,6 +19,60 @@ import logging
 from streamutils.EventVLAD import Imagenet_vgg
 from streamutils.netvlad import NetVLAD, EmbedNet, TripletNet
 import stat
+
+from datetime import timedelta
+from collections import deque
+import dv_processing as dv
+
+# ---------------------------
+# DAVIS346 helpers
+# ---------------------------
+def stream_event_windows_davis_live(dt_ms: float):
+    """
+    Yields: (H, W, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms)
+    t_raw is in microseconds (dv-processing). :contentReference[oaicite:6]{index=6}
+    """
+    cap = dv.io.camera.DAVIS()
+    cap.setEventsRunning(True)      # ensure events enabled :contentReference[oaicite:7]{index=7}
+    cap.setFramesRunning(False)
+
+    W, H = cap.getEventResolution()  # you saw (346,260)
+    slicer = dv.EventStreamSlicer()
+    q = deque()
+
+    def cb(events):
+        q.append(events)
+
+    slicer.doEveryTimeInterval(timedelta(milliseconds=float(dt_ms)), cb)
+
+    frame_idx = 0
+    while cap.isRunning():
+        t0 = time.perf_counter()
+        batch = cap.getNextEventBatch()  # non-blocking; can be None :contentReference[oaicite:8]{index=8}
+        t_read_ms = (time.perf_counter() - t0) * 1000.0
+
+        if batch is None:
+            time.sleep(0.001)
+            continue
+
+        slicer.accept(batch)
+
+        while q:
+            ev = q.popleft()
+
+            xy = np.asarray(ev.coordinates())
+            if xy.ndim == 2 and xy.shape[0] == 2 and xy.shape[1] != 2:
+                xy = xy.T
+            x = xy[:, 0].astype(np.int16, copy=False)
+            y = xy[:, 1].astype(np.int16, copy=False)
+
+            t_raw = np.asarray(ev.timestamps()).reshape(-1).astype(np.int64, copy=False)  # microseconds
+            p = np.asarray(ev.polarities()).reshape(-1).astype(np.uint8, copy=False)     # 0/1
+
+            t_ref_raw = int(t_raw[0]) if t_raw.size else 0
+            yield (H, W, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms)
+            frame_idx += 1
+
 # ---------------------------
 # HDF5 helpers
 # ---------------------------
@@ -207,10 +261,6 @@ def stream_event_windows_raw(
             break
 
     f.close()
-
-import numpy as np
-import torch
-from typing import Optional
 
 @torch.no_grad()
 def tencode(
