@@ -27,6 +27,29 @@ import torch
 
 lib = ctypes.CDLL("./libtrt_runner.so")
 
+def _unpack_superevent_pred(pred):
+    """
+    Returns prob, desc_map as torch tensors.
+    prob:  (B,1,H,W)
+    desc:  (B,D,H,W)
+    """
+    if isinstance(pred, dict):
+        prob = pred.get("prob", None)
+        desc = pred.get("descriptors", None)
+        if prob is None or desc is None:
+            raise KeyError(f"Superevent pred dict missing keys. Got: {list(pred.keys())}")
+        return prob, desc
+
+    # tuple/list outputs
+    if isinstance(pred, (tuple, list)):
+        if len(pred) == 2:
+            return pred[0], pred[1]
+        # common pattern you showed: pred[1]=prob, pred[3]=desc_map
+        if len(pred) >= 4:
+            return pred[1], pred[3]
+
+    raise TypeError(f"Unsupported pred type/shape: {type(pred)}")
+
 class TrtHandle(ctypes.Structure):
     pass
 
@@ -370,6 +393,7 @@ def main():
     sims = []
     queries = []
     ref_feats = []
+    frame = 0
     with torch.inference_mode():
         if args.live_davis:
             with torch.cuda.stream(stream_davis):
@@ -412,7 +436,7 @@ def main():
                     #print(f"vit: {(time.time()-start)*1000} msec")
                 
                 if args.extract_reference:
-                    ref_feats.append(q_desc_vit.cpu().numpy())
+                    np.savez(f"{ref_feats_dir}/ref_feats_{frame_idx}.npz", q_desc_vit.cpu().numpy())
                 else:
                     ret0.record(stream_vit)
 
@@ -423,13 +447,62 @@ def main():
 
             with torch.cuda.stream(stream_se):
                 se0.record(stream_se)
-                #start = time.time()
-                mcts = stream.gpu_mcts(x, y, t_raw, p, H, W, int(t_ref_raw), float(args.time_scale), windows_sec, device)
-                #print(f"superevent: {(time.time()-start)*1000} msec")
-                mcts = mcts[:, off_top:h_end, off_left:w_end] 
-	
-                pred = se_model(mcts.unsqueeze(0).to(dtype=torch.float16))
-                
+
+                # MCTS -> crop
+                mcts = stream.gpu_mcts(
+                    x, y, t_raw, p, H, W,
+                    int(t_ref_raw),
+                    float(args.time_scale),      # IMPORTANT: use 1e-6 for DAVIS
+                    windows_sec,
+                    device
+                )
+                mcts = mcts[:, off_top:h_end, off_left:w_end]  # (C,Hc,Wc)
+
+                # SuperEvent
+                pred = se_model(mcts.unsqueeze(0).to(dtype=torch.float16))  # (1,C,Hc,Wc) -> outputs
+                prob, desc_map = _unpack_superevent_pred(pred)
+
+                # normalize shapes defensively
+                if prob.dim() == 3:   # (B,H,W)
+                    prob = prob.unsqueeze(1)
+                if desc_map.dim() == 3:  # (D,H,W)
+                    desc_map = desc_map.unsqueeze(0)
+
+                # NMS (needs scores!)
+                kpts_all, scores_all = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
+                kpts_yx = kpts_all[0]        # (N,2) in CROPPED coords (y,x)
+                scores  = scores_all[0]      # (N,)
+
+                # Sample descriptors at keypoints (expects [B,D,Hc,Wc])
+                desc_sampled = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)  # (N,D)
+
+                # ONLY save when extracting reference
+                if args.extract_reference:
+                    out_path = Path(ref_kp_dir) / f"ref_kp_{frame_idx:05d}.npz"
+
+                    if kpts_yx.numel() == 0:
+                        np.savez_compressed(
+                            out_path,
+                            keypoints=np.empty((0, 2), dtype=np.float32),
+                            scores=np.empty((0,), dtype=np.float32),
+                            descriptors=np.empty((0, int(desc_map.shape[1])), dtype=np.float32),
+                            image_shape=np.array([H, W], dtype=np.int32),
+                        )
+                    else:
+                        # undo crop + convert to (x,y) like your extractor
+                        kpts_np = kpts_yx.detach().cpu().numpy().astype(np.float32)  # (y,x)
+                        kpts_np[:, 0] += float(off_top)
+                        kpts_np[:, 1] += float(off_left)
+
+                        kpts_xy = np.stack([kpts_np[:, 1], kpts_np[:, 0]], axis=-1).astype(np.float32)  # (x,y)
+
+                        np.savez_compressed(
+                            out_path,
+                            keypoints=kpts_xy,
+                            scores=scores.detach().cpu().numpy().astype(np.float32),
+                            descriptors=desc_sampled.detach().cpu().numpy().astype(np.float32),
+                            image_shape=np.array([H, W], dtype=np.int32),
+                        )
 
                 prob, desc_map = pred[1], pred[3]
                 kpts_all, _ = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
@@ -474,6 +547,16 @@ def main():
 
     wall_s = time.perf_counter() - wall0
     n_frames = len(t_total_list)
+
+    if args.extract_reference:
+        # generate a feature matrix from all vit features into a .pt file
+        all_feats = []
+        for feat_file in sorted(ref_feats_dir.glob("ref_feats_*.npz")):
+            data = np.load(feat_file)
+            all_feats.append(data["arr_0"])
+        all_feats = np.concatenate(all_feats, axis=0)
+        torch.save(torch.from_numpy(all_feats), ref_feats_file)
+        print(f"[INFO] Extracted reference features saved to: {ref_feats_file}")
 
     if args.method == "eventgem":
         print("\n========== SUMMARY ==========")
