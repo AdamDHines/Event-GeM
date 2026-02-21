@@ -167,20 +167,23 @@ def main():
         stream_se = torch.cuda.Stream()
         windows_sec = torch.tensor(np.array(args.mcts_windows_ms, dtype=np.float32) * 1e-3, device=device)
             
+    # For the ViT Backbone
+    def export_vit_onnx(model, save_path="vit.onnx"):
+        dummy_input = torch.randn(1, 2, 224, 224).cuda().half()
+        torch.onnx.export(model, dummy_input, save_path, 
+                        input_names=['input'], output_names=['output'],
+                        opset_version=16, do_constant_folding=True)
+
+    # For SuperEvent (Assuming MCTS 10 channels and 256x256 crop)
+    def export_se_onnx(model, save_path="superevent.onnx"):
+        dummy_input = torch.randn(1, 10, 256, 256).cuda().half()
+        torch.onnx.export(model, dummy_input, save_path,
+                        input_names=['mcts'], output_names=['prob', 'desc'],
+                        opset_version=16)
     
-    if args.method == "eventvlad":
-        stream_vlad = torch.cuda.Stream()
-        # preload the reference descriptors
-        ref_desc = np.load('/media/adam/vprdatasets/eventgem/brisbane_event/sunset2/sunset2_eventvlad.npy')
-        denoise_model = stream.build_model('event_denoiser', dep_u=5, dep_s=5, slope=0.2).to(device)
-        ckpt_path = '/home/adam/repo/Event-GeM/eventgem/external/eventlab/baselines/EventVLAD/denoiser_brisbane'
-        denoise_model = stream.load_checkpoint_into_model(denoise_model, ckpt_path)
-        query = None
-        netvlad_model = stream.build_eventvlad_model_from_tar(
-            weights_path="/home/adam/repo/Event-LAB/baselines/EventVLAD/vgg16_eventvlad.tar",
-            num_clusters=64,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
+    # export to onnx
+    export_vit_onnx(vit)
+    export_se_onnx(se_model)
 
     ref_store = None
     if args.method in ["eventgem", "eventgem-d", "superevent"]:
