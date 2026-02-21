@@ -166,51 +166,7 @@ def main():
         print(f"[INFO] SuperEvent crop: top={off_top} left={off_left} -> {Hc}x{Wc}")
         stream_se = torch.cuda.Stream()
         windows_sec = torch.tensor(np.array(args.mcts_windows_ms, dtype=np.float32) * 1e-3, device=device)
-        if args.method == "superevent":
-            # Loading the reference keypoint descriptors
-            ref_descs = stream.preload_ref_descs(ref_kp_dir, args.ref_kp_pattern)
             
-
-    if args.method == "eventgem-d":
-        # Load model + config
-        depth_ckpt, depth_config = stream.load_and_merge_config(args.depth_loadmodel, args.depth_config)
-        depth_model = fetch_model(depth_config['model'], args, device, test=True, _state_dict=depth_ckpt)
-        model_name = depth_config['model']['model_type']
-        depth_model.eval()
-        stream_d = torch.cuda.Stream()
-        prev_states=None
-
-    if args.method == "lens":
-        # model name
-        model_name = '/home/adam/repo/Event-GeM/sunset2-frames-50_LENS_IN784_FN1568_DB12824.pth'
-        lens_model = stream.LENS()
-        lens_model.load_state_dict(torch.load(model_name), strict=False)
-        stream_lens = torch.cuda.Stream()
-
-    if args.method == "sparse":
-        stream_sparse = torch.cuda.Stream()
-        ref_dir = '/media/adam/vprdatasets/eventgem/brisbane_event/sunset2/sunset2-frames-50'
-        # preload frames
-        ref_npy = sorted(list(Path(ref_dir).glob("*.npy")))
-        frames = np.array([np.load(p) for p in ref_npy])
-
-        reference_data = [arr.sum(axis=2) for arr in frames]
-        reference_data = np.array(reference_data)
-        del frames
-        reference_data_noburst = stream.remove_random_bursts(reference_data, threshold=10)
-        reference_event_means = reference_data_noburst.mean(axis=0)
-
-        prob_to_draw_from = stream.adjust_and_normalize_probabilities(reference_event_means)
-        random_pixels = np.array(stream.get_random_pixels(100, 
-                                            im_width=346, 
-                                            im_height=260, 
-                                            local_suppression_radius=7, 
-                                            prob_to_draw_from=prob_to_draw_from))
-        x_coords = random_pixels[:, 1]
-        y_coords = random_pixels[:, 0]
-        sparse_reference_data = reference_data[:, y_coords, x_coords]
-        print(sparse_reference_data.shape)
-        del reference_data
     
     if args.method == "eventvlad":
         stream_vlad = torch.cuda.Stream()
@@ -264,9 +220,6 @@ def main():
     j0 = torch.cuda.Event(True);   j1 = torch.cuda.Event(True)
 
     t_read_list, t_vit_list, t_se_list, t_rerank_list, t_total_list, t_vlad_list = [], [], [], [], [], []
-    n_events_list = []
-
-    target_period = 1.0 / max(1e-6, args.target_hz)
     wall0 = time.perf_counter()
 
     print("[INFO] Starting Loop...", flush=True)
@@ -293,168 +246,69 @@ def main():
             if x.size == 0:
                 continue
 
-            if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
-                with torch.cuda.stream(stream_vit):
-                    vit0.record(stream_vit)
-                    pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
-                    inp = stream.vit_preprocess_like_dataloader(pol_2hw, out_hw=(vitH, vitW))
-                    inp = inp.to(dtype=torch.float16)
-                    if (H != vitH) or (W != vitW):
-                        mode = "nearest" if args.resize == "nearest" else "bilinear"
-                        inp = F.interpolate(inp, size=(vitH, vitW), mode=mode, align_corners=False if mode=="bilinear" else None)
+            with torch.cuda.stream(stream_vit):
+                vit0.record(stream_vit)
+                pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
+                inp = stream.vit_preprocess_like_dataloader(pol_2hw, out_hw=(vitH, vitW))
+                inp = inp.to(dtype=torch.float16)
+                if (H != vitH) or (W != vitW):
+                    mode = "nearest" if args.resize == "nearest" else "bilinear"
+                    inp = F.interpolate(inp, size=(vitH, vitW), mode=mode, align_corners=False if mode=="bilinear" else None)
 
-                    if args.amp:
-                        with torch.autocast(device_type="cuda", dtype=torch.float16):
-                            q_desc_vit = stream.vit_gem_descriptor(vit, inp)
-                    else:
+                if args.amp:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
                         q_desc_vit = stream.vit_gem_descriptor(vit, inp)
-                    
-                    if args.extract_reference:
-                        ref_feats.append(q_desc_vit.cpu().numpy())
-                    else:
-                        ret0.record(stream_vit)
-                        top_idx_t, top_dist_t, sims_t = stream.retrieve_topk(ref_db, q_desc_vit, k=int(args.retrieval_k), return_sims=True)
-                        ret1.record(stream_vit)
-                        vit1.record(stream_vit)
-                        sims.append(sims_t.cpu())
-
-            if args.method in ["superevent", "eventgem", "eventgem-d"]:
-                with torch.cuda.stream(stream_se):
-                    se0.record(stream_se)
-                    mcts = stream.gpu_mcts(x, y, t_raw, p, H, W, int(t_ref_raw), float(args.time_scale), windows_sec, device)
-                    mcts = mcts[:, off_top:h_end, off_left:w_end] 
-                    
-                    pred = se_model(mcts.unsqueeze(0).to(dtype=torch.float16))
-                    prob, desc_map = pred['prob'], pred['descriptors']
-                    
-                    kpts_all, _ = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
-                    kpts_yx = kpts_all[0]
-
-                    q_k_desc = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)
-                    se1.record(stream_se)
-
-                    if args.extract_reference:
-                        ref_kp_path = ref_kp_dir / f"{args.ref_kp_pattern.format(frame_idx)}"
-                        np.savez(ref_kp_path, kpts=kpts_yx.cpu().numpy(), desc=q_k_desc.cpu().numpy())
-            
-            if args.method == "eventgem-d":
-                with torch.cuda.stream(stream_d):
-                    d0.record(stream_d)
-                    tencode = stream.tencode(x, y, t_raw, p, height=H, width=W, white_frame=False, normalize=True, device=device)
-                    # Inference (no grad, via decorator)
-                    with torch.autocast(device_type="cuda", enabled=True):
-                        if model_name == 'DAv2':
-                            pred = depth_model.infer_image(tencode.unsqueeze(0))  # (1,1,H,W)
-                        elif model_name == 'RecDAv2':
-                            pred, prev_states = depth_model.infer_image(tencode.unsqueeze(0), prev_states=prev_states)
-                        else:
-                            raise ValueError(f"Model {model_name} not implemented in this script.")
-                    d1.record(stream_d)
-                    if args.extract_reference:
-                        depth_path = ref_depth_dir / f"{args.depth_pattern.format(frame_idx)}"
-                        # save as png with values scaled to 16-bit range
-                        depth_to_save = (pred.squeeze().cpu().numpy() * 65535.0).astype(np.uint16)
-                        imageio.imwrite(depth_path, depth_to_save)
-
-            if args.method == "lens":
-                with torch.cuda.stream(stream_lens):
-                    lens0.record(stream_lens)
-                    pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
-                    # combine polarities by summating
-                    pol_combined = pol_2hw.sum(dim=0, keepdim=True)
-                    lens_model.evaluate(pol_combined)
-                    lens1.record(stream_lens)
-            if args.method == "sparse":
-                sparse0.record(stream_sparse)
-                pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
-                pol_combined = pol_2hw.sum(dim=0, keepdim=True)
-                # sample at random pixels
-                sampled_events = pol_combined[:, y_coords, x_coords]
-                # run a sum of absolute differences
-                stream.get_distance_matrix(sparse_reference_data, sampled_events)
-                sparse1.record(stream_sparse)
-            if args.method == "eventvlad":
-                vlad0.record(join_stream)
-                pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
-                pol_combined = pol_2hw.sum(dim=0).cpu().numpy()
-                # we need to wait for 3 inputs to denoise
-                if len(queries) < 3:
-                    queries.append(pol_combined)
-                    continue
                 else:
-                    queries.append(pol_combined)
-                    denoise_query = stream.stream_vlad_denoise(queries, denoise_model)
-                    q_desc_vlad = stream.extract_eventvlad_features(netvlad_model, denoise_query)
-                    vlad1.record(join_stream)
-                    # remove first queries index
-                    queries.pop(0)
+                    q_desc_vit = stream.vit_gem_descriptor(vit, inp)
+                
+                if args.extract_reference:
+                    ref_feats.append(q_desc_vit.cpu().numpy())
+                else:
+                    ret0.record(stream_vit)
+                    top_idx_t, top_dist_t, sims_t = stream.retrieve_topk(ref_db, q_desc_vit, k=int(args.retrieval_k), return_sims=True)
+                    ret1.record(stream_vit)
+                    vit1.record(stream_vit)
+                    sims.append(sims_t.cpu())
 
+            with torch.cuda.stream(stream_se):
+                se0.record(stream_se)
+                mcts = stream.gpu_mcts(x, y, t_raw, p, H, W, int(t_ref_raw), float(args.time_scale), windows_sec, device)
+                mcts = mcts[:, off_top:h_end, off_left:w_end] 
+                
+                pred = se_model(mcts.unsqueeze(0).to(dtype=torch.float16))
+                prob, desc_map = pred['prob'], pred['descriptors']
+                
+                kpts_all, _ = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
+                kpts_yx = kpts_all[0]
 
-            if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
-                join_stream.wait_stream(stream_vit)
-            if args.method in ["superevent", "eventgem", "eventgem-d"]:
-                join_stream.wait_stream(stream_se)
-            if args.method == "eventgem-d":
-                join_stream.wait_stream(stream_d)
-            if args.method == "lens":
-                join_stream.wait_stream(stream_lens)
-            if args.method == "sparse":
-                join_stream.wait_stream(stream_sparse)
-            if args.method == "eventvlad":
-                join_stream.wait_stream(stream_vlad)
-            if args.live_davis:
-                join_stream.wait_stream(stream_davis)
-
+                q_k_desc = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)
+                se1.record(stream_se)
+        
+            join_stream.wait_stream(stream_vit)
             j1.record(join_stream)
-            
 
+            if top_idx_t.numel() > 0 and kpts_yx.numel() > 10:
+                q_xy = kpts_yx[:, [1,0]].float()
+                q_xy[:,0] += float(off_left)
+                q_xy[:,1] += float(off_top)
+                
+                cand_ids = top_idx_t.cpu().numpy().astype(np.int64)
+                cand_dist_val = top_dist_t.cpu().numpy()
+                
+                inlier_counts = stream.batched_ransac_rerank(
+                    q_xy, q_k_desc, ref_store, cand_ids, 
+                    max_matches=170, ratio_thresh=float(args.match_ratio)
+                )
+                # after you compute inlier_counts for cand_ids, build the new column:
+                new_col = stream.build_reranked_column_from_sims(
+                    sims_t=sims_t,
+                    cand_ids=cand_ids,
+                    inlier_counts=inlier_counts,
+                    inlier_weight=float(args.inlier_weight),
+                )
 
-            t_rerank0 = time.perf_counter()
-
-            best_idx = int(top_idx_t[0].item()) if top_idx_t.numel() else -1
-            best_inl = 0
-
-            if args.method in ["eventgem", "eventgem-d"]:
-                if top_idx_t.numel() > 0 and kpts_yx.numel() > 10:
-                    q_xy = kpts_yx[:, [1,0]].float()
-                    q_xy[:,0] += float(off_left)
-                    q_xy[:,1] += float(off_top)
-                    
-                    cand_ids = top_idx_t.cpu().numpy().astype(np.int64)
-                    cand_dist_val = top_dist_t.cpu().numpy()
-                    
-                    inlier_counts = stream.batched_ransac_rerank(
-                        q_xy, q_k_desc, ref_store, cand_ids, 
-                        max_matches=170, ratio_thresh=float(args.match_ratio)
-                    )
-
-                    # after you compute inlier_counts for cand_ids, build the new column:
-                    new_col = stream.build_reranked_column_from_sims(
-                        sims_t=sims_t,
-                        cand_ids=cand_ids,
-                        inlier_counts=inlier_counts,
-                        inlier_weight=float(args.inlier_weight),
-                    )
-                    # then stash it for later matrix assembly (or write to disk)
-                    if args.method == "eventgem":
-                        reranked_cols.append(new_col)
-                        final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
-                        best_arg = np.argmin(final_scores)
-                        best_idx = cand_ids[best_arg]
-                        best_inl = inlier_counts[best_arg]
-
-                    if args.method == "eventgem-d":
-                        # find the new best candiate
-                        reranked = stream.rerank_depth_single_query(qD=pred, base_dist=new_col, ref_depth_dir=args.ref_depth_dir, top_k=args.retrieval_k)
-                        reranked_cols.append(reranked)
-                        best_idx = int(reranked.argmin().item())
-                        best_inl = 0  # not applicable for depth-based re-ranking
-
-                t_rerank = (time.perf_counter() - t_rerank0) * 1000.0
-            elif args.method == "superevent":
-                # Run brute force matching on superevent points
-                dist = []
-                dist.append(stream.bruteforce(q_k_desc, ref_descs))
+                final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
+                best_arg = np.argmin(final_scores)
 
             # End of processing for this frame, record total time
             t_total = (time.perf_counter() - cpu0) * 1000.0
