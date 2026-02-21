@@ -172,7 +172,7 @@ def main():
                     help="Name of the reference")
     ap.add_argument("--query", type=str, required=True,
                     help="Name of the query")
-    ap.add_argument("--time-scale", type=float, default=1e-9,
+    ap.add_argument("--time-scale", type=float, default=1e-6,
                     help="Time scale for event accumulation")
     ap.add_argument("--chunk-size", type=int, default=250_000,
                     help="Number of events to process in each chunk (for streaming from hdf5)")
@@ -386,7 +386,7 @@ def main():
             y = torch.tensor(y).to(device='cuda')
             p = torch.tensor(y).to(device='cuda')
             t_raw = torch.tensor(t_raw).to(device='cuda')
-		
+
             j0.record(join_stream)
             start = time.time()
             if x.size == 0:
