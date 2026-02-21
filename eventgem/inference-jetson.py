@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from external.depthanyevent.models import fetch_model  # from the DepthAnyEvent repo
 import imageio
-import tensorrt as trt
 
 THIS_DIR = Path(__file__).resolve().parent
 BACKBONE_ROOT = THIS_DIR / "external" / "backbone"
@@ -23,38 +22,109 @@ SUPEREVENT_ROOT = THIS_DIR / "external" / "superevent"
 sys.path.insert(0, str(SUPEREVENT_ROOT))
 sys.path.insert(0, str(BACKBONE_ROOT))
 
-class TRTEngine:
-    def __init__(self, engine_path):
-        self.logger = trt.Logger(trt.Logger.WARNING)
-        with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
-            self.engine = runtime.deserialize_cuda_engine(f.read())
-        self.context = self.engine.create_execution_context()
+import ctypes
+import torch
+
+lib = ctypes.CDLL("./libtrt_runner.so")
+
+class TrtHandle(ctypes.Structure):
+    pass
+
+lib.trt_load.restype = ctypes.POINTER(TrtHandle)
+lib.trt_load.argtypes = [ctypes.c_char_p]
+
+lib.trt_num_io.restype = ctypes.c_int
+lib.trt_num_io.argtypes = [ctypes.POINTER(TrtHandle)]
+
+lib.trt_is_input.restype = ctypes.c_int
+lib.trt_is_input.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int]
+
+lib.trt_get_name.restype = ctypes.c_int
+lib.trt_get_name.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+
+lib.trt_get_dtype.restype = ctypes.c_int
+lib.trt_get_dtype.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int]
+
+lib.trt_get_ndim.restype = ctypes.c_int
+lib.trt_get_ndim.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int]
+
+lib.trt_get_dims.restype = ctypes.c_int
+lib.trt_get_dims.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+
+lib.trt_set_ptr.restype = ctypes.c_int
+lib.trt_set_ptr.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int, ctypes.c_void_p]
+
+lib.trt_set_stream.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_ulonglong]
+
+lib.trt_execute.restype = ctypes.c_int
+lib.trt_execute.argtypes = [ctypes.POINTER(TrtHandle)]
+
+lib.trt_destroy.argtypes = [ctypes.POINTER(TrtHandle)]
+
+# TRT DataType enum -> torch dtype (common cases)
+TRT_TO_TORCH = {
+    0: torch.float32,  # kFLOAT
+    1: torch.float16,  # kHALF
+    2: torch.int8,     # kINT8
+    3: torch.int32,    # kINT32
+    4: torch.bool,     # kBOOL
+}
+
+class TRTEngineCUDA12:
+    def __init__(self, engine_path: str):
+        self.h = lib.trt_load(engine_path.encode())
+        if not self.h:
+            raise RuntimeError("Failed to load engine (version mismatch?)")
+
+        self.n = lib.trt_num_io(self.h)
         self.inputs = []
         self.outputs = []
-        self.bindings = []
-        
-        for i in range(self.engine.num_bindings):
-            name = self.engine.get_binding_name(i)
-            dtype = trt.nptype(self.engine.get_binding_dtype(i))
-            shape = self.engine.get_binding_shape(i)
-            # Create torch tensors directly on GPU
-            tensor = torch.empty(tuple(shape), dtype=torch.from_numpy(np.array(1, dtype=dtype)).dtype, device="cuda")
-            self.bindings.append(tensor.data_ptr())
-            if self.engine.binding_is_input(i):
-                self.inputs.append(tensor)
+        self._i_idx = []
+        self._o_idx = []
+
+        # Static-shape allocation (throws if any dim is -1)
+        for i in range(self.n):
+            dt = lib.trt_get_dtype(self.h, i)
+            if dt not in TRT_TO_TORCH:
+                raise RuntimeError(f"Unsupported TRT dtype enum {dt} at io[{i}]")
+            torch_dtype = TRT_TO_TORCH[dt]
+
+            ndim = lib.trt_get_ndim(self.h, i)
+            buf = (ctypes.c_int * 16)()
+            ok = lib.trt_get_dims(self.h, i, buf, 16)
+            if not ok:
+                raise RuntimeError(f"Failed reading dims for io[{i}]")
+            shape = [buf[k] for k in range(ndim)]
+            if any(s < 0 for s in shape):
+                raise RuntimeError(f"io[{i}] is dynamic shape {shape}; handle dynamic separately")
+
+            t = torch.empty(tuple(shape), device="cuda", dtype=torch_dtype)
+            ok = lib.trt_set_ptr(self.h, i, ctypes.c_void_p(t.data_ptr()))
+            if not ok:
+                raise RuntimeError(f"Failed setTensorAddress for io[{i}]")
+
+            if lib.trt_is_input(self.h, i):
+                self.inputs.append(t); self._i_idx.append(i)
             else:
-                self.outputs.append(tensor)
+                self.outputs.append(t); self._o_idx.append(i)
 
     def __call__(self, *args):
-        # Copy input data to the pre-allocated input tensors
-        for i, arg in enumerate(args):
-            self.inputs[i].copy_(arg)
-        
-        # Run inference
-        self.context.execute_v2(self.bindings)
-        
-        # Return outputs (as torch tensors)
+        for k, a in enumerate(args):
+            self.inputs[k].copy_(a)
+
+        # run on the current PyTorch CUDA stream
+        stream = torch.cuda.current_stream().cuda_stream
+        lib.trt_set_stream(self.h, int(stream))
+
+        ok = lib.trt_execute(self.h)
+        if ok != 1:
+            raise RuntimeError("enqueueV3 failed")
         return self.outputs[0] if len(self.outputs) == 1 else self.outputs
+
+    def close(self):
+        if self.h:
+            lib.trt_destroy(self.h)
+            self.h = None
 
 # ---------------------------
 # Main
