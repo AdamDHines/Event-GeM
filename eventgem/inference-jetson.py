@@ -382,15 +382,21 @@ def main():
             )
         for (_, _, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms) in event_iter:
             cpu0 = time.perf_counter()
-            n_events = int(x.size)
+            x = torch.tensor(x).to(device='cuda')
+            y = torch.tensor(y).to(device='cuda')
+            p = torch.tensor(y).to(device='cuda')
+            t_raw = torch.tensor(t_raw).to(device='cuda')
+		
             j0.record(join_stream)
-            
+            start = time.time()
             if x.size == 0:
                 continue
 
             with torch.cuda.stream(stream_vit):
                 vit0.record(stream_vit)
+                start=time.time()
                 pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
+                #print((time.time()-start)*1000)
                 inp = stream.vit_preprocess_like_dataloader(pol_2hw, out_hw=(vitH, vitW))
                 inp = inp.to(dtype=torch.float16)
                 if (H != vitH) or (W != vitW):
@@ -401,7 +407,9 @@ def main():
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
                         q_desc_vit = stream.vit_gem_descriptor(vit, inp)
                 else:
+                    #start = time.time()	
                     q_desc_vit = vit(inp)
+                    #print(f"vit: {(time.time()-start)*1000} msec")
                 
                 if args.extract_reference:
                     ref_feats.append(q_desc_vit.cpu().numpy())
@@ -415,10 +423,13 @@ def main():
 
             with torch.cuda.stream(stream_se):
                 se0.record(stream_se)
+                #start = time.time()
                 mcts = stream.gpu_mcts(x, y, t_raw, p, H, W, int(t_ref_raw), float(args.time_scale), windows_sec, device)
+                #print(f"superevent: {(time.time()-start)*1000} msec")
                 mcts = mcts[:, off_top:h_end, off_left:w_end] 
-                
+	
                 pred = se_model(mcts.unsqueeze(0).to(dtype=torch.float16))
+                
 
                 prob, desc_map = pred[1], pred[3]
                 kpts_all, _ = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
@@ -429,10 +440,12 @@ def main():
                 q_k_desc = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)
                 se1.record(stream_se)
         
-            join_stream.wait_stream(stream_vit)
-            join_stream.wait_stream(stream_se) 
-            j1.record(join_stream)
-            j1.synchronize() 
+            #join_stream.wait_stream(stream_vit)
+            #join_stream.wait_stream(stream_se) 
+            #j1.record(join_stream)
+            #j1.synchronize() 
+            #start=time.time()
+	    
 
             if top_idx_t.numel() > 0 and kpts_yx.numel() > 10:
                 q_xy = kpts_yx[:, [1,0]].float()
@@ -448,16 +461,16 @@ def main():
                 )
                 final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
                 best_arg = np.argmin(final_scores)
+            #print(f"total: {(time.time()-start)*1000} msec")
 
             # End of processing for this frame, record total time
             t_total = (time.perf_counter() - cpu0) * 1000.0
             t_read_list.append(t_read_ms)
 
             if (frame_idx % 100) == 0:
-                torch.cuda.synchronize()
                 hz = 1000.0 / max(1e-6, t_total)
                 # just print the total time lapsed
-                print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
+                print(f"[LIVE] {frame_idx:5d} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
 
     wall_s = time.perf_counter() - wall0
     n_frames = len(t_total_list)

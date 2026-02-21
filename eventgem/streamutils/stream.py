@@ -423,17 +423,11 @@ def tencode(
 
 @torch.no_grad()
 def gpu_polarity_frame_2ch(
-    x_np: np.ndarray, y_np: np.ndarray, p_np: np.ndarray,
+    x, y, p,
     H: int, W: int, device: torch.device
 ) -> Tuple[torch.Tensor, int]:
-    if x_np.size == 0:
-        return torch.zeros((2, H, W), device=device, dtype=torch.float32), 0
-
-    x = torch.from_numpy(x_np).to(device=device, dtype=torch.int64)
-    y = torch.from_numpy(y_np).to(device=device, dtype=torch.int64)
 
     # KEY FIX: keep p as-is, then promote safely before >0
-    p = torch.from_numpy(p_np).to(device=device)
     if p.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
         p_cmp = p.to(torch.int16)   # prevents uint8 255 -> int8 -1 wrap
     else:
@@ -483,56 +477,57 @@ def vit_preprocess_like_dataloader(pol_2hw: torch.Tensor, out_hw=(224, 224)) -> 
 
 @torch.no_grad()
 def gpu_mcts(
-    x_np: np.ndarray, y_np: np.ndarray, t_raw_np: np.ndarray, p_np: np.ndarray,
-    H: int, W: int, t_ref_raw: int, time_scale: float, windows_sec: torch.Tensor,
-    device: torch.device
+    x, y, t, p,
+    H, W, t_ref_raw, time_scale, windows_sec: torch.Tensor,
+    device
 ) -> torch.Tensor:
-    num_scales = int(windows_sec.numel())
-    C = 2 * num_scales
-    out = torch.zeros((C, H, W), device=device, dtype=torch.float32)
+    S = int(windows_sec.numel())
+    flat = H * W
+    out = torch.zeros((2 * S, H, W), device=device, dtype=torch.float32)
 
-    if x_np.size == 0:
-        return out
-
-    x = torch.from_numpy(x_np).to(device=device, dtype=torch.int64)
-    y = torch.from_numpy(y_np).to(device=device, dtype=torch.int64)
-    t = torch.from_numpy(t_raw_np).to(device=device, dtype=torch.int64)
-    p = torch.from_numpy(p_np).to(device=device, dtype=torch.int8)
+    # Move to GPU (still expensive; see section 3)
 
     valid = (x >= 0) & (x < W) & (y >= 0) & (y < H)
     if not torch.any(valid):
         return out
 
     x = x[valid]; y = y[valid]; t = t[valid]; p = p[valid]
-    lin = y * W + x
-    flat = H * W
 
+    # Relative time (seconds, negative = past)
     t_rel = (t - int(t_ref_raw)).to(torch.float32) * float(time_scale)
+
+    # Only keep events within max window (saves work)
+    Dt_max = float(windows_sec.max().item())
+    m = t_rel >= -Dt_max
+    if not torch.any(m):
+        return out
+    x = x[m]; y = y[m]; p = p[m]; t_rel = t_rel[m]
+
+    lin = y * W + x  # int32
+    # polarity group: 0 for pos, 1 for neg (match your earlier convention)
     grp = torch.where(p > 0, torch.zeros_like(lin), torch.ones_like(lin))
-    idx2 = lin + grp * flat
-    neg_inf = torch.tensor(-1e20, device=device, dtype=torch.float32)
+    idx = lin + grp * flat  # [0..2*flat)
 
-    for s_idx in range(num_scales):
-        Dt = float(windows_sec[s_idx].item())
-        m = t_rel >= -Dt
-        if not torch.any(m):
-            continue
+    # One scatter_reduce for "last timestamp per pixel per polarity"
+    neg_inf = -1e20
+    t_last = torch.full((2 * flat,), neg_inf, device=device, dtype=torch.float32)
+    t_last.scatter_reduce_(0, idx.to(torch.int64), t_rel, reduce="amax", include_self=True)
 
-        idx_m = idx2[m]
-        t_m = t_rel[m]
+    # reshape to [2,H,W]
+    t_last = t_last.view(2, H, W)
+    valid_pix = t_last > -1e10
+    dt = (-t_last).clamp(min=0.0)  # [2,H,W], seconds since last event
 
-        t_last = neg_inf.expand(2 * flat).clone()
-        t_last.scatter_reduce_(0, idx_m, t_m, reduce="amax", include_self=True)
+    # Vectorize over S windows: produce [S,2,H,W]
+    Dt = windows_sec.to(device=device, dtype=torch.float32).view(S, 1, 1, 1)          # [S,1,1,1]
+    dt_s = dt.unsqueeze(0).expand(S, -1, -1, -1)                                     # [S,2,H,W]
+    mask = valid_pix.unsqueeze(0) & (dt_s <= Dt)                                     # [S,2,H,W]
 
-        valid_pix = t_last > -1e10
-        dt = (-t_last).clamp(min=0.0, max=Dt)
-        vals = torch.zeros_like(t_last)
-        vals[valid_pix] = torch.exp(-dt[valid_pix] / Dt)
+    vals = torch.where(mask, torch.exp(-dt_s / Dt), torch.zeros_like(dt_s))          # [S,2,H,W]
 
-        vals = vals.view(2, flat).view(2, H, W)
-        out[s_idx, :, :] = vals[0]
-        out[num_scales + s_idx, :, :] = vals[1]
-
+    # Pack to your output layout: [S,H,W] pos then [S,H,W] neg
+    out[:S] = vals[:, 0]
+    out[S:] = vals[:, 1]
     return out
 
 # ---------------------------
