@@ -837,6 +837,7 @@ def batched_ransac_rerank(
     # Cosine Sim: [B, Nq, Nr]
     # align dtype/device once
     r_desc = r_desc.to(device=q_desc.device, dtype=q_desc.dtype)
+    
     sim = r_desc @ q_desc.T
     sim.masked_fill_(~r_mask.unsqueeze(1), -2.0)
     

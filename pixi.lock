@@ -6,6 +6,8 @@ environments:
     - url: https://conda.anaconda.org/adamhines/
     indexes:
     - https://pypi.org/simple
+    options:
+      pypi-prerelease-mode: if-necessary-or-explicit
     packages:
       linux-64:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-7_kmp_llvm.conda
@@ -462,7 +464,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zlib-1.3.1-hb9d3cd8_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zlib-ng-2.3.3-hceb46e0_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_6.conda
-      - pypi: https://files.pythonhosted.org/packages/d5/04/6ea6a9bebb54a19b9bb8db0bcacf97d3f83c613d4142e8f1b718f8bf0a53/dv_processing-2.0.2-cp314-cp314-manylinux_2_28_x86_64.whl
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-7_kmp_llvm.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_2.conda
@@ -731,6 +732,8 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/numba-0.63.1-py312heba07a5_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/numpy-2.3.5-py312h6615c27_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/onnx-1.20.0-py312h4afea9c_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/onnx-ir-0.1.12-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/onnxscript-0.5.6-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/opencv-4.13.0-qt6_py312h66be150_602.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/openexr-3.4.4-hd0c962a_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/openh264-2.6.0-h0564a2a_0.conda
@@ -2647,13 +2650,6 @@ packages:
   name: dv-processing
   version: 2.0.2
   sha256: 37c007114f9c15e6fed38f0f068c123930ba5562aeb7063e53cf42b4fd00f844
-  requires_dist:
-  - numpy
-  requires_python: '>=3.8'
-- pypi: https://files.pythonhosted.org/packages/d5/04/6ea6a9bebb54a19b9bb8db0bcacf97d3f83c613d4142e8f1b718f8bf0a53/dv_processing-2.0.2-cp314-cp314-manylinux_2_28_x86_64.whl
-  name: dv-processing
-  version: 2.0.2
-  sha256: 928d662b899ce595bdb0a77fec288886b57d6ab4e453358a8a8ad1c74c84738a
   requires_dist:
   - numpy
   requires_python: '>=3.8'
@@ -8565,6 +8561,38 @@ packages:
   - pkg:pypi/onnx?source=hash-mapping
   size: 10905407
   timestamp: 1770635671378
+- conda: https://conda.anaconda.org/conda-forge/noarch/onnx-ir-0.1.12-pyhd8ed1ab_0.conda
+  sha256: 2f2a8baf242cd3d4772d2e313b36a067044a25df91b37867429fe88ba006f6cf
+  md5: f4c9cd9714e5e7606368d08c2dd443a8
+  depends:
+  - ml_dtypes >=0.5.0
+  - numpy
+  - onnx >=1.16
+  - python >=3.10
+  - typing_extensions >=4.10
+  license: Apache-2.0
+  license_family: APACHE
+  purls:
+  - pkg:pypi/onnx-ir?source=hash-mapping
+  size: 100630
+  timestamp: 1761740327766
+- conda: https://conda.anaconda.org/conda-forge/noarch/onnxscript-0.5.6-pyhd8ed1ab_0.conda
+  sha256: d7f7aa9df5099b1ed0b947d93d8a64595439c59d96a214214ad846b8b9ed044f
+  md5: 979061b3b19661b2a2e6af84e3966241
+  depends:
+  - ml_dtypes
+  - numpy
+  - onnx >=1.16
+  - onnx-ir >=0.1.12,<2
+  - packaging
+  - python >=3.10
+  - typing_extensions >=4.10
+  license: MIT
+  license_family: MIT
+  purls:
+  - pkg:pypi/onnxscript?source=hash-mapping
+  size: 360209
+  timestamp: 1761916604220
 - conda: https://conda.anaconda.org/conda-forge/linux-64/opencl-headers-2025.06.13-h5888daf_0.conda
   sha256: 2b6ce54174ec19110e1b3c37455f7cd138d0e228a75727a9bba443427da30a36
   md5: 45c3d2c224002d6d0d7769142b29f986

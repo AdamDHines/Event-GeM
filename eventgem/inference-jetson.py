@@ -126,6 +126,38 @@ class TRTEngineCUDA12:
             lib.trt_destroy(self.h)
             self.h = None
 
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ViTGeMExport(nn.Module):
+    def __init__(self, backbone, p: float = 5.0, eps: float = 1e-6):
+        super().__init__()
+        self.backbone = backbone
+        self.p = p
+        self.eps = eps
+
+    def forward(self, x_bchw: torch.Tensor) -> torch.Tensor:
+        bb = self.backbone
+
+        # EXACTLY your old logic (don’t “fix” it unless you mean to change behavior)
+        t = bb.patch_embed(x_bchw)
+        t = t + bb.pos_embed
+        t = torch.cat((bb.tokens.expand(t.shape[0], -1, -1), t), dim=1)
+
+        for blk in bb.blocks:
+            t = blk(t)
+        t = bb.norm(t)
+
+        patch_tokens = t[:, 2:, :]  # assumes 2 prefix tokens, as per your old code
+        B, N, C = patch_tokens.shape
+        g = int(round(math.sqrt(N)))  # will become a constant if N is fixed (e.g., 196 -> 14)
+        patch_tokens = patch_tokens.transpose(1, 2).reshape(B, C, g, g)
+
+        gem = F.avg_pool2d(patch_tokens.clamp(min=self.eps).pow(self.p), (g, g)).pow(1.0 / self.p)
+        return gem.squeeze(-1).squeeze(-1)  # [B, C]
+
 # ---------------------------
 # Main
 # ---------------------------
@@ -181,7 +213,7 @@ def main():
                     help="Path to the SuperEvent config file")
     ap.add_argument("--se-weights", type=str, default="eventgem/external/superevent/saved_models/super_event_weights.pth",
                     help="Path to the SuperEvent weights file")
-    ap.add_argument("--se-topk", type=int, default=96,
+    ap.add_argument("--se-topk", type=int, default=170,
                     help="Number of top candidates to keep after re-ranking")
     ap.add_argument("--mcts-windows-ms", type=float, nargs="+", default=[10, 20, 30, 40, 50],
                     help="List of time windows (in ms) for MCTS")
@@ -256,15 +288,18 @@ def main():
     print(args.method)
     # Load the corresponding model to run the inference on
     if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
-        vit = TRTEngine("vit.engine")
-        vitH, vitW = stream.infer_vit_input_hw(vit)
+        vit = TRTEngineCUDA12("vitgem.engine")
+        #vit = stream.load_vit_backbone(args.backbone_ckpt, device)
+        #vitH, vitW = stream.infer_vit_input_hw(vit)
+        vitH, vitW = 224, 224
         print(f"[INFO] ViT expects ~ {vitH}x{vitW}")
         ref_db = stream.load_ref_vit_db(ref_feats_file, device=device, dtype=torch.float16 if args.amp else torch.float32)
         ref_db = ref_db.to(dtype=torch.float16)
         stream_vit = torch.cuda.Stream()
 
     if args.method in ["superevent", "eventgem", "eventgem-d"]:
-        se_model = TRTEngine("superevent.engine")
+        se_model = TRTEngineCUDA12("superevent.engine")
+        se_cfg = stream.load_superevent_config(Path(args.se_config))
         from models.util import fast_nms
         off_top, off_left, _, _, h_end, w_end, Hc, Wc = stream.compute_superevent_crop_offsets(H, W, se_cfg)
         print(f"[INFO] SuperEvent crop: top={off_top} left={off_left} -> {Hc}x{Wc}")
@@ -272,11 +307,13 @@ def main():
         windows_sec = torch.tensor(np.array(args.mcts_windows_ms, dtype=np.float32) * 1e-3, device=device)
             
     # For the ViT Backbone
-    # def export_vit_onnx(model, save_path="vit.onnx"):
-    #     dummy_input = torch.randn(1, 2, 224, 224).cuda().half()
-    #     torch.onnx.export(model, dummy_input, save_path, 
-    #                     input_names=['input'], output_names=['output'],
-    #                     opset_version=16, do_constant_folding=True)
+    def export_vit_gem_onnx(model, save_path="vitgem.onnx"):
+        
+        wrapper = ViTGeMExport(model)
+        dummy_input = torch.randn(1, 2, 224, 224).cuda().half()
+        torch.onnx.export(wrapper, dummy_input, save_path, 
+                        input_names=['input'], output_names=['output'],
+                        opset_version=18, do_constant_folding=True)
 
     # # For SuperEvent (Assuming MCTS 10 channels and 256x256 crop)
     # def export_se_onnx(model, save_path="superevent.onnx"):
@@ -286,7 +323,7 @@ def main():
     #                     opset_version=16)
     
     # # export to onnx
-    # export_vit_onnx(vit)
+    # export_vit_gem_onnx(vit.half())
     # export_se_onnx(se_model)
 
     ref_store = None
@@ -303,8 +340,6 @@ def main():
         print(f"[INFO] Ref kp store: {ref_kp_dir} (CPU Cache -> Batched GPU)")
 
     # change models to half
-    vit = vit.half()
-    se_model.half()
 
     join_stream = torch.cuda.current_stream()
 
@@ -366,12 +401,13 @@ def main():
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
                         q_desc_vit = stream.vit_gem_descriptor(vit, inp)
                 else:
-                    q_desc_vit = stream.vit_gem_descriptor(vit, inp)
+                    q_desc_vit = vit(inp)
                 
                 if args.extract_reference:
                     ref_feats.append(q_desc_vit.cpu().numpy())
                 else:
                     ret0.record(stream_vit)
+
                     top_idx_t, top_dist_t, sims_t = stream.retrieve_topk(ref_db, q_desc_vit, k=int(args.retrieval_k), return_sims=True)
                     ret1.record(stream_vit)
                     vit1.record(stream_vit)
@@ -383,10 +419,12 @@ def main():
                 mcts = mcts[:, off_top:h_end, off_left:w_end] 
                 
                 pred = se_model(mcts.unsqueeze(0).to(dtype=torch.float16))
-                prob, desc_map = pred['prob'], pred['descriptors']
-                
+
+                prob, desc_map = pred[1], pred[3]
                 kpts_all, _ = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
+ 
                 kpts_yx = kpts_all[0]
+                
 
                 q_k_desc = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)
                 se1.record(stream_se)
@@ -406,7 +444,7 @@ def main():
                 
                 inlier_counts = stream.batched_ransac_rerank(
                     q_xy, q_k_desc, ref_store, cand_ids, 
-                    max_matches=96, ratio_thresh=float(args.match_ratio)
+                    max_matches=170, ratio_thresh=float(args.match_ratio)
                 )
                 final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
                 best_arg = np.argmin(final_scores)

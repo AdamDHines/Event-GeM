@@ -13,6 +13,8 @@ libc = {family="glibc", version="2.35"}
 inference = {cmd = "pixi run python3 eventgem/inference.py"}
 inference-jetson = {cmd = "pixi run python3 eventgem/inference-jetson.py"}
 
+install-trt = "pip install --extra-index-url https://pypi.nvidia.com tensorrt-cu12"
+
 [target.linux-64.dependencies]
 python = ">3.8"
 numpy = "*"
@@ -133,6 +135,7 @@ tifffile = "*"
 triton = "*"
 typing_extensions = "*"
 prettytable = "*"
+onnxscript = "*"
 
-[pypi-dependencies]
+[target.linux-aarch64.pypi-dependencies]
 dv-processing = "*"
