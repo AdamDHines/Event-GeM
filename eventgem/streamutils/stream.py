@@ -767,7 +767,7 @@ class BatchedRefStore:
         t_mask = torch.from_numpy(np.stack(b_mask)).to(device, non_blocking=True)
         t_desc = F.normalize(t_desc, p=2, dim=2)
         
-        return t_kpts, t_desc, t_mask
+        return t_kpts, t_desc.to(dtype=torch.float16), t_mask
     
 @torch.no_grad()
 def vit_gem_descriptor(backbone, x_bchw: torch.Tensor) -> torch.Tensor:

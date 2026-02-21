@@ -1,16 +1,19 @@
 [workspace]
-authors = ["Adam D. Hines <adam.hines@qut.edu.au>, Gokul B. Nair, Michael Milford, Tobias Fischer"]
-channels = ["conda-forge"]
+authors = ["Adam D. Hines <adam.hines@qut.edu.au>, Gokul B. Nair, Nicolas Guillermo Marticorena Vidal, Michael Milford, Tobias Fischer"]
+channels = ["conda-forge", "adamhines"]
 name = "EventGeM"
 platforms = ["linux-64", "linux-aarch64"]
 version = "0.1.0"
 
 [system-requirements]
 cuda = "12"
+libc = {family="glibc", version="2.35"}
 
 [tasks]
+inference = {cmd = "pixi run python3 eventgem/inference.py"}
+inference-jetson = {cmd = "pixi run python3 eventgem/inference-jetson.py"}
 
-[dependencies]
+[target.linux-64.dependencies]
 python = ">3.8"
 numpy = "*"
 pytorch = "*"
@@ -57,17 +60,10 @@ six = "*"
 sympy = "*"
 threadpoolctl = "*"
 tifffile = "*"
-torchaudio = "*"
 triton = "*"
 typing_extensions = "*"
 prettytable = "*"
-
-[pypi-dependencies]
-dv-processing = "*"
-
-[target.linux-64.dependencies]
 cuda-version = "12.*"
-pytorch-gpu = "*"
 cuda-cudart-dev = "*"
 cuda-crt = "*"
 cudnn = "*"
@@ -87,5 +83,56 @@ libcurand-dev = "*"
 libcusolver-dev = "*"
 
 [target.linux-aarch64.dependencies]
-cuda-version = "12.*"
-pytorch-gpu = "*"
+python = "*"
+numpy = "*"
+pytorch = {version = "*", channel = "adamhines"}
+libtorch = {version = "*", channel = "adamhines"}
+sinabs = "*"
+torchvision = {version = "*", channel = "adamhines"}
+pytorch-lightning  = "*"
+einops = "*"
+timm = "*"
+yaml = "*"
+pyyaml = "*"
+flatten-dict = "*"
+opencv = "*"
+tqdm = "*"
+scikit-learn = "*"
+pynmea2 = "*"
+pyarrow = "*"
+cmapy = "*"
+contourpy = "*"
+cycler = "*"
+filelock = "*"
+fonttools = "*" 
+fsspec = "*"
+h5py = "*"
+hdf5plugin = "*"
+imageio = "*"
+Jinja2 = "*"
+joblib = "*"
+kiwisolver = "*"
+kornia = "*"
+lazy_loader = "*"
+llvmlite = "*"
+MarkupSafe = "*"
+matplotlib = "*"
+mpmath = "*"
+networkx = "*"
+numba = "*"
+packaging = "*"
+pillow = "*"
+pyparsing = "*"
+python-dateutil = "*"
+scikit-image = "*"
+scipy = "*"
+six = "*"
+sympy = "*"
+threadpoolctl = "*"
+tifffile = "*"
+triton = "*"
+typing_extensions = "*"
+prettytable = "*"
+
+[pypi-dependencies]
+dv-processing = "*"

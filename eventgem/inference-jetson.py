@@ -28,13 +28,13 @@ sys.path.insert(0, str(BACKBONE_ROOT))
 def main():
     ap = argparse.ArgumentParser()
     # Dataset parameters
-    ap.add_argument("--hdf5", "-h", type=str, required=True, 
+    ap.add_argument("--hdf5",  type=str, required=True, 
                     help="Path to the input hdf5 file containing events")
-    ap.add_argument("--dataset", "-d", type=str, required=True,
+    ap.add_argument("--dataset",  type=str, required=True,
                     help="Name of the dataset")
-    ap.add_argument("--reference", "-r", type=str, required=True,
+    ap.add_argument("--reference", type=str, required=True,
                     help="Name of the reference")
-    ap.add_argument("--query", "-q", type=str, required=True,
+    ap.add_argument("--query", type=str, required=True,
                     help="Name of the query")
     ap.add_argument("--time-scale", type=float, default=1e-9,
                     help="Time scale for event accumulation")
@@ -53,11 +53,11 @@ def main():
                 help="Which method to run (for ablation or comparison)")
     ap.add_argument('--extract-reference', action='store_true', 
                     help="Whether to extract reference information (for initial mapping)")
-    ap.add_argument('--features-dir', type=str, default='features',
+    ap.add_argument('--features-dir', type=str, default='eventgem/features',
                     help="Directory to save extracted features (if --extract-reference is set)")
-    ap.add_argument('--keypoint-dir', type=str, default='keypoints',
+    ap.add_argument('--keypoint-dir', type=str, default='eventgem/keypoints',
                     help="Directory to save extracted keypoints (if --extract-reference is set)")
-    ap.add_argument('--depth-dir', type=str, default='depth',
+    ap.add_argument('--depth-dir', type=str, default='eventgem/depth',
                     help="Directory to save extracted depth maps (if --extract-reference is set)")
     
     # ViT backbone parameters
@@ -71,7 +71,7 @@ def main():
                     help="Time window (in ms) to accumulate events for each inference step")
 
     # SuperEvent parameters
-    ap.add_argument("--retrieval-k", type=int, default=50,
+    ap.add_argument("--retrieval-k", type=int, default=10,
                     help="Number of top candidates to retrieve from ViT before re-ranking")
     ap.add_argument("--se-config", type=str, default="eventgem/external/superevent/config/super_event.yaml",
                     help="Path to the SuperEvent config file")
@@ -119,16 +119,17 @@ def main():
             raise FileNotFoundError(hdf5_path)
     
     # If extracting reference information, set storage paths
-    if args.extract_reference:
-        ref_feats_dir = Path(args.features_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
-        ref_kp_dir = Path(args.keypoint_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
-        ref_depth_dir = Path(args.depth_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
-        ref_feats_dir.mkdir(parents=True, exist_ok=True)
-        ref_kp_dir.mkdir(parents=True, exist_ok=True)
-        ref_depth_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] Extracted reference features will be saved to: {ref_feats_dir}")
-        print(f"[INFO] Extracted reference keypoints will be saved to: {ref_kp_dir}")
-        print(f"[INFO] Extracted reference depth maps will be saved to: {ref_depth_dir}")
+    # if args.extract_reference:
+    ref_feats_dir = Path(args.features_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
+    ref_feats_file = ref_feats_dir / f"{args.dataset}_{args.reference}_features.pt"
+    ref_kp_dir = Path(args.keypoint_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
+    ref_depth_dir = Path(args.depth_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
+    ref_feats_dir.mkdir(parents=True, exist_ok=True)
+    ref_kp_dir.mkdir(parents=True, exist_ok=True)
+    ref_depth_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] Extracted reference features will be saved to: {ref_feats_dir}")
+    print(f"[INFO] Extracted reference keypoints will be saved to: {ref_kp_dir}")
+    print(f"[INFO] Extracted reference depth maps will be saved to: {ref_depth_dir}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
@@ -154,7 +155,8 @@ def main():
         vit = stream.load_vit_backbone(args.backbone_ckpt, device)
         vitH, vitW = stream.infer_vit_input_hw(vit)
         print(f"[INFO] ViT expects ~ {vitH}x{vitW}")
-        ref_db = stream.load_ref_vit_db(args.ref_feats, device=device, dtype=torch.float16 if args.amp else torch.float32)
+        ref_db = stream.load_ref_vit_db(ref_feats_file, device=device, dtype=torch.float16 if args.amp else torch.float32)
+        ref_db = ref_db.to(dtype=torch.float16)
         stream_vit = torch.cuda.Stream()
 
     if args.method in ["superevent", "eventgem", "eventgem-d"]:
@@ -166,7 +168,8 @@ def main():
         windows_sec = torch.tensor(np.array(args.mcts_windows_ms, dtype=np.float32) * 1e-3, device=device)
         if args.method == "superevent":
             # Loading the reference keypoint descriptors
-            ref_descs = stream.preload_ref_descs(args.ref_kp_dir, args.ref_kp_pattern)
+            ref_descs = stream.preload_ref_descs(ref_kp_dir, args.ref_kp_pattern)
+            
 
     if args.method == "eventgem-d":
         # Load model + config
@@ -224,18 +227,21 @@ def main():
         )
 
     ref_store = None
-    if args.do_rerank or args.method in ["superevent"]:
-        if args.ref_kp_dir is None:
+    if args.method in ["eventgem", "eventgem-d", "superevent"]:
+        if ref_kp_dir is None:
             raise ValueError("--do-rerank requires --ref-kp-dir")
         
         ref_store = stream.BatchedRefStore(
-            ref_dir=Path(args.ref_kp_dir),
+            ref_dir=Path(ref_kp_dir),
             pattern=args.ref_kp_pattern,
             cache_size=args.ref_kp_cache,
             max_kpts=args.se_topk
         )
-        print(f"[INFO] Ref kp store: {args.ref_kp_dir} (CPU Cache -> Batched GPU)")
+        print(f"[INFO] Ref kp store: {ref_kp_dir} (CPU Cache -> Batched GPU)")
 
+    # change models to half
+    vit = vit.half()
+    se_model.half()
 
     join_stream = torch.cuda.current_stream()
 
@@ -292,6 +298,7 @@ def main():
                     vit0.record(stream_vit)
                     pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
                     inp = stream.vit_preprocess_like_dataloader(pol_2hw, out_hw=(vitH, vitW))
+                    inp = inp.to(dtype=torch.float16)
                     if (H != vitH) or (W != vitW):
                         mode = "nearest" if args.resize == "nearest" else "bilinear"
                         inp = F.interpolate(inp, size=(vitH, vitW), mode=mode, align_corners=False if mode=="bilinear" else None)
@@ -317,7 +324,7 @@ def main():
                     mcts = stream.gpu_mcts(x, y, t_raw, p, H, W, int(t_ref_raw), float(args.time_scale), windows_sec, device)
                     mcts = mcts[:, off_top:h_end, off_left:w_end] 
                     
-                    pred = se_model(mcts.unsqueeze(0))
+                    pred = se_model(mcts.unsqueeze(0).to(dtype=torch.float16))
                     prob, desc_map = pred['prob'], pred['descriptors']
                     
                     kpts_all, _ = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
@@ -399,7 +406,7 @@ def main():
                 join_stream.wait_stream(stream_davis)
 
             j1.record(join_stream)
-            torch.cuda.synchronize()
+            
             
             if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
                 vit_ms = vit0.elapsed_time(vit1)
@@ -417,12 +424,12 @@ def main():
                 davis_ms = davis0.elapsed_time(davis1)
 
             t_rerank0 = time.perf_counter()
-            if args.do_rerank:
-                best_idx = int(top_idx_t[0].item()) if top_idx_t.numel() else -1
-                best_inl = 0
+
+            best_idx = int(top_idx_t[0].item()) if top_idx_t.numel() else -1
+            best_inl = 0
 
             if args.method in ["eventgem", "eventgem-d"]:
-                if args.do_rerank and top_idx_t.numel() > 0 and kpts_yx.numel() > 10:
+                if top_idx_t.numel() > 0 and kpts_yx.numel() > 10:
                     q_xy = kpts_yx[:, [1,0]].float()
                     q_xy[:,0] += float(off_left)
                     q_xy[:,1] += float(off_top)
@@ -465,21 +472,19 @@ def main():
 
             # End of processing for this frame, record total time
             t_total = (time.perf_counter() - cpu0) * 1000.0
-
-            if frame_idx >= args.warmup:
-                t_read_list.append(t_read_ms)
-                if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
-                    t_vit_list.append(vit_ms)
-                if args.method in ["superevent", "eventgem", "eventgem-d"]:
-                    t_se_list.append(se_ms)
-                if args.method == "eventvlad":
-                    t_vlad_list.append(vlad_ms)
-                if args.do_rerank:
-                    t_rerank_list.append(t_rerank)
-                t_total_list.append(t_total)
-                n_events_list.append(n_events)
+            t_read_list.append(t_read_ms)
+            if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
+                t_rerank_list.append(t_rerank)
+                t_vit_list.append(vit_ms)
+            if args.method in ["superevent", "eventgem", "eventgem-d"]:
+                t_se_list.append(se_ms)
+            if args.method == "eventvlad":
+                t_vlad_list.append(vlad_ms)
+            t_total_list.append(t_total)
+            n_events_list.append(n_events)
 
             if (frame_idx % 100) == 0:
+                torch.cuda.synchronize()
                 hz = 1000.0 / max(1e-6, t_total)
                 if args.live_davis: # print davis information and vit, se, rerank times
                     print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} davis={davis_ms:.1f}ms ({hz:.1f} Hz) vit={vit_ms:.1f}ms se={se_ms:.1f}ms rerank={t_rerank:.1f}ms total={t_total:.1f}ms", flush=True)
