@@ -407,21 +407,7 @@ def main():
 
             j1.record(join_stream)
             
-            
-            if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
-                vit_ms = vit0.elapsed_time(vit1)
-            if args.method in ["superevent", "eventgem", "eventgem-d"]:
-                se_ms = se0.elapsed_time(se1)
-            if args.method == "eventgem-d":
-                d_ms = d0.elapsed_time(d1)
-            if args.method == "lens":
-                lens_ms = lens0.elapsed_time(lens1)
-            if args.method == "sparse":
-                sparse_ms = sparse0.elapsed_time(sparse1)
-            if args.method == "eventvlad":
-                vlad_ms = vlad0.elapsed_time(vlad1)
-            if args.live_davis:
-                davis_ms = davis0.elapsed_time(davis1)
+
 
             t_rerank0 = time.perf_counter()
 
@@ -473,33 +459,12 @@ def main():
             # End of processing for this frame, record total time
             t_total = (time.perf_counter() - cpu0) * 1000.0
             t_read_list.append(t_read_ms)
-            if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
-                t_rerank_list.append(t_rerank)
-                t_vit_list.append(vit_ms)
-            if args.method in ["superevent", "eventgem", "eventgem-d"]:
-                t_se_list.append(se_ms)
-            if args.method == "eventvlad":
-                t_vlad_list.append(vlad_ms)
-            t_total_list.append(t_total)
-            n_events_list.append(n_events)
 
             if (frame_idx % 100) == 0:
                 torch.cuda.synchronize()
                 hz = 1000.0 / max(1e-6, t_total)
-                if args.live_davis: # print davis information and vit, se, rerank times
-                    print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} davis={davis_ms:.1f}ms ({hz:.1f} Hz) vit={vit_ms:.1f}ms se={se_ms:.1f}ms rerank={t_rerank:.1f}ms total={t_total:.1f}ms", flush=True)
-                elif args.method == "eventgem":
-                    print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} vit={vit_ms:.1f} se={se_ms:.1f} rerank={t_rerank:.1f} total={t_total:.1f}ms ({hz:.1f} Hz) best={best_idx} inl={best_inl}", flush=True)
-                elif args.method == "eventgem-d":
-                    print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} vit={vit_ms:.1f} se={se_ms:.1f} d={d_ms:.1f} rerank={t_rerank:.1f} total={t_total:.1f}ms ({hz:.1f} Hz) best={best_idx} inl={best_inl}", flush=True)
-                elif args.method == "superevent":
-                    print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} se={se_ms:.1f} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
-                elif args.method == "lens":
-                    print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} lens={lens_ms:.1f} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
-                elif args.method == "sparse":
-                    print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} sparse={sparse_ms:.1f} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
-                else:
-                    print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} vlad={vlad_ms:.1f} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
+                # just print the total time lapsed
+                print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
 
     wall_s = time.perf_counter() - wall0
     n_frames = len(t_total_list)
