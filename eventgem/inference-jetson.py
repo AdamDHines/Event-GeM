@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from external.depthanyevent.models import fetch_model  # from the DepthAnyEvent repo
 import imageio
+import tensorrt as trt
 
 THIS_DIR = Path(__file__).resolve().parent
 BACKBONE_ROOT = THIS_DIR / "external" / "backbone"
@@ -21,6 +22,39 @@ SUPEREVENT_ROOT = THIS_DIR / "external" / "superevent"
 # Order matters: backbone's `utils` must win
 sys.path.insert(0, str(SUPEREVENT_ROOT))
 sys.path.insert(0, str(BACKBONE_ROOT))
+
+class TRTEngine:
+    def __init__(self, engine_path):
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        self.context = self.engine.create_execution_context()
+        self.inputs = []
+        self.outputs = []
+        self.bindings = []
+        
+        for i in range(self.engine.num_bindings):
+            name = self.engine.get_binding_name(i)
+            dtype = trt.nptype(self.engine.get_binding_dtype(i))
+            shape = self.engine.get_binding_shape(i)
+            # Create torch tensors directly on GPU
+            tensor = torch.empty(tuple(shape), dtype=torch.from_numpy(np.array(1, dtype=dtype)).dtype, device="cuda")
+            self.bindings.append(tensor.data_ptr())
+            if self.engine.binding_is_input(i):
+                self.inputs.append(tensor)
+            else:
+                self.outputs.append(tensor)
+
+    def __call__(self, *args):
+        # Copy input data to the pre-allocated input tensors
+        for i, arg in enumerate(args):
+            self.inputs[i].copy_(arg)
+        
+        # Run inference
+        self.context.execute_v2(self.bindings)
+        
+        # Return outputs (as torch tensors)
+        return self.outputs[0] if len(self.outputs) == 1 else self.outputs
 
 # ---------------------------
 # Main
@@ -152,7 +186,7 @@ def main():
     print(args.method)
     # Load the corresponding model to run the inference on
     if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
-        vit = stream.load_vit_backbone(args.backbone_ckpt, device)
+        vit = TRTEngine("vit.engine")
         vitH, vitW = stream.infer_vit_input_hw(vit)
         print(f"[INFO] ViT expects ~ {vitH}x{vitW}")
         ref_db = stream.load_ref_vit_db(ref_feats_file, device=device, dtype=torch.float16 if args.amp else torch.float32)
@@ -160,7 +194,7 @@ def main():
         stream_vit = torch.cuda.Stream()
 
     if args.method in ["superevent", "eventgem", "eventgem-d"]:
-        se_model, se_cfg = stream.build_superevent_model(Path(args.se_config), Path(args.se_weights), device)
+        se_model = TRTEngine("superevent.engine")
         from models.util import fast_nms
         off_top, off_left, _, _, h_end, w_end, Hc, Wc = stream.compute_superevent_crop_offsets(H, W, se_cfg)
         print(f"[INFO] SuperEvent crop: top={off_top} left={off_left} -> {Hc}x{Wc}")
@@ -168,22 +202,22 @@ def main():
         windows_sec = torch.tensor(np.array(args.mcts_windows_ms, dtype=np.float32) * 1e-3, device=device)
             
     # For the ViT Backbone
-    def export_vit_onnx(model, save_path="vit.onnx"):
-        dummy_input = torch.randn(1, 2, 224, 224).cuda().half()
-        torch.onnx.export(model, dummy_input, save_path, 
-                        input_names=['input'], output_names=['output'],
-                        opset_version=16, do_constant_folding=True)
+    # def export_vit_onnx(model, save_path="vit.onnx"):
+    #     dummy_input = torch.randn(1, 2, 224, 224).cuda().half()
+    #     torch.onnx.export(model, dummy_input, save_path, 
+    #                     input_names=['input'], output_names=['output'],
+    #                     opset_version=16, do_constant_folding=True)
 
-    # For SuperEvent (Assuming MCTS 10 channels and 256x256 crop)
-    def export_se_onnx(model, save_path="superevent.onnx"):
-        dummy_input = torch.randn(1, 10, 256, 256).cuda().half()
-        torch.onnx.export(model, dummy_input, save_path,
-                        input_names=['mcts'], output_names=['prob', 'desc'],
-                        opset_version=16)
+    # # For SuperEvent (Assuming MCTS 10 channels and 256x256 crop)
+    # def export_se_onnx(model, save_path="superevent.onnx"):
+    #     dummy_input = torch.randn(1, 10, 256, 256).cuda().half()
+    #     torch.onnx.export(model, dummy_input, save_path,
+    #                     input_names=['mcts'], output_names=['prob', 'desc'],
+    #                     opset_version=16)
     
-    # export to onnx
-    export_vit_onnx(vit)
-    export_se_onnx(se_model)
+    # # export to onnx
+    # export_vit_onnx(vit)
+    # export_se_onnx(se_model)
 
     ref_store = None
     if args.method in ["eventgem", "eventgem-d", "superevent"]:
