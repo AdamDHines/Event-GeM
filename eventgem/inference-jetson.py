@@ -316,8 +316,9 @@ def main():
         #vitH, vitW = stream.infer_vit_input_hw(vit)
         vitH, vitW = 224, 224
         print(f"[INFO] ViT expects ~ {vitH}x{vitW}")
-        ref_db = stream.load_ref_vit_db(ref_feats_file, device=device, dtype=torch.float16 if args.amp else torch.float32)
-        ref_db = ref_db.to(dtype=torch.float16)
+        if not args.extract_reference:
+            ref_db = stream.load_ref_vit_db(ref_feats_file, device=device, dtype=torch.float16 if args.amp else torch.float32)
+            ref_db = ref_db.to(dtype=torch.float16)
         stream_vit = torch.cuda.Stream()
 
     if args.method in ["superevent", "eventgem", "eventgem-d"]:
@@ -503,15 +504,15 @@ def main():
                             descriptors=desc_sampled.detach().cpu().numpy().astype(np.float32),
                             image_shape=np.array([H, W], dtype=np.int32),
                         )
+                else:
+                    prob, desc_map = pred[1], pred[3]
+                    kpts_all, _ = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
+    
+                    kpts_yx = kpts_all[0]
+                    
 
-                prob, desc_map = pred[1], pred[3]
-                kpts_all, _ = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
- 
-                kpts_yx = kpts_all[0]
-                
-
-                q_k_desc = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)
-                se1.record(stream_se)
+                    q_k_desc = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)
+                    se1.record(stream_se)
         
             #join_stream.wait_stream(stream_vit)
             #join_stream.wait_stream(stream_se) 
@@ -519,21 +520,21 @@ def main():
             #j1.synchronize() 
             #start=time.time()
 	    
-
-            if top_idx_t.numel() > 0 and kpts_yx.numel() > 10:
-                q_xy = kpts_yx[:, [1,0]].float()
-                q_xy[:,0] += float(off_left)
-                q_xy[:,1] += float(off_top)
-                
-                cand_ids = top_idx_t.cpu().numpy().astype(np.int64)
-                cand_dist_val = top_dist_t.cpu().numpy()
-                
-                inlier_counts = stream.batched_ransac_rerank(
-                    q_xy, q_k_desc, ref_store, cand_ids, 
-                    max_matches=170, ratio_thresh=float(args.match_ratio)
-                )
-                final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
-                best_arg = np.argmin(final_scores)
+            if not args.extract_reference:
+                if top_idx_t.numel() > 0 and kpts_yx.numel() > 10:
+                    q_xy = kpts_yx[:, [1,0]].float()
+                    q_xy[:,0] += float(off_left)
+                    q_xy[:,1] += float(off_top)
+                    
+                    cand_ids = top_idx_t.cpu().numpy().astype(np.int64)
+                    cand_dist_val = top_dist_t.cpu().numpy()
+                    
+                    inlier_counts = stream.batched_ransac_rerank(
+                        q_xy, q_k_desc, ref_store, cand_ids, 
+                        max_matches=170, ratio_thresh=float(args.match_ratio)
+                    )
+                    final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
+                    best_arg = np.argmin(final_scores)
             #print(f"total: {(time.time()-start)*1000} msec")
 
             # End of processing for this frame, record total time
