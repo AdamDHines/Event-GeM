@@ -478,32 +478,19 @@ def main():
                 desc_sampled = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)  # (N,D)
 
                 # ONLY save when extracting reference
+                # inside loop, after you compute kpts_yx, scores, desc_sampled:
                 if args.extract_reference:
-                    out_path = Path(ref_kp_dir) / f"ref_kp_{frame_idx:05d}.npz"
-
-                    if kpts_yx.numel() == 0:
-                        np.savez_compressed(
-                            out_path,
-                            keypoints=np.empty((0, 2), dtype=np.float32),
-                            scores=np.empty((0,), dtype=np.float32),
-                            descriptors=np.empty((0, int(desc_map.shape[1])), dtype=np.float32),
-                            image_shape=np.array([H, W], dtype=np.int32),
+                    if raw_logger is None:
+                        D = int(desc_sampled.shape[1])
+                        raw_logger = stream.RawKPLogger(
+                            Path(ref_kp_dir) / "ref_kp_raw.bin",
+                            H=H, W=W,
+                            off_top=off_top, off_left=off_left,
+                            top_k=int(args.se_topk),
+                            D=D,
                         )
-                    else:
-                        # undo crop + convert to (x,y) like your extractor
-                        kpts_np = kpts_yx.detach().cpu().numpy().astype(np.float32)  # (y,x)
-                        kpts_np[:, 0] += float(off_top)
-                        kpts_np[:, 1] += float(off_left)
 
-                        kpts_xy = np.stack([kpts_np[:, 1], kpts_np[:, 0]], axis=-1).astype(np.float32)  # (x,y)
-
-                        np.savez_compressed(
-                            out_path,
-                            keypoints=kpts_xy,
-                            scores=scores.detach().cpu().numpy().astype(np.float32),
-                            descriptors=desc_sampled.detach().cpu().numpy().astype(np.float32),
-                            image_shape=np.array([H, W], dtype=np.int32),
-                        )
+                    raw_logger.write(frame_idx, int(t_ref_raw), kpts_yx, scores, desc_sampled)
                 else:
                     prob, desc_map = pred[1], pred[3]
                     kpts_all, _ = fast_nms(prob, se_cfg, top_k=int(args.se_topk))

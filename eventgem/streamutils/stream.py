@@ -24,6 +24,84 @@ from datetime import timedelta
 from collections import deque
 import dv_processing as dv
 
+import struct
+from pathlib import Path
+import numpy as np
+import torch
+
+class RawKPLogger:
+    """
+    Append-only binary log, fixed-size per frame.
+    Stores cropped keypoints (y,x) and later you correct offsets offline.
+    """
+    MAGIC = b"EKPR"
+    VER = 1
+
+    def __init__(self, path: Path, H: int, W: int, off_top: int, off_left: int, top_k: int, D: int):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.H, self.W = int(H), int(W)
+        self.off_top, self.off_left = int(off_top), int(off_left)
+        self.top_k, self.D = int(top_k), int(D)
+
+        # Big buffer helps a lot
+        self.f = open(self.path, "wb", buffering=1024 * 1024)
+
+        # header: magic(4) ver(u32) H(u16) W(u16) off_top(i16) off_left(i16) K(u16) D(u16)
+        hdr = struct.pack(
+            "<4sIHHhhHH",
+            self.MAGIC, self.VER,
+            self.H, self.W,
+            self.off_top, self.off_left,
+            self.top_k, self.D
+        )
+        self.f.write(hdr)
+        self._frames_since_flush = 0
+
+    @torch.no_grad()
+    def write(self, frame_idx: int, t_ref_raw: int, kpts_yx: torch.Tensor, scores: torch.Tensor, desc: torch.Tensor):
+        """
+        kpts_yx: (N,2) y,x on GPU
+        scores:  (N,)  on GPU
+        desc:    (N,D) on GPU
+        """
+        K, D = self.top_k, self.D
+
+        n = int(kpts_yx.shape[0])
+        n_valid = min(n, K)
+
+        # Pad to fixed size K so each record is constant-size (fast append)
+        k_pad = torch.full((K, 2), -1, device=kpts_yx.device, dtype=torch.int16)
+        s_pad = torch.zeros((K,), device=scores.device, dtype=torch.float16)
+        d_pad = torch.zeros((K, D), device=desc.device, dtype=torch.float16)
+
+        if n_valid > 0:
+            k_pad[:n_valid] = kpts_yx[:n_valid].to(torch.int16)
+            s_pad[:n_valid] = scores[:n_valid].to(torch.float16)
+            d_pad[:n_valid] = desc[:n_valid].to(torch.float16)
+
+        # move minimal bytes to CPU
+        k_np = k_pad.cpu().numpy()
+        s_np = s_pad.cpu().numpy()
+        d_np = d_pad.cpu().numpy()
+
+        # record header: frame(u32) t_ref(i64) n_valid(u16)
+        self.f.write(struct.pack("<IqH", int(frame_idx), int(t_ref_raw), int(n_valid)))
+        self.f.write(k_np.tobytes(order="C"))
+        self.f.write(s_np.tobytes(order="C"))
+        self.f.write(d_np.tobytes(order="C"))
+
+        self._frames_since_flush += 1
+        if self._frames_since_flush >= 200:  # tune
+            self.f.flush()
+            self._frames_since_flush = 0
+
+    def close(self):
+        if self.f:
+            self.f.flush()
+            self.f.close()
+            self.f = None
+
 # ---------------------------
 # DAVIS346 helpers
 # ---------------------------
