@@ -349,7 +349,7 @@ def main():
     # # export to onnx
     # export_vit_gem_onnx(vit.half())
     # export_se_onnx(se_model)
-
+    raw_logger = None
     ref_store = None
     if args.method in ["eventgem", "eventgem-d", "superevent"]:
         if ref_kp_dir is None:
