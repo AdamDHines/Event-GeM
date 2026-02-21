@@ -286,6 +286,7 @@ def main():
     ref_feats_dir.mkdir(parents=True, exist_ok=True)
     ref_kp_dir.mkdir(parents=True, exist_ok=True)
     ref_depth_dir.mkdir(parents=True, exist_ok=True)
+    qry_feat_dir = Path(args.features_dir) / args.dataset / f"{args.query}-{args.dt_ms}"
     print(f"[INFO] Extracted reference features will be saved to: {ref_feats_dir}")
     print(f"[INFO] Extracted reference keypoints will be saved to: {ref_kp_dir}")
     print(f"[INFO] Extracted reference depth maps will be saved to: {ref_depth_dir}")
@@ -523,6 +524,7 @@ def main():
                     )
                     final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
                     best_arg = np.argmin(final_scores)
+                    np.save(f"{qry_feat_dir}/qry_rerank_{frame_idx}.npy", final_scores)
             #print(f"total: {(time.time()-start)*1000} msec")
 
             # End of processing for this frame, record total time
