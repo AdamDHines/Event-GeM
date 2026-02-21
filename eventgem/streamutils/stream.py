@@ -835,7 +835,9 @@ def batched_ransac_rerank(
     r_kpts, r_desc, r_mask = ref_store.get_batch_tensor(cand_indices, device)
     
     # Cosine Sim: [B, Nq, Nr]
-    sim = torch.einsum('id,bjd->bij', q_desc, r_desc) 
+    # align dtype/device once
+    r_desc = r_desc.to(device=q_desc.device, dtype=q_desc.dtype)
+    sim = r_desc @ q_desc.T
     sim.masked_fill_(~r_mask.unsqueeze(1), -2.0)
     
     # Ratio Test

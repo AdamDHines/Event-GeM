@@ -77,7 +77,7 @@ def main():
                     help="Path to the SuperEvent config file")
     ap.add_argument("--se-weights", type=str, default="eventgem/external/superevent/saved_models/super_event_weights.pth",
                     help="Path to the SuperEvent weights file")
-    ap.add_argument("--se-topk", type=int, default=170,
+    ap.add_argument("--se-topk", type=int, default=96,
                     help="Number of top candidates to keep after re-ranking")
     ap.add_argument("--mcts-windows-ms", type=float, nargs="+", default=[10, 20, 30, 40, 50],
                     help="List of time windows (in ms) for MCTS")
@@ -285,7 +285,9 @@ def main():
                 se1.record(stream_se)
         
             join_stream.wait_stream(stream_vit)
+            join_stream.wait_stream(stream_se) 
             j1.record(join_stream)
+            j1.synchronize() 
 
             if top_idx_t.numel() > 0 and kpts_yx.numel() > 10:
                 q_xy = kpts_yx[:, [1,0]].float()
@@ -297,16 +299,8 @@ def main():
                 
                 inlier_counts = stream.batched_ransac_rerank(
                     q_xy, q_k_desc, ref_store, cand_ids, 
-                    max_matches=170, ratio_thresh=float(args.match_ratio)
+                    max_matches=96, ratio_thresh=float(args.match_ratio)
                 )
-                # after you compute inlier_counts for cand_ids, build the new column:
-                new_col = stream.build_reranked_column_from_sims(
-                    sims_t=sims_t,
-                    cand_ids=cand_ids,
-                    inlier_counts=inlier_counts,
-                    inlier_weight=float(args.inlier_weight),
-                )
-
                 final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
                 best_arg = np.argmin(final_scores)
 
