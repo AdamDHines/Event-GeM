@@ -461,24 +461,25 @@ def main():
 
                 # SuperEvent
                 pred = se_model(mcts.unsqueeze(0).to(dtype=torch.float16))  # (1,C,Hc,Wc) -> outputs
-                prob, desc_map = _unpack_superevent_pred(pred)
+                prob, desc_map = pred[1], pred[3]   # (adjust if your se_model returns dict)
 
-                # normalize shapes defensively
-                if prob.dim() == 3:   # (B,H,W)
-                    prob = prob.unsqueeze(1)
-                if desc_map.dim() == 3:  # (D,H,W)
-                    desc_map = desc_map.unsqueeze(0)
-
-                # NMS (needs scores!)
+                # NMS first (need kpts + scores for saving)
                 kpts_all, scores_all = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
-                kpts_yx = kpts_all[0]        # (N,2) in CROPPED coords (y,x)
-                scores  = scores_all[0]      # (N,)
 
-                # Sample descriptors at keypoints (expects [B,D,Hc,Wc])
+                kpts_yx = kpts_all[0]          # (N,2) or (N,3)
+                scores  = scores_all[0] if scores_all is not None else None
+
+                # If kpts are (y,x,score), strip coords and (optionally) use 3rd col as score
+                if kpts_yx.ndim == 3 and kpts_yx.shape[0] == 1:
+                    kpts_yx = kpts_yx.squeeze(0)
+                if kpts_yx.shape[-1] > 2:
+                    if scores is None:
+                        scores = kpts_yx[:, 2]
+                    kpts_yx = kpts_yx[:, :2]   # keep (y,x) only
+
+                # Sample descriptors once (works for both saving and query)
                 desc_sampled = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)  # (N,D)
 
-                # ONLY save when extracting reference
-                # inside loop, after you compute kpts_yx, scores, desc_sampled:
                 if args.extract_reference:
                     if raw_logger is None:
                         D = int(desc_sampled.shape[1])
@@ -489,17 +490,17 @@ def main():
                             top_k=int(args.se_topk),
                             D=D,
                         )
+                    # scores can be None; your logger expects a tensor -> make a zeros tensor
+                    if scores is None:
+                        scores = torch.zeros((kpts_yx.shape[0],), device=desc_sampled.device, dtype=torch.float32)
 
                     raw_logger.write(frame_idx, int(t_ref_raw), kpts_yx, scores, desc_sampled)
-                else:
-                    prob, desc_map = pred[1], pred[3]
-                    kpts_all, _ = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
-    
-                    kpts_yx = kpts_all[0]
-                    
 
-                    q_k_desc = stream.sample_descriptors_at_kpts(kpts_yx.float(), desc_map)
-                    se1.record(stream_se)
+                else:
+                    # Use the same sampled descriptors for your normal path
+                    q_k_desc = desc_sampled
+
+                se1.record(stream_se)
         
             #join_stream.wait_stream(stream_vit)
             #join_stream.wait_stream(stream_se) 
