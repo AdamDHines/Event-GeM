@@ -411,7 +411,7 @@ def main():
                         final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
                         best_arg = np.argmin(final_scores)
                         print(best_arg)
-                        np.save(f"{qry_feat_dir}/qry_rerank_{frame_idx}.npy", final_scores)
+                        np.savez_compressed(f"{qry_feat_dir}/qry_rerank_{frame_idx}.npz", final_scores.cpu().numpy())
 
                 # End of processing for this frame, record total time
                 t_total = (time.perf_counter() - cpu0) * 1000.0
@@ -436,6 +436,11 @@ def main():
             convert_feats.main(
                 npz_dir=str(Path(ref_feats_dir)),
                 out=str(Path(ref_feats_file))
+            )
+        else:
+            convert_feats.main(
+                npz_dir=str(Path(qry_feat_dir)),
+                out=str(Path(qry_feat_dir) / f"{args.dataset}_{args.query}_features.pt")
             )
 
 if __name__ == "__main__":
