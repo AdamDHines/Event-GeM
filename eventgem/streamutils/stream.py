@@ -266,7 +266,7 @@ def stream_event_windows_davis_live(dt_ms: float, on_window=None, bias_steps_cf=
 
     # 4. Verification (Optional)
     on_bias = cap.getDavis346BiasCoarseFine(B.On)
-    print(f"Verified ON: Coarse {on_bias.coarseValue}, Fine {on_bias.fineValue}")
+    print(on_bias)
 
     # 3. Stop streams before applying hardware changes
     cap.setEventsRunning(False)
