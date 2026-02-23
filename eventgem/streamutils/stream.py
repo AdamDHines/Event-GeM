@@ -242,32 +242,26 @@ class LiveEventPreview:
         except Exception:
             pass
 
-def _apply_davis346_bias_deltas(cap: dv.io.camera.DAVIS, deltas: dict):
+def apply_davis346_bias_steps_once(cap, bias_steps_cf):
     """
-    deltas: dict of {dv.io.camera.DAVIS.Davis346BiasCF.<Bias>: int_delta}
-    Raw units are whatever dv-processing exposes (docs example uses +1_000_000 steps). :contentReference[oaicite:1]{index=1}
+    bias_steps_cf: dict {BiasEnum: (delta_coarse, delta_fine)}
+    Uses getDavis346BiasCoarseFine / setDavis346BiasCoarseFine (works on your build).
     """
-    for bias_enum, delta in deltas.items():
-        cur = int(cap.getDavis346BiasCurrent(bias_enum))
-        cap.setDavis346BiasCurrent(bias_enum, cur + int(delta))
+    for bias_enum, (dc, df) in bias_steps_cf.items():
+        coarse, fine = cap.getDavis346BiasCoarseFine(bias_enum)
+        cap.setDavis346BiasCoarseFine(bias_enum, int(coarse + dc), int(fine + df))
 
-def stream_event_windows_davis_live(dt_ms: float, on_window=None, bias_deltas=None):
+def stream_event_windows_davis_live(dt_ms: float, on_window=None, bias_steps_cf=None):
     cap = dv.io.camera.DAVIS()
 
-    # ---- SET ONCE (before enabling event stream) ----
-    if bias_deltas:
-        # make sure events aren't running yet
+    # SET ONCE (before starting event readout)
+    if bias_steps_cf:
         cap.setEventsRunning(False)
         cap.setFramesRunning(False)
-
-        _apply_davis346_bias_deltas(cap, bias_deltas)
-
-        # tiny settle delay (optional, but helps avoid weirdness right at start)
-        time.sleep(0.05)
-
+        apply_davis346_bias_steps_once(cap, bias_steps_cf)
+        time.sleep(0.05)  # tiny settle; optional
     cap.setEventsRunning(True)
     cap.setFramesRunning(False)
-
     W, H = cap.getEventResolution()
     slicer = dv.EventStreamSlicer()
     q = deque()

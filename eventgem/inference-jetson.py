@@ -294,15 +294,19 @@ def main():
     wall0 = time.perf_counter()
 
     print("[INFO] Starting Loop...", flush=True)
-    import dv_processing as dv
     B = dv.io.camera.DAVIS.Davis346BiasCF
 
-    bias_deltas = {
-        # Main levers to reduce event rate:
-        B.On:        +3_000_000,
-        B.Off:       +3_000_000,
-        B.Refractory:+1_000_000,
+    bias_steps_cf = {
+        B.On:         (+1, 0),
+        B.Off:        (+1, 0),
+        B.Refractory: (+1, 0),
     }
+
+    event_iter = stream.stream_event_windows_davis_live(
+        args.dt_ms,
+        on_window=preview.enqueue,
+        bias_steps_cf=bias_steps_cf,
+    )
     reranked_cols = []
     sims = []
     queries = []
