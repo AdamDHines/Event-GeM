@@ -3,6 +3,8 @@ import argparse
 import time
 from pathlib import Path
 import streamutils.stream as stream
+import utils.convert_ref as convert_ref
+import utils.convert_feats as convert_feats
 
 import sys
 import numpy as np
@@ -423,6 +425,17 @@ def main():
         wall_s = time.perf_counter() - wall0
         n_frames = len(t_total_list)
         preview.stop()
+
+        # convert the keypoints to the format expected by the reference (for evaluation)
+        if args.extract_reference:
+            convert_ref.main(
+                raw_path=str(Path(ref_kp_dir) / "ref_kp_raw.bin"),
+                out_dir=str(Path(ref_kp_dir) / f"kps_{args.reference}")
+            )
+            convert_feats.main(
+                npz_dir=str(Path(ref_feats_dir)),
+                out=str(Path(ref_feats_dir) / f"{ref_feats_file}")
+            )
 
 if __name__ == "__main__":
     main()

@@ -61,7 +61,3 @@ def main(raw_path: str, out_dir: str):
             )
 
             i += 1
-
-if __name__ == "__main__":
-    import sys
-    main(sys.argv[1], sys.argv[2])

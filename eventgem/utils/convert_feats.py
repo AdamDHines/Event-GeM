@@ -38,17 +38,11 @@ def load_desc(npz_path: Path) -> np.ndarray:
     return arr.astype(np.float32, copy=False)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--npz_dir", type=str, required=True)
-    ap.add_argument("--pattern", type=str, default="ref_feats_*.npz")
-    ap.add_argument("--out", type=str, required=True, help="Output .pt (tensor only)")
-    args = ap.parse_args()
-
-    npz_dir = Path(args.npz_dir)
-    paths = sorted(npz_dir.glob(args.pattern), key=frame_key)
+def main(npz_dir, out, pattern="ref_feats_*.npz"):
+    npz_dir = Path(npz_dir)
+    paths = sorted(npz_dir.glob(pattern), key=frame_key)
     if not paths:
-        raise SystemExit(f"No files matched {args.pattern} in {npz_dir}")
+        raise SystemExit(f"No files matched {pattern} in {npz_dir}")
 
     descs = [load_desc(p) for p in paths]
 
@@ -59,11 +53,12 @@ def main():
 
     mat = torch.from_numpy(np.stack(descs, axis=0))  # [N, D], float32
 
-    out_path = Path(args.out)
+    out_path = Path(out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(mat, out_path)
     print(f"Saved {out_path} with shape {tuple(mat.shape)} dtype={mat.dtype}")
 
-
-if __name__ == "__main__":
-    main()
+    # delete all .npz files after conversion from the operating system
+    for p in paths:
+        p.unlink()
+    print(f"Deleted {len(paths)} .npz files in {npz_dir}")
