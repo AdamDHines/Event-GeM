@@ -17,16 +17,7 @@ def load_desc(npz_path: Path) -> np.ndarray:
 
     # If you saved a named array (recommended), set this key to that name.
     # Otherwise we fall back to the first array in the file (often "arr_0").
-    if len(z.files) == 1:
-        arr = z[z.files[0]]
-    else:
-        # common guesses; if none match, take first
-        for k in ("desc", "q_desc_vit", "feat", "feats", "descriptor", "descriptors", "emb", "embedding"):
-            if k in z.files:
-                arr = z[k]
-                break
-        else:
-            arr = z[z.files[0]]
+    arr = z['arr_0']
 
     arr = np.asarray(arr)
     # Make it 1D [D]
