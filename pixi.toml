@@ -137,5 +137,5 @@ typing_extensions = "*"
 prettytable = "*"
 onnxscript = "*"
 
-[target.linux-aarch64.pypi-dependencies]
+[pypi-dependencies]
 dv-processing = "*"
