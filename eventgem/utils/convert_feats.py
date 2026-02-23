@@ -29,11 +29,11 @@ def load_desc(npz_path: Path) -> np.ndarray:
     return arr.astype(np.float32, copy=False)
 
 
-def main(npy_dir, out, pattern="ref_feats_*.npz"):
-    npy_dir = Path(npy_dir)
-    paths = sorted(npy_dir.glob(pattern), key=frame_key)
+def main(npz_dir, out, pattern="ref_feats_*.npz"):
+    npz_dir = Path(npz_dir)
+    paths = sorted(npz_dir.glob(pattern), key=frame_key)
     if not paths:
-        raise SystemExit(f"No files matched {pattern} in {npy_dir}")
+        raise SystemExit(f"No files matched {pattern} in {npz_dir}")
 
     descs = [load_desc(p) for p in paths]
 
@@ -52,4 +52,4 @@ def main(npy_dir, out, pattern="ref_feats_*.npz"):
     # delete all .npz files after conversion from the operating system
     for p in paths:
         p.unlink()
-    print(f"Deleted {len(paths)} .npy files in {npy_dir}")
+    print(f"Deleted {len(paths)} .npz files in {npz_dir}")
