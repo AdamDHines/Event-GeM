@@ -7,6 +7,13 @@ def read_header(f):
     assert magic == b"EKPR", f"bad magic: {magic}"
     return ver, H, W, off_top, off_left, K, D
 
+def _read_exact(f, n: int) -> bytes | None:
+    """Read exactly n bytes; return None if EOF/truncated."""
+    b = f.read(n)
+    if len(b) != n:
+        return None
+    return b
+
 def main(raw_path: str, out_dir: str):
     raw_path = Path(raw_path)
     out_dir = Path(out_dir)
@@ -22,17 +29,28 @@ def main(raw_path: str, out_dir: str):
 
         i = 0
         while True:
-            hdr = f.read(rec_hdr_sz)
-            if not hdr:
-                break
+            hdr = _read_exact(f, rec_hdr_sz)
+            if hdr is None:
+                break  # clean EOF or truncated header
+
             frame_idx, t_ref_raw, n_valid = struct.unpack("<IqH", hdr)
 
-            k_buf = f.read(k_bytes)
-            s_buf = f.read(s_bytes)
-            d_buf = f.read(d_bytes)
-            if len(k_buf) != k_bytes:
+            k_buf = _read_exact(f, k_bytes)
+            if k_buf is None:
+                print(f"[WARN] Truncated file at record {i} (keypoints). Stopping.", flush=True)
                 break
 
+            s_buf = _read_exact(f, s_bytes)
+            if s_buf is None:
+                print(f"[WARN] Truncated file at record {i} (scores). Stopping.", flush=True)
+                break
+
+            d_buf = _read_exact(f, d_bytes)
+            if d_buf is None:
+                print(f"[WARN] Truncated file at record {i} (descriptors). Stopping.", flush=True)
+                break
+
+            # Now it's safe to parse
             k = np.frombuffer(k_buf, dtype=np.int16).reshape(K, 2)     # (y,x) cropped
             s = np.frombuffer(s_buf, dtype=np.float16)                 # scores
             d = np.frombuffer(d_buf, dtype=np.float16).reshape(K, D)   # desc
@@ -46,8 +64,6 @@ def main(raw_path: str, out_dir: str):
                 k = k[:n].astype(np.float32)   # (y,x)
                 k[:, 0] += off_top
                 k[:, 1] += off_left
-
-                # convert to (x,y)
                 keypoints = np.stack([k[:, 1], k[:, 0]], axis=-1).astype(np.float32)
                 scores = s[:n].astype(np.float32)
                 desc = d[:n].astype(np.float32)
@@ -59,5 +75,4 @@ def main(raw_path: str, out_dir: str):
                 descriptors=desc,
                 image_shape=np.array([H, W], dtype=np.int32),
             )
-
             i += 1

@@ -29,7 +29,7 @@ def load_desc(npz_path: Path) -> np.ndarray:
     return arr.astype(np.float32, copy=False)
 
 
-def main(npy_dir, out, pattern="ref_feats_*.npy"):
+def main(npy_dir, out, pattern="ref_feats_*.npz"):
     npy_dir = Path(npy_dir)
     paths = sorted(npy_dir.glob(pattern), key=frame_key)
     if not paths:
