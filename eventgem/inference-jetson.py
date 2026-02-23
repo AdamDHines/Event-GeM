@@ -327,7 +327,7 @@ def main():
                         mode = "nearest" if args.resize == "nearest" else "bilinear"
                         inp = F.interpolate(inp, size=(vitH, vitW), mode=mode, align_corners=False if mode=="bilinear" else None)
 
-                    q_desc_vit = vit(inp, return_heatmap=True)
+                    q_desc_vit = vit(inp)
                     
                     if args.extract_reference:
                         np.savez(f"{ref_feats_dir}/ref_feats_{frame_idx}.npz", q_desc_vit.cpu().numpy())
@@ -410,6 +410,7 @@ def main():
                         )
                         final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
                         best_arg = np.argmin(final_scores)
+                        
                         np.savez_compressed(f"{qry_feat_dir}/ref_feats_{frame_idx}.npz", q_desc_vit.cpu().numpy())
 
                 # End of processing for this frame, record total time
