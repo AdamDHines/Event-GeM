@@ -260,22 +260,17 @@ def stream_event_windows_davis_live(dt_ms: float, on_window=None, bias_steps_cf=
 
     # 3. Apply the specific values from your reference
     # OnBn -> ON_BN, OffBn -> OFF_BN, RefrBp -> REFR_BP
-    cap.setDavis346BiasCoarseFine(B.ON_BN, 1, 63)
-    cap.setDavis346BiasCoarseFine(B.OFF_BN, 5, 168)
-    cap.setDavis346BiasCoarseFine(B.REFR_BP, 1, 0)
+    cap.setDavis346BiasCoarseFine(B.OnBn, 1, 63)
+    cap.setDavis346BiasCoarseFine(B.OffBn, 5, 168)
+    cap.setDavis346BiasCoarseFine(B.Refractory, 1, 0)
 
     # 4. Verification (Optional)
-    on_bias = cap.getDavis346BiasCoarseFine(B.ON_BN)
+    on_bias = cap.getDavis346BiasCoarseFine(B.OnBn)
     print(f"Verified ON: Coarse {on_bias.coarseValue}, Fine {on_bias.fineValue}")
 
     # 3. Stop streams before applying hardware changes
     cap.setEventsRunning(False)
     cap.setFramesRunning(False)
-    
-    try:
-        apply_davis346_thresholds(cap, bias_configs)
-    except Exception as e:
-        print(f"Failed to set biases: {e}")
     
     # Let hardware settle
     time.sleep(0.1) 
