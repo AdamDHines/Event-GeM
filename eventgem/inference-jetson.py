@@ -147,8 +147,6 @@ class TRTEngineCUDA12:
 def main():
     ap = argparse.ArgumentParser()
     # Dataset parameters
-    ap.add_argument("--hdf5",  type=str, required=True, 
-                    help="Path to the input hdf5 file containing events")
     ap.add_argument("--dataset",  type=str, required=True,
                     help="Name of the dataset")
     ap.add_argument("--reference", type=str, required=True,
