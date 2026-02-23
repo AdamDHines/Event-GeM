@@ -242,26 +242,43 @@ class LiveEventPreview:
         except Exception:
             pass
 
-def apply_davis346_bias_steps_once(cap, bias_steps_cf):
+def apply_davis346_thresholds(cap, bias_configs):
     """
-    bias_steps_cf: dict {BiasEnum: (delta_coarse, delta_fine)}
-    Uses getDavis346BiasCoarseFine / setDavis346BiasCoarseFine (works on your build).
+    bias_configs: dict {DavisBias enum: (coarse_value, fine_value)}
     """
-    for bias_enum, (dc, df) in bias_steps_cf.items():
-        coarse, fine = cap.getDavis346BiasCoarseFine(bias_enum)
-        cap.setDavis346BiasCoarseFine(bias_enum, int(coarse + dc), int(fine + df))
+    for bias_enum, (coarse, fine) in bias_configs.items():
+        # The crash was likely here: the original code had nested int() calls
+        # and was trying to read values before setting them.
+        # We can set absolute values directly.
+        cap.setDavis346BiasCoarseFine(bias_enum, coarse, fine)
+        print(f"Set {bias_enum.name}: Coarse={coarse}, Fine={fine}")
 
 def stream_event_windows_davis_live(dt_ms: float, on_window=None, bias_steps_cf=None):
+    # 1. Initialize camera
     cap = dv.io.camera.DAVIS()
 
-    # SET ONCE (before starting event readout)
-    if bias_steps_cf:
-        cap.setEventsRunning(False)
-        cap.setFramesRunning(False)
-        apply_davis346_bias_steps_once(cap, bias_steps_cf)
-        time.sleep(0.05)  # tiny settle; optional
-    cap.setEventsRunning(True)
+    # 2. Define the exact values from your reference
+    # These match your C-code: setic (coarse) and setif (fine)
+    B = dv.io.camera.DavisBias
+    bias_configs = {
+        B.On:         (1, 63),   # OnBn Coarse=1, Fine=63
+        B.Off:        (5, 168),  # OffBn Coarse=5, Fine=168
+        B.Refractory: (1, 0),    # Example refractory setting
+    }
+
+    # 3. Apply settings
+    # It is safer to stop the stream before changing hardware biases
+    cap.setEventsRunning(False)
     cap.setFramesRunning(False)
+    
+    apply_davis346_thresholds(cap, bias_configs)
+    
+    # Small settle time for hardware
+    time.sleep(0.1) 
+    
+    # 4. Restart stream
+    cap.setEventsRunning(True)
+    cap.setFramesRunning(True)
     W, H = cap.getEventResolution()
     slicer = dv.EventStreamSlicer()
     q = deque()
