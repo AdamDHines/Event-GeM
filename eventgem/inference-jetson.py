@@ -226,6 +226,7 @@ def main():
     ref_kp_dir.mkdir(parents=True, exist_ok=True)
     ref_depth_dir.mkdir(parents=True, exist_ok=True)
     qry_feat_dir = Path(args.features_dir) / args.dataset / f"{args.query}-{args.dt_ms}"
+    qry_feat_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Extracted reference features will be saved to: {ref_feats_dir}")
     print(f"[INFO] Extracted reference keypoints will be saved to: {ref_kp_dir}")
     print(f"[INFO] Extracted reference depth maps will be saved to: {ref_depth_dir}")
