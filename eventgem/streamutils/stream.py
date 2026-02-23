@@ -242,11 +242,42 @@ class LiveEventPreview:
         except Exception:
             pass
 
+def davis346_reduce_event_rate(cap: dv.io.camera.DAVIS,
+                              on_scale: float = 1.15,
+                              off_scale: float = 1.15,
+                              refr_scale: float = 1.10):
+    """
+    Heuristic: raise On/Off thresholds + a bit of refractory to reduce event rate.
+    Scales current bias values (raw units) so you can tune with simple multipliers.
+    """
+    B = dv.io.camera.DAVIS.Davis346BiasCF
+
+    def get(b): return int(cap.getDavis346BiasCurrent(b))
+    def set_(b, v): cap.setDavis346BiasCurrent(b, int(v))
+
+    on0   = get(B.On)
+    off0  = get(B.Off)
+    refr0 = get(B.Refractory)
+
+    on1   = max(0, int(round(on0   * on_scale)))
+    off1  = max(0, int(round(off0  * off_scale)))
+    refr1 = max(0, int(round(refr0 * refr_scale)))
+
+    set_(B.On, on1)
+    set_(B.Off, off1)
+    set_(B.Refractory, refr1)
+
+    return {"On": (on0, on1), "Off": (off0, off1), "Refractory": (refr0, refr1)}
+
 # ---------------------------
 # DAVIS346 helpers
 # ---------------------------
 def stream_event_windows_davis_live(dt_ms: float, on_window=None):
     cap = dv.io.camera.DAVIS()
+
+
+    print(davis346_reduce_event_rate(cap, on_scale=2.0, off_scale=2.0, refr_scale=1.1))
+
     cap.setEventsRunning(True)
     cap.setFramesRunning(False)
 
