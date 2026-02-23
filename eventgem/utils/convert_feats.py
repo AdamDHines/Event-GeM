@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
+import torch.nn.functional as F
 
 def frame_key(path: Path) -> int:
     m = re.search(r"ref_feats_(\d+)\.npz$", path.name)
@@ -19,6 +19,7 @@ def load_desc(npz_path: Path) -> np.ndarray:
     # Otherwise we fall back to the first array in the file (often "arr_0").
     arr = z['arr_0']
 
+
     arr = np.asarray(arr)
     # Make it 1D [D]
     if arr.ndim == 2 and arr.shape[0] == 1:
@@ -26,7 +27,9 @@ def load_desc(npz_path: Path) -> np.ndarray:
     elif arr.ndim != 1:
         arr = arr.reshape(-1)
 
-    return arr.astype(np.float32, copy=False)
+    arr = F.normalize(torch.from_numpy(arr), dim=0).numpy()
+
+    return arr.astype(np.float16, copy=False)
 
 
 def main(npz_dir, out, pattern="ref_feats_*.npz"):

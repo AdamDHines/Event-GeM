@@ -240,7 +240,7 @@ def main():
 
     H, W = 260, 346  # default DAVIS resolution
     stream_davis = torch.cuda.Stream()
-    vit = TRTEngineCUDA12("vitgem-hm.engine")
+    vit = TRTEngineCUDA12("vitgem.engine")
     vitH, vitW = 224, 224
     print(f"[INFO] ViT expects ~ {vitH}x{vitW}")
     if not args.extract_reference:
@@ -259,63 +259,8 @@ def main():
     stop_event = threading.Event()
 
     # Start preview
-    # preview = stream.LiveEventPreview(scale=1.5, stop_event=stop_event)
-    # preview.start()
-    import cv2
-    cv2.namedWindow("DAVIS events", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("ViT heatmap", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("Keypoints", cv2.WINDOW_NORMAL)
-
-    def pol2ch_to_u8(pol_2hw: torch.Tensor, clip_val=5.0) -> np.ndarray:
-        """
-        pol_2hw: torch (2,H,W), pos/neg counts (or similar).
-        Returns uint8 grayscale (H,W).
-        """
-        # (pos - neg) -> [-clip, clip] -> [0,255]
-        img = (pol_2hw[0] - pol_2hw[1]).detach().float().cpu().numpy()
-        img = np.clip(img, -clip_val, clip_val)
-        out = ((img + clip_val) / (2.0 * clip_val) * 255.0).astype(np.uint8)
-        return out
-
-    def hm_to_u8(hm: torch.Tensor) -> np.ndarray:
-        """
-        hm: torch (B,g,g) or (g,g) normalized 0..1 (recommended).
-        Returns uint8 (g,g).
-        """
-        if hm.ndim == 3:
-            hm = hm[0]
-        hm_u8 = (hm.detach().float().clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
-        return hm_u8
-
-    def draw_kpts_on_gray(gray_u8: np.ndarray, kpts_yx, off_top, off_left, radius=2) -> np.ndarray:
-        """
-        gray_u8: (H,W) uint8
-        kpts_yx: torch or numpy (N,2) in cropped (y,x)
-        returns BGR overlay
-        """
-        overlay = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
-
-        if kpts_yx is None:
-            return overlay
-
-        if torch.is_tensor(kpts_yx):
-            pts = kpts_yx.detach().cpu().numpy()
-        else:
-            pts = np.asarray(kpts_yx)
-
-        if pts.size == 0:
-            return overlay
-
-        pts = pts.reshape(-1, 2)
-        xs = (pts[:, 1] + float(off_left)).astype(np.int32)
-        ys = (pts[:, 0] + float(off_top)).astype(np.int32)
-
-        H, W = gray_u8.shape[:2]
-        for x, y in zip(xs, ys):
-            if 0 <= x < W and 0 <= y < H:
-                cv2.circle(overlay, (x, y), radius, (0, 255, 0), 1, cv2.LINE_AA)
-
-        return overlay
+    preview = stream.LiveEventPreview(scale=1.5, stop_event=stop_event)
+    preview.start()
 
     # 1) Enter to start + countdown
     wait_for_enter("Press ENTER to start streaming...\n")
@@ -358,7 +303,7 @@ def main():
     try:
         with torch.inference_mode():
             with torch.cuda.stream(stream_davis):
-                event_iter = stream.stream_event_windows_davis_live(args.dt_ms)
+                event_iter = stream.stream_event_windows_davis_live(args.dt_ms, on_window=preview.enqueue)
             for (_, _, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms) in event_iter:
                 cpu0 = time.perf_counter()
                 if stop_event.is_set():
@@ -382,7 +327,7 @@ def main():
                         mode = "nearest" if args.resize == "nearest" else "bilinear"
                         inp = F.interpolate(inp, size=(vitH, vitW), mode=mode, align_corners=False if mode=="bilinear" else None)
 
-                    q_desc_vit, hm = vit(inp, return_heatmap=True)
+                    q_desc_vit = vit(inp, return_heatmap=True)
                     
                     if args.extract_reference:
                         np.savez(f"{ref_feats_dir}/ref_feats_{frame_idx}.npz", q_desc_vit.cpu().numpy())
@@ -448,27 +393,7 @@ def main():
                         # Use the same sampled descriptors for your normal path
                         q_k_desc = desc_sampled
 
-                se1.record(stream_se)
-
-                events_u8 = pol2ch_to_u8(pol_2hw, clip_val=5.0)
-
-                # --- Heatmap image ---
-                hm_u8_small = hm_to_u8(hm)                      # (g,g)
-                hm_u8 = cv2.resize(hm_u8_small, (W, H), interpolation=cv2.INTER_NEAREST)
-                hm_color = cv2.applyColorMap(hm_u8, cv2.COLORMAP_JET)
-
-                # --- Keypoints overlay on events ---
-                kp_overlay = draw_kpts_on_gray(events_u8, kpts_yx, off_top, off_left, radius=2)
-
-                # --- Show all three ---
-                cv2.imshow("DAVIS events", events_u8)
-                cv2.imshow("ViT heatmap", hm_color)
-                cv2.imshow("Keypoints", kp_overlay)
-
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q")):
-                    stop_event.set()
-                    break
+                    se1.record(stream_se)
             
                 if not args.extract_reference:
                     if top_idx_t.numel() > 0 and kpts_yx.numel() > 10:
