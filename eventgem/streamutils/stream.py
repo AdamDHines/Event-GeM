@@ -25,9 +25,10 @@ from collections import deque
 import dv_processing as dv
 
 import struct
-from pathlib import Path
-import numpy as np
-import torch
+
+
+import threading
+from queue import Queue, Empty
 
 class RawKPLogger:
     """
@@ -102,10 +103,149 @@ class RawKPLogger:
             self.f.close()
             self.f = None
 
+def events_to_polarity_image(H, W, x, y, p, clip_val=5):
+    """
+    Fast visual: accumulate +/-1 per pixel then map to gray.
+    p expected 0/1 (0=neg, 1=pos).
+    """
+    img = np.zeros((H, W), dtype=np.int16)
+    if x.size == 0:
+        return np.full((H, W), 127, dtype=np.uint8)
+
+    pos = (p == 1)
+    neg = ~pos
+
+    if np.any(pos):
+        np.add.at(img, (y[pos], x[pos]), 1)
+    if np.any(neg):
+        np.add.at(img, (y[neg], x[neg]), -1)
+
+    img = np.clip(img, -clip_val, clip_val)
+    disp = ((img.astype(np.float32) + clip_val) / (2.0 * clip_val) * 255.0).astype(np.uint8)
+    return disp
+
+
+class LiveEventPreview:
+    """
+    Threaded OpenCV preview window. Non-blocking for producer:
+    - enqueue() will drop old frames if viewer can't keep up.
+    - start() creates window + thread
+    - stop() joins thread + destroys window
+    """
+    def __init__(self, win="DAVIS346 events", scale=1.0, stop_event=None):
+        self.win = win
+        self.scale = float(scale)
+        self.stop_event = stop_event  # optional threading.Event shared with main loop
+
+        self._q = Queue(maxsize=1)     # keep only latest
+        self._thread = None
+        self._running = threading.Event()
+
+        # for FPS display
+        self._last_t = None
+        self._fps_ema = None
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._running.set()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running.clear()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+        # Best-effort window cleanup
+        try:
+            cv2.destroyWindow(self.win)
+        except Exception:
+            pass
+
+    def enqueue(self, H, W, x, y, p, frame_idx, t_ref_raw, t_read_ms):
+        """
+        Non-blocking producer. Drops frame if viewer is busy.
+        Copies are minimal: x/y/p are expected numpy arrays.
+        """
+        if not self._running.is_set():
+            return
+
+        item = (int(H), int(W), x, y, p, int(frame_idx), int(t_ref_raw), float(t_read_ms))
+
+        # Drop old frame if queue is full
+        if self._q.full():
+            try:
+                _ = self._q.get_nowait()
+            except Empty:
+                pass
+
+        try:
+            self._q.put_nowait(item)
+        except Exception:
+            # If enqueue fails for any reason, just skip (never block main loop)
+            pass
+
+    def _loop(self):
+        # Some systems benefit from this when running HighGUI in a thread
+        try:
+            cv2.startWindowThread()
+        except Exception:
+            pass
+
+        cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
+
+        while self._running.is_set():
+            # Try to get latest frame; if none, just idle briefly
+            try:
+                H, W, x, y, p, frame_idx, t_ref_raw, t_read_ms = self._q.get(timeout=0.05)
+            except Empty:
+                continue
+
+            now = time.perf_counter()
+            if self._last_t is None:
+                self._last_t = now
+            dt = now - self._last_t
+            self._last_t = now
+            inst_fps = 1.0 / max(dt, 1e-6)
+            self._fps_ema = inst_fps if self._fps_ema is None else (0.9 * self._fps_ema + 0.1 * inst_fps)
+
+            frame = events_to_polarity_image(H, W, x, y, p)
+
+            if self.scale != 1.0:
+                frame = cv2.resize(
+                    frame,
+                    (int(W * self.scale), int(H * self.scale)),
+                    interpolation=cv2.INTER_NEAREST
+                )
+
+            overlay = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            text1 = f"dt={t_read_ms:.2f}ms  fps~{self._fps_ema:.1f}"
+            text2 = f"idx={frame_idx}  events={x.size}  t_ref(us)={t_ref_raw}"
+            cv2.putText(overlay, text1, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(overlay, text2, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+
+            cv2.imshow(self.win, overlay)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")):  # ESC or q
+                if self.stop_event is not None:
+                    self.stop_event.set()
+                self._running.clear()
+                break
+
+        # Cleanup
+        try:
+            cv2.destroyWindow(self.win)
+        except Exception:
+            pass
+
 # ---------------------------
 # DAVIS346 helpers
 # ---------------------------
-def stream_event_windows_davis_live(dt_ms: float):
+def stream_event_windows_davis_live(dt_ms: float, on_window=None):
     cap = dv.io.camera.DAVIS()
     cap.setEventsRunning(True)
     cap.setFramesRunning(False)
@@ -123,41 +263,56 @@ def stream_event_windows_davis_live(dt_ms: float):
     frame_idx = 0
     w_end_raw = None
 
-    while cap.isRunning():
-        t0 = time.perf_counter()
-        batch = cap.getNextEventBatch()
-        t_read_ms = (time.perf_counter() - t0) * 1000.0
+    try:
+        while cap.isRunning():
+            t0 = time.perf_counter()
+            batch = cap.getNextEventBatch()
+            t_read_ms = (time.perf_counter() - t0) * 1000.0
 
-        if batch is None:
-            time.sleep(0.001)
-            continue
+            if batch is None:
+                time.sleep(0.001)
+                continue
 
-        slicer.accept(batch)
+            slicer.accept(batch)
 
-        while q:
-            ev = q.popleft()
+            while q:
+                ev = q.popleft()
 
-            xy = np.asarray(ev.coordinates())
-            if xy.ndim == 2 and xy.shape[0] == 2 and xy.shape[1] != 2:
-                xy = xy.T
-            x = xy[:, 0].astype(np.int32, copy=False)
-            y = xy[:, 1].astype(np.int32, copy=False)
+                xy = np.asarray(ev.coordinates())
+                if xy.ndim == 2 and xy.shape[0] == 2 and xy.shape[1] != 2:
+                    xy = xy.T
+                x = xy[:, 0].astype(np.int32, copy=False)
+                y = xy[:, 1].astype(np.int32, copy=False)
 
-            t_raw = np.asarray(ev.timestamps()).reshape(-1).astype(np.int64, copy=False)  # us
-            p = np.asarray(ev.polarities()).reshape(-1).astype(np.uint8, copy=False)     # 0/1
+                t_raw = np.asarray(ev.timestamps()).reshape(-1).astype(np.int64, copy=False)  # us
+                p = np.asarray(ev.polarities()).reshape(-1).astype(np.uint8, copy=False)     # 0/1
 
-            # Define window boundaries ourselves (stable even if ev has gaps)
-            if w_end_raw is None:
-                # start from first timestamp we ever see
-                t0_raw = int(t_raw[0]) if t_raw.size else 0
-                w_end_raw = t0_raw + dt_us
-            else:
-                w_end_raw += dt_us
+                if w_end_raw is None:
+                    t0_raw = int(t_raw[0]) if t_raw.size else 0
+                    w_end_raw = t0_raw + dt_us
+                else:
+                    w_end_raw += dt_us
 
-            t_ref_raw = w_end_raw  # <-- THIS is what MCTS expects
+                t_ref_raw = w_end_raw
 
-            yield (H, W, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms)
-            frame_idx += 1
+                # Non-blocking window callback (threaded preview uses this)
+                if on_window is not None:
+                    on_window(H, W, x, y, p, frame_idx, t_ref_raw, t_read_ms)
+
+                yield (H, W, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms)
+                frame_idx += 1
+
+    finally:
+        # Ensure camera shuts down cleanly if the consumer breaks
+        try:
+            cap.setEventsRunning(False)
+            cap.setFramesRunning(False)
+        except Exception:
+            pass
+        try:
+            cap.close()  # if available in your dv-processing build
+        except Exception:
+            pass
 
 # ---------------------------
 # HDF5 helpers
