@@ -329,7 +329,7 @@ def main():
                     q_desc_vit = vit(inp)
                     
                     if args.extract_reference:
-                        np.save(f"{ref_feats_dir}/ref_feats_{frame_idx}.npy", q_desc_vit.cpu().numpy())
+                        np.savez(f"{ref_feats_dir}/ref_feats_{frame_idx}.npz", q_desc_vit.cpu().numpy())
                     else:
                         ret0.record(stream_vit)
 
@@ -433,8 +433,8 @@ def main():
                 out_dir=str(Path(ref_kp_dir) / f"kps_{args.reference}")
             )
             convert_feats.main(
-                npy_dir=ref_feats_dir,
-                out=ref_feats_dir / f"{ref_feats_file}"
+                npz_dir=str(Path(ref_feats_dir)),
+                out=str(Path(ref_feats_dir) / f"{ref_feats_file}")
             )
 
 if __name__ == "__main__":
