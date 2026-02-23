@@ -243,33 +243,35 @@ class LiveEventPreview:
             pass
 
 def apply_davis346_thresholds(cap, bias_configs):
-    """
-    bias_configs: dict {DavisBias enum: (coarse_value, fine_value)}
-    """
     for bias_enum, (coarse, fine) in bias_configs.items():
-        # The crash was likely here: the original code had nested int() calls
-        # and was trying to read values before setting them.
-        # We can set absolute values directly.
+        # Using the direct method for Coarse/Fine setting
         cap.setDavis346BiasCoarseFine(bias_enum, coarse, fine)
         print(f"Set {bias_enum.name}: Coarse={coarse}, Fine={fine}")
 
 def stream_event_windows_davis_live(dt_ms: float, on_window=None, bias_steps_cf=None):
-    # 1. Initialize camera
+# 1. Initialize camera
     cap = dv.io.camera.DAVIS()
 
-    # 2. Define the exact values from your reference
-    # These match your C-code: setic (coarse) and setif (fine)
-    B = dv.io.camera.DavisBias
+    # 2. Get the correct Bias Enum from the CameraCapture class
+    # This is the correct path for dv-processing
+    B = dv.io.CameraCapture.Bias
+
     bias_configs = {
-        B.On:         (1, 63),   # OnBn Coarse=1, Fine=63
-        B.Off:        (5, 168),  # OffBn Coarse=5, Fine=168
-        B.Refractory: (1, 0),    # Example refractory setting
+        B.DAVIS346_ON_BN:   (1, 63),   # Threshold for ON events
+        B.DAVIS346_OFF_BN:  (5, 168),  # Threshold for OFF events
+        B.DAVIS346_REFR_BP: (1, 0),    # Refractory period (prevents immediate re-firing)
     }
 
-    # 3. Apply settings
-    # It is safer to stop the stream before changing hardware biases
+    # 3. Apply settings while streams are paused
     cap.setEventsRunning(False)
     cap.setFramesRunning(False)
+    
+    apply_davis346_thresholds(cap, bias_configs)
+    
+    time.sleep(0.1) 
+    
+    cap.setEventsRunning(True)
+    cap.setFramesRunning(True)
     
     apply_davis346_thresholds(cap, bias_configs)
     
