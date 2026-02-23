@@ -410,8 +410,7 @@ def main():
                         )
                         final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
                         best_arg = np.argmin(final_scores)
-                        print(best_arg)
-                        np.savez_compressed(f"{qry_feat_dir}/qry_rerank_{frame_idx}.npz", final_scores.cpu().numpy())
+                        np.savez_compressed(f"{qry_feat_dir}/ref_feats_{frame_idx}.npz", final_scores.cpu().numpy())
 
                 # End of processing for this frame, record total time
                 t_total = (time.perf_counter() - cpu0) * 1000.0
