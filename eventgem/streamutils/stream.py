@@ -243,42 +243,44 @@ class LiveEventPreview:
             pass
 
 def apply_davis346_thresholds(cap, bias_configs):
+    """
+    bias_configs: dict {BiasEnum: (coarse_value, fine_value)}
+    """
     for bias_enum, (coarse, fine) in bias_configs.items():
-        # Using the direct method for Coarse/Fine setting
-        cap.setDavis346BiasCoarseFine(bias_enum, coarse, fine)
-        print(f"Set {bias_enum.name}: Coarse={coarse}, Fine={fine}")
+        # Correct signature: enum, coarse (int), fine (int)
+        cap.setDavis346BiasCoarseFine(bias_enum, int(coarse), int(fine))
+        print(f"Successfully set {bias_enum.name} to Coarse={coarse}, Fine={fine}")
 
 def stream_event_windows_davis_live(dt_ms: float, on_window=None, bias_steps_cf=None):
-# 1. Initialize camera
+    # 1. Initialize camera
     cap = dv.io.camera.DAVIS()
 
-    # 2. Get the correct Bias Enum from the CameraCapture class
-    # This is the correct path for dv-processing
-    B = dv.io.CameraCapture.Bias
+    # 2. Access the specific Enum class identified in your traceback
+    B = dv.io.camera.DAVIS.Davis346BiasCF
 
-    bias_configs = {
-        B.DAVIS346_ON_BN:   (1, 63),   # Threshold for ON events
-        B.DAVIS346_OFF_BN:  (5, 168),  # Threshold for OFF events
-        B.DAVIS346_REFR_BP: (1, 0),    # Refractory period (prevents immediate re-firing)
-    }
+    # 3. Apply the specific values from your reference
+    # OnBn -> ON_BN, OffBn -> OFF_BN, RefrBp -> REFR_BP
+    cap.setDavis346BiasCoarseFine(B.ON_BN, 1, 63)
+    cap.setDavis346BiasCoarseFine(B.OFF_BN, 5, 168)
+    cap.setDavis346BiasCoarseFine(B.REFR_BP, 1, 0)
 
-    # 3. Apply settings while streams are paused
+    # 4. Verification (Optional)
+    on_bias = cap.getDavis346BiasCoarseFine(B.ON_BN)
+    print(f"Verified ON: Coarse {on_bias.coarseValue}, Fine {on_bias.fineValue}")
+
+    # 3. Stop streams before applying hardware changes
     cap.setEventsRunning(False)
     cap.setFramesRunning(False)
     
-    apply_davis346_thresholds(cap, bias_configs)
+    try:
+        apply_davis346_thresholds(cap, bias_configs)
+    except Exception as e:
+        print(f"Failed to set biases: {e}")
     
+    # Let hardware settle
     time.sleep(0.1) 
     
-    cap.setEventsRunning(True)
-    cap.setFramesRunning(True)
-    
-    apply_davis346_thresholds(cap, bias_configs)
-    
-    # Small settle time for hardware
-    time.sleep(0.1) 
-    
-    # 4. Restart stream
+    # 4. Restart streams
     cap.setEventsRunning(True)
     cap.setFramesRunning(True)
     W, H = cap.getEventResolution()
