@@ -242,41 +242,28 @@ class LiveEventPreview:
         except Exception:
             pass
 
-def davis346_reduce_event_rate(cap: dv.io.camera.DAVIS,
-                              on_scale: float = 1.15,
-                              off_scale: float = 1.15,
-                              refr_scale: float = 1.10):
+def _apply_davis346_bias_deltas(cap: dv.io.camera.DAVIS, deltas: dict):
     """
-    Heuristic: raise On/Off thresholds + a bit of refractory to reduce event rate.
-    Scales current bias values (raw units) so you can tune with simple multipliers.
+    deltas: dict of {dv.io.camera.DAVIS.Davis346BiasCF.<Bias>: int_delta}
+    Raw units are whatever dv-processing exposes (docs example uses +1_000_000 steps). :contentReference[oaicite:1]{index=1}
     """
-    B = dv.io.camera.DAVIS.Davis346BiasCF
+    for bias_enum, delta in deltas.items():
+        cur = int(cap.getDavis346BiasCurrent(bias_enum))
+        cap.setDavis346BiasCurrent(bias_enum, cur + int(delta))
 
-    def get(b): return int(cap.getDavis346BiasCurrent(b))
-    def set_(b, v): cap.setDavis346BiasCurrent(b, int(v))
-
-    on0   = get(B.On)
-    off0  = get(B.Off)
-    refr0 = get(B.Refractory)
-
-    on1   = max(0, int(round(on0   * on_scale)))
-    off1  = max(0, int(round(off0  * off_scale)))
-    refr1 = max(0, int(round(refr0 * refr_scale)))
-
-    set_(B.On, on1)
-    set_(B.Off, off1)
-    set_(B.Refractory, refr1)
-
-    return {"On": (on0, on1), "Off": (off0, off1), "Refractory": (refr0, refr1)}
-
-# ---------------------------
-# DAVIS346 helpers
-# ---------------------------
-def stream_event_windows_davis_live(dt_ms: float, on_window=None):
+def stream_event_windows_davis_live(dt_ms: float, on_window=None, bias_deltas=None):
     cap = dv.io.camera.DAVIS()
 
+    # ---- SET ONCE (before enabling event stream) ----
+    if bias_deltas:
+        # make sure events aren't running yet
+        cap.setEventsRunning(False)
+        cap.setFramesRunning(False)
 
-    print(davis346_reduce_event_rate(cap, on_scale=2.0, off_scale=2.0, refr_scale=1.1))
+        _apply_davis346_bias_deltas(cap, bias_deltas)
+
+        # tiny settle delay (optional, but helps avoid weirdness right at start)
+        time.sleep(0.05)
 
     cap.setEventsRunning(True)
     cap.setFramesRunning(False)
@@ -290,7 +277,7 @@ def stream_event_windows_davis_live(dt_ms: float, on_window=None):
 
     slicer.doEveryTimeInterval(timedelta(milliseconds=float(dt_ms)), cb)
 
-    dt_us = int(round(float(dt_ms) * 1000.0))  # microseconds
+    dt_us = int(round(float(dt_ms) * 1000.0))
     frame_idx = 0
     w_end_raw = None
 
@@ -315,8 +302,8 @@ def stream_event_windows_davis_live(dt_ms: float, on_window=None):
                 x = xy[:, 0].astype(np.int32, copy=False)
                 y = xy[:, 1].astype(np.int32, copy=False)
 
-                t_raw = np.asarray(ev.timestamps()).reshape(-1).astype(np.int64, copy=False)  # us
-                p = np.asarray(ev.polarities()).reshape(-1).astype(np.uint8, copy=False)     # 0/1
+                t_raw = np.asarray(ev.timestamps()).reshape(-1).astype(np.int64, copy=False)
+                p = np.asarray(ev.polarities()).reshape(-1).astype(np.uint8, copy=False)
 
                 if w_end_raw is None:
                     t0_raw = int(t_raw[0]) if t_raw.size else 0
@@ -326,7 +313,6 @@ def stream_event_windows_davis_live(dt_ms: float, on_window=None):
 
                 t_ref_raw = w_end_raw
 
-                # Non-blocking window callback (threaded preview uses this)
                 if on_window is not None:
                     on_window(H, W, x, y, p, frame_idx, t_ref_raw, t_read_ms)
 
@@ -334,14 +320,13 @@ def stream_event_windows_davis_live(dt_ms: float, on_window=None):
                 frame_idx += 1
 
     finally:
-        # Ensure camera shuts down cleanly if the consumer breaks
         try:
             cap.setEventsRunning(False)
             cap.setFramesRunning(False)
         except Exception:
             pass
         try:
-            cap.close()  # if available in your dv-processing build
+            cap.close()
         except Exception:
             pass
 

@@ -294,7 +294,15 @@ def main():
     wall0 = time.perf_counter()
 
     print("[INFO] Starting Loop...", flush=True)
+    import dv_processing as dv
+    B = dv.io.camera.DAVIS.Davis346BiasCF
 
+    bias_deltas = {
+        # Main levers to reduce event rate:
+        B.On:        +3_000_000,
+        B.Off:       +3_000_000,
+        B.Refractory:+1_000_000,
+    }
     reranked_cols = []
     sims = []
     queries = []
@@ -303,7 +311,11 @@ def main():
     try:
         with torch.inference_mode():
             with torch.cuda.stream(stream_davis):
-                event_iter = stream.stream_event_windows_davis_live(args.dt_ms, on_window=preview.enqueue)
+                event_iter = stream.stream_event_windows_davis_live(
+                            args.dt_ms,
+                            on_window=preview.enqueue,
+                            bias_deltas=bias_deltas
+                        )
             for (_, _, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms) in event_iter:
                 cpu0 = time.perf_counter()
                 if stop_event.is_set():
