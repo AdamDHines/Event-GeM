@@ -330,7 +330,8 @@ def main():
                     q_desc_vit = vit(inp)
                     
                     if args.extract_reference:
-                        np.savez(f"{ref_feats_dir}/ref_feats_{frame_idx}.npz", q_desc_vit.cpu().numpy())
+                        if not (frame_idx < 10):
+                            np.savez(f"{ref_feats_dir}/ref_feats_{frame_idx}.npz", q_desc_vit.cpu().numpy())
                     else:
                         ret0.record(stream_vit)
 
@@ -410,8 +411,8 @@ def main():
                         )
                         final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
                         best_arg = np.argmin(final_scores)
-                        
-                        np.savez_compressed(f"{qry_feat_dir}/ref_feats_{frame_idx}.npz", q_desc_vit.cpu().numpy())
+                        if not (frame_idx < 10):
+                            np.savez_compressed(f"{qry_feat_dir}/ref_feats_{frame_idx}.npz", q_desc_vit.cpu().numpy())
 
                 # End of processing for this frame, record total time
                 t_total = (time.perf_counter() - cpu0) * 1000.0
