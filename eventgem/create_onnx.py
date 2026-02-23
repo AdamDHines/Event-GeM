@@ -3,6 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import streamutils.stream as stream
+from pathlib import Path
+import sys
+
+THIS_DIR = Path(__file__).resolve().parent
+BACKBONE_ROOT = THIS_DIR / "external" / "backbone"
+sys.path.insert(0, str(BACKBONE_ROOT))
 
 class ViTGeMExport(nn.Module):
     def __init__(self, backbone, p: float = 5.0, eps: float = 1e-6):
