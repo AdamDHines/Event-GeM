@@ -434,7 +434,7 @@ def main():
             )
             convert_feats.main(
                 npz_dir=str(Path(ref_feats_dir)),
-                out=str(Path(ref_feats_dir) / f"{ref_feats_file}")
+                out=str(Path(ref_feats_file))
             )
 
 if __name__ == "__main__":
