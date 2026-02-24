@@ -30,6 +30,46 @@ import struct
 import threading
 from queue import Queue, Empty
 
+class LiveDistPlotCV:
+    def __init__(self, n_refs: int, update_hz: float = 10.0, w: int = 900, h: int = 260):
+        self.n = n_refs
+        self.min_dt = 1.0 / float(update_hz)
+        self.t_last = 0.0
+        self.w, self.h = w, h
+        self.win = "new_dist"
+        cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
+
+    def update(self, new_dist_1d: np.ndarray):
+        t = time.perf_counter()
+        if (t - self.t_last) < self.min_dt:
+            return
+        self.t_last = t
+
+        y = np.asarray(new_dist_1d, dtype=np.float32)
+        if y.shape[0] != self.n:
+            return
+
+        # Normalize to [0, 1] robustly (cheap)
+        ymin, ymax = float(np.min(y)), float(np.max(y))
+        if ymax <= ymin:
+            ymax = ymin + 1e-3
+        yn = (y - ymin) / (ymax - ymin)
+
+        img = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+
+        # Map indices -> x pixels
+        xs = (np.linspace(0, self.w - 1, self.n)).astype(np.int32)
+        ys = (self.h - 1 - (yn * (self.h - 1))).astype(np.int32)
+
+        pts = np.stack([xs, ys], axis=1).reshape((-1, 1, 2))
+        cv2.polylines(img, [pts], isClosed=False, color=(255, 255, 255), thickness=1)
+
+        cv2.putText(img, "Distance", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
+        cv2.putText(img, "Reference index", (10, self.h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
+
+        cv2.imshow(self.win, img)
+        cv2.waitKey(1)
+
 class RawKPLogger:
     """
     Append-only binary log, fixed-size per frame.
@@ -267,8 +307,6 @@ def stream_event_windows_davis_live(dt_ms: float, on_window=None, bias_steps_cf=
     # 4. Verification (Optional)
     on_bias = cap.getDavis346BiasCoarseFine(B.On)
     off_bias = cap.getDavis346BiasCoarseFine(B.Off)
-    print(on_bias)
-    print(off_bias)
 
     # 3. Stop streams before applying hardware changes
     cap.setEventsRunning(False)

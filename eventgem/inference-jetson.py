@@ -221,6 +221,8 @@ def main():
     ref_feats_dir = Path(args.features_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
     ref_feats_file = ref_feats_dir / f"{args.dataset}_{args.reference}_features.pt"
     ref_kp_dir = Path(args.keypoint_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
+    qry_kp_dir = Path(args.keypoint_dir) / args.dataset / f"{args.query}-{args.dt_ms}"
+    qry_rerank_dir = Path(args.features_dir) / args.dataset / f"{args.query}-{args.dt_ms}" / "rerank"
     ref_depth_dir = Path(args.depth_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
     ref_feats_dir.mkdir(parents=True, exist_ok=True)
     ref_kp_dir.mkdir(parents=True, exist_ok=True)
@@ -308,6 +310,7 @@ def main():
         on_window=preview.enqueue,
         bias_steps_cf=bias_steps_cf,
     )
+    plotter = stream.LiveDistPlotCV(n_refs=ref_store.num_refs, update_hz=10.0)
     reranked_cols = []
     sims = []
     queries = []
@@ -410,6 +413,20 @@ def main():
                     else:
                         # Use the same sampled descriptors for your normal path
                         q_k_desc = desc_sampled
+                        if raw_logger is None:
+                            D = int(desc_sampled.shape[1])
+                            raw_logger = stream.RawKPLogger(
+                                Path(qry_kp_dir) / "ref_kp_raw.bin",
+                                H=H, W=W,
+                                off_top=off_top, off_left=off_left,
+                                top_k=int(args.se_topk),
+                                D=D,
+                            )
+                        # scores can be None; your logger expects a tensor -> make a zeros tensor
+                        if scores is None:
+                            scores = torch.zeros((kpts_yx.shape[0],), device=desc_sampled.device, dtype=torch.float32)
+
+                        raw_logger.write(frame_idx, int(t_ref_raw), kpts_yx, scores, desc_sampled)
 
                     se1.record(stream_se)
             
@@ -427,9 +444,11 @@ def main():
                             max_matches=170, ratio_thresh=float(args.match_ratio)
                         )
                         final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
-                        best_arg = np.argmin(final_scores)
+                        new_dist = stream.build_reranked_column_from_sims(sims_t, cand_ids, inlier_counts, args.inlier_weight)
+                        plotter.update(new_dist)
                         if not (frame_idx < 10):
                             np.savez_compressed(f"{qry_feat_dir}/ref_feats_{frame_idx}.npz", q_desc_vit.cpu().numpy())
+                            np.savez_compressed(f"{qry_rerank_dir}/rerank_{frame_idx}.npz", new_dist.cpu().numpy())
 
                 # End of processing for this frame, record total time
                 t_total = (time.perf_counter() - cpu0) * 1000.0
