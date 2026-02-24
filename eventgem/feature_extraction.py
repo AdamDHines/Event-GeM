@@ -309,7 +309,6 @@ class EventGeM:
 
             with torch.no_grad():
                 pred = model(batch)
-                print(pred.keys())  # Debug: print keys of the prediction dictionary
 
                 # Older versions might return a tuple
                 if isinstance(pred, tuple):
@@ -363,7 +362,7 @@ class EventGeM:
                 ys = kpts_np[:, 0]
                 kpts_xy = np.stack([xs, ys], axis=-1).astype(np.float32)  # (N, 2), (x, y)
 
-                self.debug_plot_keypoints(batch[b], kpts_xy, save_path=f"debug_kpts_{frame_idx-1:05d}.png")
+               # self.debug_plot_keypoints(batch[b], kpts_xy, save_path=f"debug_kpts_{frame_idx-1:05d}.png")
 
                 # Save per-frame NPZ, same structure as original
                 np.savez_compressed(

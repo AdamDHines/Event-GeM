@@ -19,6 +19,7 @@ install-trt = "pip install --extra-index-url https://pypi.nvidia.com tensorrt-cu
 python = ">3.8"
 numpy = "*"
 pytorch = "*"
+pandas = "*"
 sinabs = "*"
 torchvision = "*"
 pytorch-lightning  = "*"

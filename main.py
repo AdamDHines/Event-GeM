@@ -15,12 +15,12 @@ def main():
     #                         help="Reference directory to use for evaluation")
     # parser.add_argument("--query", "-q", type=str, 
     #                         help="Query directory to use for evaluation")
-    parser.add_argument("--dataset", "-d", type=str, default="brisbane_event",
+    parser.add_argument("--dataset", type=str, default="brisbane_event",
                             choices=["brisbane_event", "nsavp", "fast_slow"],
                             help="Dataset to use for evaluation")
-    parser.add_argument("--reference", "-r", type=str, default="sunset2",
+    parser.add_argument("--reference",  type=str, default="sunset2",
                             help="Reference directory to use for evaluation")
-    parser.add_argument("--query", "-q", type=str, default="sunset1",
+    parser.add_argument("--query", type=str, default="sunset1",
                             help="Query directory to use for evaluation")
     parser.add_argument("--recon-msec", type=int, default=50,
                             help="Reconstruction time window in milliseconds for event datasets")
@@ -64,11 +64,11 @@ def main():
     if args.mode == "feature-extract":
         eventgem.feature_inference()
     else:
-        original, reranked = eventgem.keypoint_inference()
+        original, reranked, reranked_depth = eventgem.keypoint_inference()
         # Run Recall@K evaluation
         gt = np.load(os.path.join(args.data_root, args.dataset, "ground_truth", f"{args.reference}_{args.query}_GT.npy"))
         # gt = None
-        recall(original, reranked, gt)
+        recall(original, reranked, reranked_depth, gt)
 
 if __name__ == "__main__":
     main()

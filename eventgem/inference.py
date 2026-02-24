@@ -68,7 +68,7 @@ def main():
                     help="Resize method to use when resizing input event frames for ViT (if needed)")
     ap.add_argument("--amp", action="store_true",
                     help="Whether to use automatic mixed precision for ViT inference (GPU only)")
-    ap.add_argument("--dt-ms", type=float, default=250,
+    ap.add_argument("--dt-ms", type=float, default=10,
                     help="Time window (in ms) to accumulate events for each inference step")
 
     # SuperEvent parameters
@@ -80,7 +80,7 @@ def main():
                     help="Path to the SuperEvent weights file")
     ap.add_argument("--se-topk", type=int, default=170,
                     help="Number of top candidates to keep after re-ranking")
-    ap.add_argument("--mcts-windows-ms", type=float, nargs="+", default=[50, 100, 150, 200, 250],
+    ap.add_argument("--mcts-windows-ms", type=float, nargs="+", default=[2, 4, 6, 8, 10],
                     help="List of time windows (in ms) for MCTS")
     ap.add_argument("--ref-kp-pattern", type=str, default="mcts_{:05d}.feat.npz",
                     help="Pattern to match reference keypoint files (should include a placeholder for candidate ID)")
@@ -577,10 +577,12 @@ def main():
         reranked_cols_stack = np.stack(reranked_cols, axis=0)
         reranked_cols_stack = reranked_cols_stack.T
         S_in = 1-reranked_cols_stack
+        print(S_in.shape)
 
         K = [1, 5, 10]
         # load ground truth file
         gt = np.load(args.gt_file)
+        print(gt.shape)
         # resize to match shape of reranked_cols_stack if needed
         from skimage.transform import resize
         gt_resized = resize(gt, S_in.shape, order=0, preserve_range=True, anti_aliasing=False)
