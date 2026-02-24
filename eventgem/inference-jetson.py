@@ -229,6 +229,8 @@ def main():
     ref_depth_dir.mkdir(parents=True, exist_ok=True)
     qry_feat_dir = Path(args.features_dir) / args.dataset / f"{args.query}-{args.dt_ms}"
     qry_feat_dir.mkdir(parents=True, exist_ok=True)
+    qry_rerank_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"[INFO] Extracted reference features will be saved to: {ref_feats_dir}")
     print(f"[INFO] Extracted reference keypoints will be saved to: {ref_kp_dir}")
     print(f"[INFO] Extracted reference depth maps will be saved to: {ref_depth_dir}")
@@ -310,7 +312,7 @@ def main():
         on_window=preview.enqueue,
         bias_steps_cf=bias_steps_cf,
     )
-    plotter = stream.LiveDistPlotCV(n_refs=ref_store.num_refs, update_hz=10.0)
+    #plotter = stream.LiveDistPlotCV(n_refs=ref_store.num_refs, update_hz=10.0)
     reranked_cols = []
     sims = []
     queries = []
@@ -445,10 +447,10 @@ def main():
                         )
                         final_scores = cand_dist_val - (inlier_counts * args.inlier_weight)
                         new_dist = stream.build_reranked_column_from_sims(sims_t, cand_ids, inlier_counts, args.inlier_weight)
-                        plotter.update(new_dist)
+                        #plotter.update(new_dist)
                         if not (frame_idx < 10):
                             np.savez_compressed(f"{qry_feat_dir}/ref_feats_{frame_idx}.npz", q_desc_vit.cpu().numpy())
-                            np.savez_compressed(f"{qry_rerank_dir}/rerank_{frame_idx}.npz", new_dist.cpu().numpy())
+                            np.savez_compressed(f"{qry_rerank_dir}/rerank_{frame_idx}.npz", new_dist)
 
                 # End of processing for this frame, record total time
                 t_total = (time.perf_counter() - cpu0) * 1000.0
