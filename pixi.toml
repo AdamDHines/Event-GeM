@@ -10,6 +10,8 @@ cuda = "12"
 libc = {family="glibc", version="2.35"}
 
 [tasks]
+eventgem = {cmd = "pixi run python3 main.py"}
+
 inference = {cmd = "pixi run python3 eventgem/inference.py"}
 inference-jetson = {cmd = "pixi run python3 eventgem/inference-jetson.py"}
 

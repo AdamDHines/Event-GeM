@@ -571,10 +571,10 @@ def stream_event_windows_raw(
 
 @torch.no_grad()
 def tencode(
-    x: np.ndarray,
-    y: np.ndarray,
-    t: np.ndarray,
-    p: np.ndarray,
+    x,
+    y,
+    t,
+    p,
     height: int,
     width: int,
     white_frame: bool = False,
@@ -603,10 +603,10 @@ def tencode(
             frame = np.full((3, H, W), base_val, dtype=np.float32)
             return frame / 255.0 if normalize else frame
 
-        x64 = x.astype(np.int64, copy=False)
-        y64 = y.astype(np.int64, copy=False)
-        t64 = t.astype(np.float64, copy=False)
-        p64 = p.astype(np.float64, copy=False)
+        x64 = x
+        y64 = y
+        t64 = t
+        p64 = p
 
         order = np.argsort(t64)
         x64, y64, t64, p64 = x64[order], y64[order], t64[order], p64[order]
@@ -644,17 +644,17 @@ def tencode(
         return out.cpu().numpy() if return_numpy else out
 
     # Move window to GPU
-    x_t = torch.from_numpy(x).to(device=device, dtype=torch.int64)
-    y_t = torch.from_numpy(y).to(device=device, dtype=torch.int64)
+    x_t = x
+    y_t = y
 
     # t should be int64 raw timestamps if coming from your stream
-    t_t = torch.from_numpy(t).to(device=device)
+    t_t = t
     if t_t.dtype != torch.int64:
         # If you pass float timestamps, we can still do it, but int64 raw is best for correctness.
         t_t = t_t.to(torch.int64)
 
     # Polarity fix (same idea as your gpu_polarity_frame_2ch)
-    p_t = torch.from_numpy(p).to(device=device)
+    p_t = p
     if p_t.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
         p_cmp = p_t.to(torch.int16)  # avoids uint8 255 -> int8 -1 style wrap issues
     else:
@@ -1248,6 +1248,152 @@ def batched_ransac_rerank(
     best_counts, _ = count.max(dim=1)
     
     return best_counts.cpu().numpy().astype(np.int32)
+
+def compute_inliers_2d_usac_fast_from_tensors(
+    q_kpts_yx_t: torch.Tensor,   # [Nq,2] yx on GPU ok
+    q_desc_t: torch.Tensor,      # [Nq,D] on GPU ok
+    r_data: dict,                # {"kpts": (Nr,2) xy np.float32, "desc": (Nr,D) np.float32}
+    off_left: int,
+    off_top: int,
+    ransac_thresh: float,
+    ratio: float = 0.8,
+    max_iters: int = 100,
+):
+    # ---- move query to CPU numpy for OpenCV ----
+    if q_kpts_yx_t.numel() < 8 or q_desc_t.numel() == 0:
+        return 0
+
+    q_xy = q_kpts_yx_t[:, [1, 0]].float()
+    q_xy[:, 0] += float(off_left)
+    q_xy[:, 1] += float(off_top)
+
+    kpts_q = q_xy.detach().cpu().numpy().astype(np.float32)
+    desc_q = q_desc_t.detach().cpu().numpy().astype(np.float32)
+
+    desc_r = r_data["desc"]
+    kpts_r = r_data["kpts"]
+
+    if kpts_q.shape[0] < 4 or kpts_r.shape[0] < 4:
+        return 0
+
+    matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+
+    try:
+        matches = matcher.knnMatch(desc_q, desc_r, k=2)
+    except cv2.error:
+        return 0
+
+    good = []
+    for m_n in matches:
+        if len(m_n) == 2 and m_n[0].distance < ratio * m_n[1].distance:
+            good.append(m_n[0])
+
+    if len(good) < 4:
+        return 0
+
+    src_pts = np.float32([kpts_q[m.queryIdx] for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kpts_r[m.trainIdx] for m in good]).reshape(-1, 1, 2)
+
+    try:
+        _, mask = cv2.findHomography(
+            src_pts, dst_pts,
+            method=cv2.USAC_FAST,
+            ransacReprojThreshold=ransac_thresh,
+            maxIters=max_iters
+        )
+    except cv2.error:
+        return 0
+
+    return int(mask.sum()) if mask is not None else 0
+
+
+def usac_fast_inliers_from_refstore(
+    q_kpts_yx_t: torch.Tensor,   # [Nq,2] yx (GPU ok)
+    q_desc_t: torch.Tensor,      # [Nq,D] (GPU ok)
+    ref_store,                   # BatchedRefStore
+    cand_ids: np.ndarray,        # [K] int64
+    off_left: int,
+    off_top: int,
+    ransac_thresh: float,
+    ratio: float = 0.8,
+    max_iters: int = 100,
+):
+    """
+    Returns inlier counts per candidate using OpenCV USAC_FAST.
+    Ref data comes from your existing ref_store (no load_event_features).
+    """
+    K = int(len(cand_ids))
+    if K == 0:
+        return np.zeros((0,), dtype=np.int32)
+
+    # ---- query -> XY + offsets -> CPU numpy ----
+    if q_kpts_yx_t.numel() == 0 or q_desc_t.numel() == 0:
+        return np.zeros((K,), dtype=np.int32)
+
+    q_xy = q_kpts_yx_t[:, [1, 0]].float()
+    q_xy[:, 0] += float(off_left)
+    q_xy[:, 1] += float(off_top)
+
+    kpts_q = q_xy.detach().cpu().numpy().astype(np.float32)
+    desc_q = q_desc_t.detach().cpu().numpy().astype(np.float32)
+
+    if kpts_q.shape[0] < 4:
+        return np.zeros((K,), dtype=np.int32)
+
+    # ---- fetch refs in one go (GPU tensors) ----
+    # r_kpts: [K, Nr, 2]  (whatever coords you stored)
+    # r_desc: [K, Nr, D]
+    # r_mask: [K, Nr] bool
+    r_kpts_t, r_desc_t, r_mask_t = ref_store.get_batch_tensor(cand_ids, device=q_kpts_yx_t.device)
+
+    # move refs to CPU numpy for OpenCV
+    r_kpts = r_kpts_t.detach().cpu().numpy().astype(np.float32)
+    r_desc = r_desc_t.detach().cpu().numpy().astype(np.float32)
+    r_mask = r_mask_t.detach().cpu().numpy().astype(bool)
+
+    matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+
+    inliers = np.zeros((K,), dtype=np.int32)
+
+    for j in range(K):
+        # apply mask (valid ref points only)
+        valid = r_mask[j]
+        kpts_r = r_kpts[j][valid]
+        desc_r = r_desc[j][valid]
+
+        if kpts_r.shape[0] < 4:
+            continue
+
+        try:
+            matches = matcher.knnMatch(desc_q, desc_r, k=2)
+        except cv2.error:
+            continue
+
+        good = []
+        for m_n in matches:
+            if len(m_n) == 2 and m_n[0].distance < ratio * m_n[1].distance:
+                good.append(m_n[0])
+
+        if len(good) < 4:
+            continue
+
+        src_pts = np.float32([kpts_q[m.queryIdx] for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kpts_r[m.trainIdx] for m in good]).reshape(-1, 1, 2)
+
+        try:
+            _, mask = cv2.findHomography(
+                src_pts, dst_pts,
+                method=cv2.USAC_FAST,
+                ransacReprojThreshold=ransac_thresh,
+                maxIters=max_iters,
+            )
+        except cv2.error:
+            continue
+
+        if mask is not None:
+            inliers[j] = int(mask.sum())
+
+    return inliers
 
 class _DepthLRUCache:
     """Tiny LRU cache for *downsampled* reference depth maps."""
@@ -2693,3 +2839,101 @@ def extract_eventvlad_features(model, query, device='cuda'):
         out = out.unsqueeze(0)
 
     return out.detach().cpu().to(torch.float32).numpy()
+
+
+# Import the MLPSelector and feature logic from your original script
+# or redefine them here for a standalone utility.
+
+class RerankGate:
+    def __init__(self, ckpt_dir: str, device: str = "cuda"):
+        self.device = device
+        
+        # 1. Load calibration & configuration
+        with open(os.path.join(ckpt_dir, "temp.json"), "r") as f:
+            cfg = json.load(f)
+            self.temp = cfg["temperature"]
+            self.K = cfg.get("K", 50) # The K-count the gate was trained on
+
+        # 2. Load Ensemble Members
+        self.models = []
+        ckpts = sorted([p for p in os.listdir(ckpt_dir) if p.startswith("selector_m") and p.endswith(".pt")])
+        for c in ckpts:
+            obj = torch.load(os.path.join(ckpt_dir, c), map_location=device)
+            m = self._build_model(obj["d_in"])
+
+            sd = obj["state_dict"]
+            # compatibility: older checkpoints saved as MLPSelector(net=Sequential(...))
+            if any(k.startswith("net.") for k in sd.keys()):
+                sd = {k.replace("net.", "", 1): v for k, v in sd.items()}
+
+            m.load_state_dict(sd, strict=True)
+            m.to(device).eval()
+            self.models.append(m)
+
+    def _build_model(self, d_in: int):
+        """Matches the recommended robust architecture."""
+        return nn.Sequential(
+            nn.BatchNorm1d(d_in),
+            nn.Linear(d_in, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1)
+        )
+
+    def extract_features_torch(self, topk_vals: torch.Tensor) -> torch.Tensor:
+        """
+        Vectorized feature extraction directly in PyTorch (GPU).
+        Keeps everything on-device to avoid CPU sync bottlenecks.
+        """
+        v = topk_vals # [1, K]
+        mu = v.mean(dim=1, keepdim=True)
+        sig = v.std(dim=1, keepdim=True) + 1e-6
+        z1 = (v[:, [0]] - mu) / sig
+
+        # Margins
+        m12 = v[:, [0]] - v[:, [1]]
+        m15 = v[:, [0]] - v[:, [4]]
+        m110 = v[:, [0]] - v[:, [9]]
+
+        # Aleatoric Uncertainty (Entropy)
+        p = F.softmax(v, dim=1)
+        ent = -(p * torch.log(p + 1e-12)).sum(dim=1, keepdim=True)
+        pmax = p.max(dim=1, keepdim=True).values
+
+        feats = torch.cat([
+            v, v[:, [0]], v[:, [1]], v[:, [4]], v[:, [9]],
+            m12, m15, m110, mu, sig, z1, ent, pmax
+        ], dim=1)
+        return feats
+
+    @torch.no_grad()
+    def decide(self, sims, topk_vals,
+               tau: float = 0.5, var_threshold: float = 0.05):
+        """
+        The Main Entry Point.
+        q_desc: [D] or [1, D] descriptor from ViT-GeM
+        ref_database: [N_ref, D] all reference descriptors
+        """
+        # 2. Extract Gate Features
+        gate_in = self.extract_features_torch(topk_vals)
+
+        # 3. Ensemble Forward Pass (Epistemic Check)
+    
+        # 3. Ensemble forward pass
+        logits = torch.cat([m(gate_in) for m in self.models], dim=0).squeeze(-1)  # [M]
+        logits = logits / self.temp
+        probs_m = torch.sigmoid(logits)  # [M]
+
+        prob_correct = probs_m.mean().item()
+        epistemic_var = probs_m.var(unbiased=False).item()  # var in [0, 0.25]
+        
+        # 4. Aleatoric Check (Probability via Temperature Scaling)
+        mean_logit = torch.mean(logits)
+        prob_correct = 1.0 / (1.0 + torch.exp(-(mean_logit / self.temp)))
+
+        # 5. Logic: Rerank if (Low Confidence) OR (High Disagreement)
+        should_rerank = (prob_correct < tau) or (epistemic_var > var_threshold)
+
+        return should_rerank, prob_correct, epistemic_var

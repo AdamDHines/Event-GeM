@@ -46,7 +46,7 @@ def main():
                             help="Directory to save extracted features")
     parser.add_argument("--keypoint-out", type=str, default="./eventgem/keypoints",
                             help="Directory to save detected keypoints")
-    parser.add_argument("--rerank_mode", type=str, default="depth", choices=["keypoints", "depth", "both"],
+    parser.add_argument("--rerank_mode", type=str, default="keypoints", choices=["keypoints", "depth", "both"],
                             help="Which results to evaluate: original, reranked, or both")
     parser.add_argument("--reference_depth_dir", type=str, default="/media/adam/vprdatasets/edvpr/sunset2/raw16",
                             help="Directory containing reference depth maps (if using depth-based re-ranking)")
@@ -54,21 +54,28 @@ def main():
                             help="Directory containing query depth maps (if using depth-based re-ranking)")
     parser.add_argument("--depth_pattern", type=str, default="depth_{:06d}.png",
                             help="File pattern for depth maps")
-    # Togglable operation
-    parser.add_argument("--mode", type=str, default="keypoints", choices=["feature-extract", "keypoints"],
-                            help="Operation mode: feature extraction or keypoint detection")
+    
+    parser.add_argument("--rerun-features", action="store_true",
+                            help="Whether to re-run feature extraction even if features already exist")
+    parser.add_argument("--rerun-keypoints", action="store_true",
+                            help="Whether to re-run keypoint inference even if keypoints already exist")
+
     args = parser.parse_args()
 
     # Initialize and run Event-GeM inference
     eventgem = EventGeM(args)
-    if args.mode == "feature-extract":
-        eventgem.feature_inference()
-    else:
-        original, reranked, reranked_depth = eventgem.keypoint_inference()
-        # Run Recall@K evaluation
-        gt = np.load(os.path.join(args.data_root, args.dataset, "ground_truth", f"{args.reference}_{args.query}_GT.npy"))
-        # gt = None
-        recall(original, reranked, reranked_depth, gt)
+    eventgem.feature_inference()
+    original, reranked, reranked_depth = eventgem.keypoint_inference()
+    # save the matrices for later evaluation
+    outpath = "./train_split"
+    os.makedirs(outpath, exist_ok=True)
+    np.save(os.path.join(outpath, f"{args.reference}_{args.query}_original.npy"), original)
+    np.save(os.path.join(outpath, f"{args.reference}_{args.query}_reranked.npy"), reranked)
+    np.save(os.path.join(outpath, f"{args.reference}_{args.query}_reranked_depth.npy"), reranked_depth)
+    # Run Recall@K evaluation
+    gt = np.load(os.path.join(args.data_root, args.dataset, "ground_truth", f"{args.reference}_{args.query}_GT.npy"))
+    # gt = None
+    recall(original, reranked, reranked_depth, gt)
 
 if __name__ == "__main__":
     main()
