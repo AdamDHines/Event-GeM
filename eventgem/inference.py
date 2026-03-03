@@ -6,6 +6,9 @@ import streamutils.stream as stream
 import os
 import streamutils.convert_ref as convert_ref
 
+import ctypes
+
+
 import sys
 import h5py
 import numpy as np
@@ -14,6 +17,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from external.depthanyevent.models import fetch_model  # from the DepthAnyEvent repo
 import imageio
+import matplotlib.pyplot as plt
 THIS_DIR = Path(__file__).resolve().parent
 BACKBONE_ROOT = THIS_DIR / "external" / "backbone"
 SUPEREVENT_ROOT = THIS_DIR / "external" / "superevent"
@@ -21,6 +25,108 @@ SUPEREVENT_ROOT = THIS_DIR / "external" / "superevent"
 # Order matters: backbone's `utils` must win
 sys.path.insert(0, str(SUPEREVENT_ROOT))
 sys.path.insert(0, str(BACKBONE_ROOT))
+
+lib = ctypes.CDLL("/home/adam/repo/Event-GeM/libtrt_runner.so")
+
+class TrtHandle(ctypes.Structure):
+    pass
+
+lib.trt_load.restype = ctypes.POINTER(TrtHandle)
+lib.trt_load.argtypes = [ctypes.c_char_p]
+
+lib.trt_num_io.restype = ctypes.c_int
+lib.trt_num_io.argtypes = [ctypes.POINTER(TrtHandle)]
+
+lib.trt_is_input.restype = ctypes.c_int
+lib.trt_is_input.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int]
+
+lib.trt_get_name.restype = ctypes.c_int
+lib.trt_get_name.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+
+lib.trt_get_dtype.restype = ctypes.c_int
+lib.trt_get_dtype.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int]
+
+lib.trt_get_ndim.restype = ctypes.c_int
+lib.trt_get_ndim.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int]
+
+lib.trt_get_dims.restype = ctypes.c_int
+lib.trt_get_dims.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+
+lib.trt_set_ptr.restype = ctypes.c_int
+lib.trt_set_ptr.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int, ctypes.c_void_p]
+
+lib.trt_set_stream.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_ulonglong]
+
+lib.trt_execute.restype = ctypes.c_int
+lib.trt_execute.argtypes = [ctypes.POINTER(TrtHandle)]
+
+lib.trt_destroy.argtypes = [ctypes.POINTER(TrtHandle)]
+
+# TRT DataType enum -> torch dtype (common cases)
+TRT_TO_TORCH = {
+    0: torch.float32,  # kFLOAT
+    1: torch.float16,  # kHALF
+    2: torch.int8,     # kINT8
+    3: torch.int32,    # kINT32
+    4: torch.bool,     # kBOOL
+}
+
+class TRTEngineCUDA12:
+    def __init__(self, engine_path: str):
+        self.h = lib.trt_load(engine_path.encode())
+        if not self.h:
+            raise RuntimeError("Failed to load engine (version mismatch?)")
+
+        self.n = lib.trt_num_io(self.h)
+        self.inputs = []
+        self.outputs = []
+        self._i_idx = []
+        self._o_idx = []
+        
+
+        # Static-shape allocation (throws if any dim is -1)
+        for i in range(self.n):
+            dt = lib.trt_get_dtype(self.h, i)
+            if dt not in TRT_TO_TORCH:
+                raise RuntimeError(f"Unsupported TRT dtype enum {dt} at io[{i}]")
+            torch_dtype = TRT_TO_TORCH[dt]
+
+            ndim = lib.trt_get_ndim(self.h, i)
+            buf = (ctypes.c_int * 16)()
+            ok = lib.trt_get_dims(self.h, i, buf, 16)
+            if not ok:
+                raise RuntimeError(f"Failed reading dims for io[{i}]")
+            shape = [buf[k] for k in range(ndim)]
+            if any(s < 0 for s in shape):
+                raise RuntimeError(f"io[{i}] is dynamic shape {shape}; handle dynamic separately")
+
+            t = torch.empty(tuple(shape), device="cuda", dtype=torch_dtype)
+            ok = lib.trt_set_ptr(self.h, i, ctypes.c_void_p(t.data_ptr()))
+            if not ok:
+                raise RuntimeError(f"Failed setTensorAddress for io[{i}]")
+
+            if lib.trt_is_input(self.h, i):
+                self.inputs.append(t); self._i_idx.append(i)
+            else:
+                self.outputs.append(t); self._o_idx.append(i)
+
+    def __call__(self, *args):
+        for k, a in enumerate(args):
+            self.inputs[k].copy_(a)
+
+        # run on the current PyTorch CUDA stream
+        stream = torch.cuda.current_stream().cuda_stream
+        lib.trt_set_stream(self.h, int(stream))
+
+        ok = lib.trt_execute(self.h)
+        if ok != 1:
+            raise RuntimeError("enqueueV3 failed")
+        return self.outputs[0] if len(self.outputs) == 1 else self.outputs
+
+    def close(self):
+        if self.h:
+            lib.trt_destroy(self.h)
+            self.h = None
 
 # ---------------------------
 # Main
@@ -59,6 +165,8 @@ def main():
                     help="Directory to save extracted keypoints (if --extract-reference is set)")
     ap.add_argument('--depth-dir', type=str, default='depth',
                     help="Directory to save extracted depth maps (if --extract-reference is set)")
+    ap.add_argument('--onnx', action='store_true',
+                    help="Whether to use ONNX Runtime for ViT inference (instead of PyTorch, GPU only)")
     
     # ViT backbone parameters
     ap.add_argument("--backbone-ckpt", type=str, default="./eventgem/ckpt/pr.pt",
@@ -81,7 +189,7 @@ def main():
                     help="Number of top candidates to keep after re-ranking")
     ap.add_argument("--mcts-windows-ms", type=float, nargs="+", default=[10, 20, 30, 40, 50],
                     help="List of time windows (in ms) for MCTS")
-    ap.add_argument("--ref-kp-pattern", type=str, default="mcts_{:05d}.feat.npz",
+    ap.add_argument("--ref-kp-pattern", type=str, default="ref_kp_{:05d}.npz",
                     help="Pattern to match reference keypoint files (should include a placeholder for candidate ID)")
     ap.add_argument("--ref-kp-cache", type=int, default=2048,
                     help="Size of the cache for reference keypoints")
@@ -122,7 +230,8 @@ def main():
     # if args.extract_reference:
     ref_feats_dir = Path(args.features_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
     ref_feats_file = ref_feats_dir / f"{args.dataset}_{args.reference}_features.pt"
-    ref_kp_dir = Path(args.keypoint_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
+    print(ref_feats_file)
+    ref_kp_dir = Path(args.keypoint_dir) / args.dataset / f"{args.reference}-{args.dt_ms}" / f"kps_{args.reference}"
     ref_depth_dir = Path(args.depth_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
     ref_feats_dir.mkdir(parents=True, exist_ok=True)
     ref_kp_dir.mkdir(parents=True, exist_ok=True)
@@ -152,15 +261,22 @@ def main():
     print(args.method)
     # Load the corresponding model to run the inference on
     if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
-        vit = stream.load_vit_backbone(args.backbone_ckpt, device)
-        vitH, vitW = stream.infer_vit_input_hw(vit)
+        if args.onnx:
+            vit = TRTEngineCUDA12("/home/adam/repo/Event-GeM/vit.engine")
+        else:
+            vit = stream.load_vit_backbone(args.backbone_ckpt, device)
+        vitH, vitW = 224, 224
         print(f"[INFO] ViT expects ~ {vitH}x{vitW}")
         if not args.extract_reference:
             ref_db = stream.load_ref_vit_db(ref_feats_file, device=device, dtype=torch.float16 if args.amp else torch.float32)
         stream_vit = torch.cuda.Stream()
 
     if args.method in ["superevent", "eventgem", "eventgem-d"]:
-        se_model, se_cfg = stream.build_superevent_model(Path(args.se_config), Path(args.se_weights), device)
+        if args.onnx:
+            se_model = TRTEngineCUDA12("/home/adam/repo/Event-GeM/superevent.engine")
+            _, se_cfg = stream.build_superevent_model(Path(args.se_config), Path(args.se_weights), device)
+        else:
+            se_model, se_cfg = stream.build_superevent_model(Path(args.se_config), Path(args.se_weights), device)
         from models.util import fast_nms
         off_top, off_left, _, _, h_end, w_end, Hc, Wc = stream.compute_superevent_crop_offsets(H, W, se_cfg)
         print(f"[INFO] SuperEvent crop: top={off_top} left={off_left} -> {Hc}x{Wc}")
@@ -224,7 +340,6 @@ def main():
             num_clusters=64,
             device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
-
     ref_store = None
     if args.method in ["eventgem", "eventgem-d", "superevent"]:
         if ref_kp_dir is None:
@@ -265,9 +380,8 @@ def main():
     wall0 = time.perf_counter()
 
     print("[INFO] Starting Loop...", flush=True)
-    gate = stream.RerankGate(ckpt_dir="/home/adam/repo/Event-GeM/sel_ckpt_brisbane", device=device)
+    gate = stream.RerankGate(ckpt_dir="/home/adam/repo/Event-GeM/morning", device=device)
     # Pre-load your reference descriptors to GPU
-    ref_database = ref_db
     reranked_cols = []
     sims = []
     queries = []
@@ -292,6 +406,7 @@ def main():
         frame_ids_all: list[int] = []
         rerank_mask_all: list[bool] = []
         K_eval = int(args.retrieval_k)
+        new_cols = []
         for (_, _, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms) in event_iter:
             cpu0 = time.perf_counter()
             n_events = int(x.size)
@@ -302,8 +417,8 @@ def main():
             t_raw = torch.from_numpy(t_raw).to(device)
             p = torch.from_numpy(p).to(device)
             
-            if x.size == 0:
-                continue
+            # if x.size == 0:
+            #     continue
 
             if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
                 with torch.cuda.stream(stream_vit):
@@ -313,36 +428,33 @@ def main():
                     if (H != vitH) or (W != vitW):
                         mode = "nearest" if args.resize == "nearest" else "bilinear"
                         inp = F.interpolate(inp, size=(vitH, vitW), mode=mode, align_corners=False if mode=="bilinear" else None)
-
-                    if args.amp:
-                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        if args.onnx:
+                            q_desc_vit = vit(inp)
+                        else:
                             q_desc_vit = stream.vit_gem_descriptor(vit, inp)
-                    else:
-                        q_desc_vit = stream.vit_gem_descriptor(vit, inp)
-                    
-                   # print(f"Gate decision: rerank_needed={rerank_needed} conf={conf:.4f} discord={discord:.4f}")
-                    
+
                     if args.extract_reference:
                         ref_feats.append(q_desc_vit.cpu().numpy())
                     else:
                         ret0.record(stream_vit)
                         
                         top_idx_t, top_dist_t, sims_t = stream.retrieve_topk(ref_db, q_desc_vit, k=int(args.retrieval_k), return_sims=True)
-                        rerank_needed, _, _ = gate.decide(sims_t, top_dist_t.unsqueeze(0), tau=0.35)
 
                         ret1.record(stream_vit)
                         vit1.record(stream_vit)
-                        sims.append(sims_t.cpu())
 
-            if args.method in ["superevent", "eventgem", "eventgem-d"] and rerank_needed:
+            if args.method in ["superevent", "eventgem", "eventgem-d"]:
                 with torch.cuda.stream(stream_se):
                     se0.record(stream_se)
                     mcts = stream.gpu_mcts(x, y, t_raw, p, H, W, int(t_ref_raw), float(args.time_scale), windows_sec, device)
                     mcts = mcts[:, off_top:h_end, off_left:w_end] 
-                    
+
                     pred = se_model(mcts.unsqueeze(0))
-                    prob, desc_map = pred['prob'], pred['descriptors']
-                    
+                    if args.onnx:
+                        prob, desc_map = pred[1], pred[3]
+                    else:
+                        prob, desc_map = pred['prob'], pred['descriptors']
+
                     kpts_all, scores_all = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
                     kpts_yx = kpts_all[0]
 
@@ -367,7 +479,7 @@ def main():
 
                         raw_logger.write(frame_idx, int(t_ref_raw), kpts_yx, scores, q_k_desc)
 
-            if args.method == "eventgem-d" and rerank_needed:
+            if args.method == "eventgem-d":
                 with torch.cuda.stream(stream_d):
                     d0.record(stream_d)
                     tencode = stream.tencode(x, y, t_raw, p, height=H, width=W, white_frame=False, normalize=True, device=device)
@@ -441,10 +553,8 @@ def main():
             
             if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
                 vit_ms = vit0.elapsed_time(vit1)
-            if args.method in ["superevent", "eventgem", "eventgem-d"] and rerank_needed:
+            if args.method in ["superevent", "eventgem", "eventgem-d"]:
                 se_ms = se0.elapsed_time(se1)
-            if not rerank_needed:
-                se_ms = 0
             if args.method == "eventgem-d":
                 d_ms = d0.elapsed_time(d1)
             if args.method == "lens":
@@ -461,30 +571,38 @@ def main():
                 best_idx = int(top_idx_t[0].item()) if top_idx_t.numel() else -1
                 best_inl = 0
 
-            if args.method in ["eventgem", "eventgem-d"] and rerank_needed:
+            if args.method in ["eventgem", "eventgem-d"]:
                 if top_idx_t.numel() > 0 and kpts_yx.numel() > 10:
                     # --- shortlist from global retrieval ---
                     cand_ids = top_idx_t.detach().cpu().numpy().astype(np.int64)             # [K]
                     cand_dist_val = top_dist_t.detach().cpu().numpy().astype(np.float32)    # [K]
 
                     # --- keypoint rerank via USAC_FAST (returns inliers aligned with cand_ids) ---
-                    inl = stream.usac_fast_inliers_from_refstore(
-                        q_kpts_yx_t=kpts_yx,
-                        q_desc_t=q_k_desc,
-                        ref_store=ref_store,
-                        cand_ids=cand_ids,
-                        off_left=off_left,
-                        off_top=off_top,
-                        ransac_thresh=float(args.ransac_thresh),
-                        ratio=0.8,
-                        max_iters=100,
-                    ).astype(np.int32)                                                       # [K]
+                    # inl = stream.usac_fast_inliers_from_refstore(
+                    #     q_kpts_yx_t=kpts_yx,
+                    #     q_desc_t=q_k_desc,
+                    #     ref_store=ref_store,
+                    #     cand_ids=cand_ids,
+                    #     off_left=off_left,
+                    #     off_top=off_top,
+                    #     ransac_thresh=float(args.ransac_thresh),
+                    #     ratio=0.8,
+                    #     max_iters=128,
+                    # ).astype(np.int32)    
+                    
+                    inl = stream.batched_ransac_rerank(
+                            kpts_yx, q_k_desc, ref_store, cand_ids, off_left, off_top,
+                            max_matches=170, ratio_thresh=float(args.match_ratio)
+                        )                                    # [K]
 
                     kp_new_dists = cand_dist_val - inl.astype(np.float32) * float(args.inlier_weight)  # [K]
 
                     # --- method-specific handling ---
                     if args.method == "eventgem":
-                        reranked_cols.append((cand_ids, kp_new_dists, inl))
+                        new_col = stream.build_reranked_column_from_sims(sims_t, cand_ids, inl, args.inlier_weight)
+
+
+                        new_cols.append(new_col)
 
                         best_j = int(np.argmin(kp_new_dists))
                         best_idx = int(cand_ids[best_j])
@@ -528,36 +646,6 @@ def main():
 
             # End of processing for this frame, record total time
             t_total = (time.perf_counter() - cpu0) * 1000.0
-            # -----------------------------
-            # Stash final shortlist distances for later evaluation
-            # (do this AFTER rerank stage has possibly modified distances)
-            # -----------------------------
-            if stash_topk:
-                # default: global shortlist
-                final_ids = top_idx_t.detach().cpu().numpy().astype(np.int32)          # [K]
-                final_dists = top_dist_t.detach().cpu().numpy().astype(np.float32)     # [K]
-                final_reranked = bool(rerank_needed)
-
-                # if rerank happened AND produced new distances, overwrite with reranked shortlist
-                # (only when the rerank block successfully created these arrays)
-                if rerank_needed and ("cand_ids" in locals()):
-                    # cand_ids is np.int64 [K]
-                    final_ids = cand_ids.astype(np.int32, copy=False)
-
-                    if args.method == "eventgem" and ("kp_new_dists" in locals()):
-                        final_dists = kp_new_dists.astype(np.float32, copy=False)
-                    elif args.method == "eventgem-d" and ("depth_new_dists" in locals()):
-                        final_dists = depth_new_dists.astype(np.float32, copy=False)
-
-                # hard guard: ensure consistent K
-                if final_ids.shape[0] != K_eval or final_dists.shape[0] != K_eval:
-                    # Skip stashing this frame if shapes are wrong (should not happen)
-                    pass
-                else:
-                    cand_ids_all.append(final_ids)
-                    cand_dists_all.append(final_dists)
-                    frame_ids_all.append(int(frame_idx))
-                    rerank_mask_all.append(final_reranked)
 
             t_read_list.append(t_read_ms)
             if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
@@ -567,8 +655,6 @@ def main():
             if args.method == "eventvlad":
                 t_vlad_list.append(vlad_ms)
             if args.method in ["eventgem", "eventgem-d"]:
-                if not rerank_needed:
-                    t_rerank = 0.0
                 t_rerank_list.append(t_rerank)
             t_total_list.append(t_total)
             n_events_list.append(n_events)
@@ -591,48 +677,7 @@ def main():
                     print(f"[LIVE] {frame_idx:5d} ev={n_events:5d} vlad={vlad_ms:.1f} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)
 
     wall_s = time.perf_counter() - wall0
-        # -----------------------------
-    # Rebuild dense distance matrix for evaluation: D_out [N_ref, N_qry]
-    # We fill +inf everywhere, and write only the final topK distances per query.
-    # Saved as a .npy that can be memory-mapped by np.load(..., mmap_mode="r")
-    # -----------------------------
-    if stash_topk and len(cand_ids_all) > 0:
 
-        N_ref = int(ref_db.shape[0])
-        Q = len(cand_ids_all)
-        out_dir = Path(getattr(args, "out_dir", "."))  # change if you have a specific eval dir
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        cand_ids_np = np.stack(cand_ids_all, axis=0).astype(np.int64, copy=False)      # [Q,K]
-        cand_dists_np = np.stack(cand_dists_all, axis=0).astype(np.float32, copy=False)  # [Q,K]
-        frame_ids_np = np.asarray(frame_ids_all, dtype=np.int32)
-        rerank_mask_np = np.asarray(rerank_mask_all, dtype=bool)
-
-        # Save sparse stash too (useful + cheap)
-        np.savez_compressed(
-            out_dir / "gated_topk.npz",
-            cand_ids=cand_ids_np,
-            cand_dists=cand_dists_np,
-            frame_idx=frame_ids_np,
-            reranked=rerank_mask_np,
-            N_ref=np.int32(N_ref),
-            K=np.int32(K_eval),
-        )
-
-        # Build dense matrix as .npy memmap (N_ref x Q)
-        D_path = out_dir / "D_gated.npy"
-        D = np.lib.format.open_memmap(str(D_path), mode="w+", dtype=np.float32, shape=(N_ref, Q))
-        D[:] = np.inf
-
-        # vectorized scatter
-        q_rep = np.repeat(np.arange(Q, dtype=np.int64), K_eval)     # [Q*K]
-        r_flat = cand_ids_np.reshape(-1)                             # [Q*K]
-        d_flat = cand_dists_np.reshape(-1)                           # [Q*K]
-        D[r_flat, q_rep] = d_flat
-        D.flush()
-
-        print(f"[EVAL] Saved gated dense distance matrix: {D_path} (shape={D.shape})")
-        print(f"[EVAL] Saved gated sparse topK stash:   {out_dir / 'gated_topk.npz'}")
     n_frames = len(t_total_list)
 
     if args.extract_reference:
@@ -689,13 +734,16 @@ def main():
 
     # stack the reranked cols
     if args.gt_file is not None:
-        S_in = D
-        print(S_in.shape)
-
+        # make a big matrix of shape (n_frames, R) where each row is the reranked distance vector for that query frame
+        S_in = np.stack(new_cols, axis=0)  # shape (n_frames, R)
+        S_in = 1 - S_in.T
+        # plt.imshow(S_in, aspect='auto')
+        # plt.colorbar()
+        # plt.show()
         K = [1, 5, 10]
         # load ground truth file
         gt = np.load(args.gt_file)
-        print(gt.shape)
+
         # resize to match shape of reranked_cols_stack if needed
         from skimage.transform import resize
         gt_resized = resize(gt, S_in.shape, order=0, preserve_range=True, anti_aliasing=False)

@@ -1069,9 +1069,9 @@ class BatchedRefStore:
         t_desc = torch.from_numpy(np.stack(b_desc)).to(device, non_blocking=True)
         t_mask = torch.from_numpy(np.stack(b_mask)).to(device, non_blocking=True)
         t_desc = F.normalize(t_desc, p=2, dim=2)
-        
+
         return t_kpts, t_desc.to(dtype=torch.float16), t_mask
-    
+
 @torch.no_grad()
 def vit_gem_descriptor(backbone, x_bchw: torch.Tensor) -> torch.Tensor:
     t = backbone.patch_embed(x_bchw)
@@ -1113,140 +1113,91 @@ def sample_descriptors_at_kpts(keypoints_yx: torch.Tensor, descriptors: torch.Te
 
 @torch.no_grad()
 def batched_ransac_rerank(
-    q_kpts: torch.Tensor,       # [Nq, 2]
-    q_desc: torch.Tensor,       # [Nq, D]
-    ref_store: BatchedRefStore,
-    cand_indices: np.ndarray,   # [B]
+    q_kpts_yx: torch.Tensor,     # [Nq, 2] (Assumed YX based on your Traceback)
+    q_desc: torch.Tensor,        # [Nq, D]
+    ref_store,
+    cand_indices: np.ndarray, 
+    off_left: int,
+    off_top: int,
     max_matches: int = 512,
     ratio_thresh: float = 0.8,
-    iterations: int = 64,       # RANSAC iterations per candidate
-    thresh_px: float = 5.0      # Inlier threshold in pixels
+    iterations: int = 128,      # Increased for better convergence
+    thresh_px: float = 5.0
 ):
-    """
-    Fully Vectorized GPU RANSAC using Robust DLT.
-    """
     B = len(cand_indices)
-    if B == 0:
-        return np.zeros(0, dtype=np.int32)
-    
-    device = q_kpts.device
-    # Use DLT (SVD-based) instead of get_perspective_transform (Solve-based) to prevent crashes
+    if B == 0: return np.zeros(0, dtype=np.int32)
+    device = q_kpts_yx.device
     from kornia.geometry.homography import find_homography_dlt
 
-    # --- 1. Batch Match ---
-    # Fetch Ref: [B, Nr, D]
+    # 1. FIX COORDINATES: YX -> XY and apply Offsets
+    # Snippet 2: q_xy = q_kpts_yx_t[:, [1, 0]]
+    q_kpts = q_kpts_yx[:, [1, 0]].float().clone()
+    q_kpts[:, 0] += float(off_left)
+    q_kpts[:, 1] += float(off_top)
+
+    # 2. MATCHING: Use L2 distance to match Snippet 2 (OpenCV BFMatcher)
     r_kpts, r_desc, r_mask = ref_store.get_batch_tensor(cand_indices, device)
+    r_desc = r_desc.to(dtype=q_desc.dtype)
     
-    # Cosine Sim: [B, Nq, Nr]
-    # align dtype/device once
-    r_desc = r_desc.to(device=q_desc.device, dtype=q_desc.dtype)
-    
-    sim = r_desc @ q_desc.T
-    sim.masked_fill_(~r_mask.unsqueeze(1), -2.0)
-    
-    # Ratio Test
-    top_val, top_idx = torch.topk(sim, k=2, dim=2) 
-    pass_ratio = (1.0 - top_val[:, :, 0]) < (ratio_thresh * (1.0 - top_val[:, :, 1]))
-    
-    # Gather Top Matches
-    s1_masked = top_val[:, :, 0].clone()
-    s1_masked[~pass_ratio] = -10.0
+    # Efficient L2 squared: ||a-b||^2 = ||a||^2 + ||b||^2 - 2abT
+    dist_sq = (q_desc**2).sum(1).view(1, -1, 1) + (r_desc**2).sum(2).view(B, 1, -1) - 2 * (q_desc @ r_desc.transpose(1, 2))
+    dist_sq.masked_fill_(~r_mask.unsqueeze(1), 1e8) # Mask invalid refs
 
-    # Select best 'max_matches' per candidate
-    _, best_match_indices = torch.topk(s1_masked, k=max_matches, dim=1) 
-    
-    # Gather Points: [B, M, 2]
-    src_pts = q_kpts[best_match_indices.view(-1)].view(B, max_matches, 2)
-    ref_match_indices = torch.gather(top_idx[:,:,0], 1, best_match_indices) 
-    dst_pts = torch.gather(r_kpts, 1, ref_match_indices.unsqueeze(-1).expand(-1, -1, 2))
+    # Ratio Test (L2 distance ratio)
+    top_val, top_idx = torch.topk(dist_sq, k=2, dim=2, largest=False)
+    # distance < ratio * distance_2  =>  dist^2 < ratio^2 * dist2^2
+    pass_ratio = top_val[:, :, 0] < (ratio_thresh**2 * top_val[:, :, 1])
 
-# --- 1. Identify Valid Matches (WITHIN THE 512 LIMIT) ---
-    # pass_ratio was calculated on the full set, 
-    # but we only kept 'max_matches' (512) for src_pts/dst_pts.
-    # We must slice pass_ratio to match.
-    gathered_pass = torch.gather(pass_ratio, 1, best_match_indices) # [B, 512]
-    num_valid_per_cand = gathered_pass.sum(dim=1) # [B]
+    # 3. GATHER TOP MATCHES
+    # We want the best L2 matches that passed the ratio test
+    match_scores = top_val[:, :, 0].clone()
+    match_scores[~pass_ratio] = 1e8 # Penalize failed ratio tests
     
-    # Sort the 512 points so valid ones (1s) come before invalid ones (0s)
-    _, sort_idx = torch.sort(gathered_pass.float(), dim=1, descending=True)
+    _, best_m_idx = torch.topk(match_scores, k=max_matches, dim=1, largest=False)
     
-    # Now gather from the ALREADY-CAPPED src_pts and dst_pts
-    src_pts = torch.gather(src_pts, 1, sort_idx.unsqueeze(-1).expand(-1, -1, 2))
-    dst_pts = torch.gather(dst_pts, 1, sort_idx.unsqueeze(-1).expand(-1, -1, 2))
+    # Extract points [B, M, 2]
+    src_pts = torch.gather(q_kpts.unsqueeze(0).expand(B, -1, -1), 1, best_m_idx.unsqueeze(-1).expand(-1, -1, 2))
+    ref_indices = torch.gather(top_idx[:, :, 0], 1, best_m_idx)
+    dst_pts = torch.gather(r_kpts, 1, ref_indices.unsqueeze(-1).expand(-1, -1, 2))
     
-    # --- 2. Vectorized Range-Bound Sampling ---
-    rand_floats = torch.rand((B, iterations, 4), device=device)
+    # Filter for the actual "valid" ones in our sampling range
+    gathered_pass = torch.gather(pass_ratio, 1, best_m_idx)
+    num_valid = gathered_pass.sum(dim=1).clamp(min=4)
+
+    # 4. NORMALIZATION (Essential for DLT stability)
+    # DLT fails if coords are [0, 1000]. We normalize to ~[-1, 1]
+    norm_factor = max(q_kpts.max(), r_kpts.max())
+    src_pts_n = src_pts / norm_factor
+    dst_pts_n = dst_pts / norm_factor
+
+    # 5. VECTORIZED RANSAC
+    # (Sampling logic remains similar, but use normalized points for DLT)
+    rand_idx = (torch.rand((B, iterations, 4), device=device) * num_valid.view(B, 1, 1)).long()
+    batch_off = torch.arange(B, device=device).view(B, 1, 1) * max_matches
+    g_idx = (rand_idx + batch_off).view(-1)
     
-    # Scale by num_valid so we only pick from the "packed" valid matches at the front
-    # We clamp at 4 because RANSAC needs at least 4 points to run the DLT math
-    sampling_limit = num_valid_per_cand.view(B, 1, 1).clamp(min=4)
-    rand_idx = (rand_floats * sampling_limit).long()
+    ps_src = src_pts_n.view(-1, 2)[g_idx].view(-1, 4, 2)
+    ps_dst = dst_pts_n.view(-1, 2)[g_idx].view(-1, 4, 2)
     
-    # --- 3. Global Indexing (Same as before but now restricted) ---
-    batch_offsets = torch.arange(B, device=device).view(B, 1, 1) * max_matches
-    global_rand_idx = (rand_idx + batch_offsets).view(-1)
+    H_n = find_homography_dlt(ps_src, ps_dst) # [B*iter, 3, 3]
     
-    # ... rest of your DLT and inlier counting logic ...
-    
-    # Gather 4-point sets
-    # Expand src_pts to [B, iter, M, 2] is too big memory-wise?
-    # Optimization: indexing directly
-    # Helper: offset batch indices
-    # flat_rand_idx: [B, iter, 4] -> values in 0..M-1
-    # We need global indices into flattened [B*M, 2] array
-    
-    # batch_offsets = torch.arange(B, device=device).view(B, 1, 1) * max_matches
-    # global_rand_idx = (rand_idx + batch_offsets).view(-1) # [B*iter*4]
-    
-    src_flat = src_pts.view(-1, 2) # [B*M, 2]
-    dst_flat = dst_pts.view(-1, 2)
-    
-    ps_src = src_flat[global_rand_idx].view(B, iterations, 4, 2)
-    ps_dst = dst_flat[global_rand_idx].view(B, iterations, 4, 2)
-    
-    # Flatten for DLT
-    ps_src_k = ps_src.reshape(-1, 4, 2)
-    ps_dst_k = ps_dst.reshape(-1, 4, 2)
-    
-    # Compute Homographies using DLT (Robust SVD)
-    # find_homography_dlt never crashes on singular inputs
-    H = find_homography_dlt(ps_src_k, ps_dst_k, weights=None)
-    
-    # --- 3. Verify Inliers ---
-    # Verify all points: [B, 1, M, 2]
-    
-    # H: [B*iter, 3, 3] -> [B, iter, 3, 3]
-    H_view = H.view(B, iterations, 3, 3)
-    
-    # Prepare Src Points Homogeneous: [B, 1, 3, M]
+    # 6. VERIFY (Use original scale for thresholding)
+    H_view = H_n.view(B, iterations, 3, 3)
+    # To use original thresh_px, we need to "un-normalize" H 
+    # but it's easier to just warp the normalized points and scale back
     ones = torch.ones((B, 1, max_matches, 1), device=device)
-    src_h = torch.cat([src_pts.unsqueeze(1), ones], dim=3) 
-    src_h_t = src_h.transpose(2, 3) # [B, 1, 3, M]
+    src_h = torch.cat([src_pts_n.unsqueeze(1), ones], dim=3).transpose(2, 3)
     
-    # Transform: [B, iter, 3, 3] @ [B, 1, 3, M] -> [B, iter, 3, M]
-    src_warped_h = H_view @ src_h_t
+    warped_h = H_view @ src_h
+    warped = (warped_h[:, :, :2, :] / (warped_h[:, :, 2:3, :] + 1e-8)) * norm_factor
     
-    # Normalize
-    w = src_warped_h[:, :, 2:3, :] + 1e-7
-    src_warped = src_warped_h[:, :, 0:2, :] / w # [B, iter, 2, M]
+    dist = torch.norm(warped - dst_pts.unsqueeze(1).transpose(2, 3), dim=2) # [B, iter, M]
     
-    # Distances
-    # dst_pts: [B, M, 2] -> [B, 1, 2, M]
-    dst_t = dst_pts.unsqueeze(1).transpose(2, 3)
-    diff = src_warped - dst_t
-    dist_sq = diff.pow(2).sum(dim=2) # [B, iter, M]
-    
-    # Count Inliers
-    # Must be geometrically close AND originally valid
-    is_inlier = dist_sq < (thresh_px**2)
-    is_valid_point = gathered_pass.unsqueeze(1) # [B, 1, M]
-    
-    final_inliers = is_inlier & is_valid_point
-    
-    # Best iteration
-    count = final_inliers.sum(dim=2) # [B, iter]
-    best_counts, _ = count.max(dim=1)
-    
+    # Final Inlier Count
+    is_inlier = (dist < thresh_px) & gathered_pass.unsqueeze(1)
+    counts = is_inlier.sum(dim=2)
+    best_counts, _ = counts.max(dim=1)
+
     return best_counts.cpu().numpy().astype(np.int32)
 
 def compute_inliers_2d_usac_fast_from_tensors(
@@ -1316,7 +1267,7 @@ def usac_fast_inliers_from_refstore(
     off_top: int,
     ransac_thresh: float,
     ratio: float = 0.8,
-    max_iters: int = 100,
+    max_iters: int = 2096,
 ):
     """
     Returns inlier counts per candidate using OpenCV USAC_FAST.
@@ -1347,9 +1298,9 @@ def usac_fast_inliers_from_refstore(
     r_kpts_t, r_desc_t, r_mask_t = ref_store.get_batch_tensor(cand_ids, device=q_kpts_yx_t.device)
 
     # move refs to CPU numpy for OpenCV
-    r_kpts = r_kpts_t.detach().cpu().numpy().astype(np.float32)
-    r_desc = r_desc_t.detach().cpu().numpy().astype(np.float32)
-    r_mask = r_mask_t.detach().cpu().numpy().astype(bool)
+    r_kpts = r_kpts_t.astype(np.float32)
+    r_desc = r_desc_t.astype(np.float32)
+    r_mask = r_mask_t.astype(bool)
 
     matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
 
@@ -2841,99 +2792,234 @@ def extract_eventvlad_features(model, query, device='cuda'):
     return out.detach().cpu().to(torch.float32).numpy()
 
 
-# Import the MLPSelector and feature logic from your original script
-# or redefine them here for a standalone utility.
+import os
+import json
+from typing import Tuple, List, Union, Dict, Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MLPSelector(nn.Module):
+    """
+    Named-layer architecture (bn/fc1/fc2/fc3) with configurable widths.
+    """
+    def __init__(self, d_in: int, h1: int, h2: int, p_drop: float = 0.2, use_bn: bool = True):
+        super().__init__()
+        self.use_bn = use_bn
+        self.bn = nn.BatchNorm1d(d_in) if use_bn else nn.Identity()
+        self.fc1 = nn.Linear(d_in, h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.fc3 = nn.Linear(h2, 1)
+        self.drop = nn.Dropout(p_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.bn(x)
+        x = F.relu(self.fc1(x), inplace=True)
+        x = self.drop(x)
+        x = F.relu(self.fc2(x), inplace=True)
+        x = self.fc3(x)
+        return x.squeeze(-1)
+
+
+def _build_sequential_selector(d_in: int, h1: int, h2: int, p_drop: float = 0.2, use_bn: bool = False) -> nn.Module:
+    """
+    Builds a Sequential that can match *any* MLP widths found in checkpoints.
+    Optionally includes BN as layer 0 (not typical for your current checkpoint).
+    """
+    layers: List[nn.Module] = []
+    if use_bn:
+        layers.append(nn.BatchNorm1d(d_in))  # would introduce state_dict keys "0.*" for BN (only if ckpt matches)
+    layers.extend([
+        nn.Linear(d_in, h1),
+        nn.ReLU(inplace=True),
+        nn.Dropout(p_drop),
+        nn.Linear(h1, h2),
+        nn.ReLU(inplace=True),
+        nn.Linear(h2, 1),
+    ])
+    return nn.Sequential(*layers)
+
 
 class RerankGate:
     def __init__(self, ckpt_dir: str, device: str = "cuda"):
         self.device = device
-        
-        # 1. Load calibration & configuration
+
+        # ---- config
         with open(os.path.join(ckpt_dir, "temp.json"), "r") as f:
             cfg = json.load(f)
-            self.temp = cfg["temperature"]
-            self.K = cfg.get("K", 50) # The K-count the gate was trained on
+        self.temp = float(cfg["temperature"])
+        self.K = int(cfg.get("K", 50))
 
-        # 2. Load Ensemble Members
-        self.models = []
+        # ---- checkpoints
         ckpts = sorted([p for p in os.listdir(ckpt_dir) if p.startswith("selector_m") and p.endswith(".pt")])
+        if not ckpts:
+            raise FileNotFoundError(f"No selector_m*.pt found in {ckpt_dir}")
+
+        self.models: List[nn.Module] = []
         for c in ckpts:
-            obj = torch.load(os.path.join(ckpt_dir, c), map_location=device)
-            m = self._build_model(obj["d_in"])
+            obj = torch.load(os.path.join(ckpt_dir, c), map_location="cpu")
+            if "d_in" not in obj:
+                raise KeyError(f"Checkpoint {c} missing 'd_in'.")
+            d_in = int(obj["d_in"])
 
-            sd = obj["state_dict"]
-            # compatibility: older checkpoints saved as MLPSelector(net=Sequential(...))
-            if any(k.startswith("net.") for k in sd.keys()):
-                sd = {k.replace("net.", "", 1): v for k, v in sd.items()}
+            sd = obj.get("state_dict", obj)
+            sd = self._normalize_state_dict_keys(sd)
 
-            m.load_state_dict(sd, strict=True)
-            m.to(device).eval()
-            self.models.append(m)
+            model = self._build_model_from_state_dict(d_in, sd)
+            model.load_state_dict(sd, strict=True)
+            model.to(self.device).eval()
+            self.models.append(model)
 
-    def _build_model(self, d_in: int):
-        """Matches the recommended robust architecture."""
-        return nn.Sequential(
-            nn.BatchNorm1d(d_in),
-            nn.Linear(d_in, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 1)
+        # feature dimension must match model input dim
+        self.d_in = self._infer_d_in_from_first_model()
+
+    @staticmethod
+    def _normalize_state_dict_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
+        out = {}
+        for k, v in sd.items():
+            if k.startswith("module."):
+                k = k[len("module."):]
+            if k.startswith("net."):
+                k = k[len("net."):]
+            out[k] = v
+        return out
+
+    @staticmethod
+    def _infer_mlp_widths_from_sd(sd: Dict[str, torch.Tensor]) -> Tuple[int, int]:
+        """
+        Infer (h1, h2) from either sequential-style keys or named-layer keys.
+        """
+        keys = set(sd.keys())
+
+        # Sequential-style: 0.weight is first Linear, 3.weight second Linear, 5.weight final Linear
+        # In your checkpoint, 0.weight is [h1, d_in], 3.weight is [h2, h1], 5.weight is [1, h2]
+        if "0.weight" in keys and "3.weight" in keys and "5.weight" in keys:
+            h1 = int(sd["0.weight"].shape[0])
+            h2 = int(sd["3.weight"].shape[0])
+            return h1, h2
+
+        # Named-layer style
+        if "fc1.weight" in keys and "fc2.weight" in keys and "fc3.weight" in keys:
+            h1 = int(sd["fc1.weight"].shape[0])
+            h2 = int(sd["fc2.weight"].shape[0])
+            return h1, h2
+
+        raise RuntimeError(f"Cannot infer MLP widths from checkpoint keys: {sorted(list(keys))[:20]} ...")
+
+    @classmethod
+    def _build_model_from_state_dict(cls, d_in: int, sd: Dict[str, torch.Tensor]) -> nn.Module:
+        keys = set(sd.keys())
+
+        # Case A: sequential checkpoints (your current ones)
+        if "0.weight" in keys and "3.weight" in keys and "5.weight" in keys:
+            h1, h2 = cls._infer_mlp_widths_from_sd(sd)
+            # These ckpts do NOT include BN parameters (based on your earlier error),
+            # so we build without BN so keys line up.
+            return _build_sequential_selector(d_in=d_in, h1=h1, h2=h2, p_drop=0.2, use_bn=False)
+
+        # Case B: named-layer checkpoints
+        if "fc1.weight" in keys and "fc2.weight" in keys and "fc3.weight" in keys:
+            h1, h2 = cls._infer_mlp_widths_from_sd(sd)
+            use_bn = ("bn.weight" in keys) or ("bn.running_mean" in keys)
+            return MLPSelector(d_in=d_in, h1=h1, h2=h2, p_drop=0.2, use_bn=use_bn)
+
+        raise RuntimeError(
+            "Unknown checkpoint architecture. "
+            f"Example keys: {sorted(list(keys))[:20]} ..."
         )
 
-    def extract_features_torch(self, topk_vals: torch.Tensor) -> torch.Tensor:
-        """
-        Vectorized feature extraction directly in PyTorch (GPU).
-        Keeps everything on-device to avoid CPU sync bottlenecks.
-        """
-        v = topk_vals # [1, K]
+    def _infer_d_in_from_first_model(self) -> int:
+        m = self.models[0]
+
+        if isinstance(m, nn.Sequential):
+            # If BN not present, first layer is Linear
+            # If BN present, layer 0 is BN and layer 1 is Linear
+            first_linear = None
+            for layer in m:
+                if isinstance(layer, nn.Linear):
+                    first_linear = layer
+                    break
+            if first_linear is None:
+                raise RuntimeError("Could not find Linear layer in Sequential model.")
+            return int(first_linear.in_features)
+
+        if hasattr(m, "fc1") and isinstance(getattr(m, "fc1"), nn.Linear):
+            return int(m.fc1.in_features)
+
+        raise RuntimeError("Cannot infer d_in from loaded model.")
+
+    def extract_features_torch(self, topk_vals: Union[torch.Tensor, "np.ndarray", list]) -> torch.Tensor:
+        v = topk_vals
+        if not torch.is_tensor(v):
+            v = torch.tensor(v, dtype=torch.float32)
+        v = v.to(self.device, dtype=torch.float32)
+
+        if v.ndim == 1:
+            v = v.unsqueeze(0)
+        if v.ndim != 2:
+            raise ValueError(f"topk_vals must be [K] or [B,K], got {tuple(v.shape)}")
+
+        B, K = v.shape
+        if K < self.K:
+            raise ValueError(f"topk_vals has K={K}, but gate expects at least K={self.K}")
+        if K > self.K:
+            v = v[:, : self.K]
+            K = self.K
+
+        def col(idx: int) -> torch.Tensor:
+            idx = min(idx, K - 1)
+            return v[:, idx:idx + 1]
+
+        v1, v2, v5, v10 = col(0), col(1), col(4), col(9)
+
         mu = v.mean(dim=1, keepdim=True)
-        sig = v.std(dim=1, keepdim=True) + 1e-6
-        z1 = (v[:, [0]] - mu) / sig
+        sig = v.std(dim=1, keepdim=True).clamp_min(1e-6)
+        z1 = (v1 - mu) / sig
 
-        # Margins
-        m12 = v[:, [0]] - v[:, [1]]
-        m15 = v[:, [0]] - v[:, [4]]
-        m110 = v[:, [0]] - v[:, [9]]
+        m12 = v1 - v2
+        m15 = v1 - v5
+        m110 = v1 - v10
 
-        # Aleatoric Uncertainty (Entropy)
         p = F.softmax(v, dim=1)
-        ent = -(p * torch.log(p + 1e-12)).sum(dim=1, keepdim=True)
+        ent = -(p * torch.log(p.clamp_min(1e-12))).sum(dim=1, keepdim=True)
         pmax = p.max(dim=1, keepdim=True).values
 
-        feats = torch.cat([
-            v, v[:, [0]], v[:, [1]], v[:, [4]], v[:, [9]],
-            m12, m15, m110, mu, sig, z1, ent, pmax
-        ], dim=1)
+        feats = torch.cat([v, v1, v2, v5, v10, m12, m15, m110, mu, sig, z1, ent, pmax], dim=1)
+
+        if feats.shape[1] != self.d_in:
+            raise RuntimeError(f"Feature dim mismatch: got {feats.shape[1]} expected {self.d_in}")
+
         return feats
 
     @torch.no_grad()
-    def decide(self, sims, topk_vals,
-               tau: float = 0.5, var_threshold: float = 0.05):
-        """
-        The Main Entry Point.
-        q_desc: [D] or [1, D] descriptor from ViT-GeM
-        ref_database: [N_ref, D] all reference descriptors
-        """
-        # 2. Extract Gate Features
-        gate_in = self.extract_features_torch(topk_vals)
+    def decide(
+        self,
+        topk_vals: Union[torch.Tensor, "np.ndarray", list],
+        tau: float = 0.5,
+        epistemic_var_threshold: float = 0.05,
+        rerank_if_low_prob: bool = True,
+    ) -> Tuple[bool, float, float]:
+        gate_in = self.extract_features_torch(topk_vals)  # [1,D]
 
-        # 3. Ensemble Forward Pass (Epistemic Check)
-    
-        # 3. Ensemble forward pass
-        logits = torch.cat([m(gate_in) for m in self.models], dim=0).squeeze(-1)  # [M]
-        logits = logits / self.temp
-        probs_m = torch.sigmoid(logits)  # [M]
+        member_logits = []
+        for m in self.models:
+            lg = m(gate_in)
+            if lg.ndim == 0:
+                lg = lg.unsqueeze(0)
+            member_logits.append(lg)
 
-        prob_correct = probs_m.mean().item()
-        epistemic_var = probs_m.var(unbiased=False).item()  # var in [0, 0.25]
-        
-        # 4. Aleatoric Check (Probability via Temperature Scaling)
-        mean_logit = torch.mean(logits)
-        prob_correct = 1.0 / (1.0 + torch.exp(-(mean_logit / self.temp)))
+        logits = torch.stack(member_logits, dim=0).squeeze(-1)  # [M]
+        logits = logits / max(self.temp, 1e-6)
 
-        # 5. Logic: Rerank if (Low Confidence) OR (High Disagreement)
-        should_rerank = (prob_correct < tau) or (epistemic_var > var_threshold)
+        probs_m = torch.sigmoid(logits)
+        prob_pos = float(probs_m.mean().item())
+        epistemic_var = float(probs_m.var(unbiased=False).item())
 
-        return should_rerank, prob_correct, epistemic_var
+        if rerank_if_low_prob:
+            should_rerank = (prob_pos < tau) or (epistemic_var > epistemic_var_threshold)
+        else:
+            should_rerank = (prob_pos >= tau) or (epistemic_var > epistemic_var_threshold)
+
+        return should_rerank, prob_pos, epistemic_var

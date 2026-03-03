@@ -86,6 +86,7 @@ libcufile-dev = "*"
 libcufft-dev = "*"
 libcurand-dev = "*"
 libcusolver-dev = "*"
+onnxscript = "*"
 
 [target.linux-aarch64.dependencies]
 python = "*"

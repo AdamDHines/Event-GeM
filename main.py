@@ -50,7 +50,7 @@ def main():
                             help="Which results to evaluate: original, reranked, or both")
     parser.add_argument("--reference_depth_dir", type=str, default="/media/adam/vprdatasets/edvpr/sunset2/raw16",
                             help="Directory containing reference depth maps (if using depth-based re-ranking)")
-    parser.add_argument("--query_depth_dir", type=str, default="/media/adam/vprdatasets/edvpr/sunset1/raw16",
+    parser.add_argument("--query_depth_dir", type=str, default="/media/adam/vprdatasets/edvpr/daytime/raw16",
                             help="Directory containing query depth maps (if using depth-based re-ranking)")
     parser.add_argument("--depth_pattern", type=str, default="depth_{:06d}.png",
                             help="File pattern for depth maps")
