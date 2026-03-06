@@ -8,19 +8,12 @@ def main():
     parser = argparse.ArgumentParser(description="Event-GeM: Pre-trained feature extraction and 2D-homology re-reanking for visual place recognition")
     
     # Dataset parameters
-    # parser.add_argument("--dataset", "-d", type=str,  
-    #                         choices=["brisbane_event", "nsavp", "fast_slow"],
-    #                         help="Dataset to use for evaluation")
-    # parser.add_argument("--reference", "-r", type=str, 
-    #                         help="Reference directory to use for evaluation")
-    # parser.add_argument("--query", "-q", type=str, 
-    #                         help="Query directory to use for evaluation")
-    parser.add_argument("--dataset", type=str, default="brisbane_event",
+    parser.add_argument("--dataset", "-d", type=str,  
                             choices=["brisbane_event", "nsavp", "fast_slow"],
                             help="Dataset to use for evaluation")
-    parser.add_argument("--reference",  type=str, default="sunset2",
+    parser.add_argument("--reference", "-r", type=str, 
                             help="Reference directory to use for evaluation")
-    parser.add_argument("--query", type=str, default="sunset1",
+    parser.add_argument("--query", "-q", type=str, 
                             help="Query directory to use for evaluation")
     parser.add_argument("--recon-msec", type=int, default=50,
                             help="Reconstruction time window in milliseconds for event datasets")
@@ -38,7 +31,7 @@ def main():
                             help="RANSAC pixel threshold (e.g. 3-5 px)")
     parser.add_argument("--inlier-weight", type=float, default=0.05, 
                             help="Distance subtraction per inlier")
-    parser.add_argument("--backbone_batch-size", type=int, default=32,
+    parser.add_argument("--backbone_batch-size", type=int, default=1,
                             help="Batch size for feature extraction")
     parser.add_argument("--keypoint_batch-size", type=int, default=16,
                             help="Batch size for feature extraction")

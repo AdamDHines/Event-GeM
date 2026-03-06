@@ -1119,7 +1119,7 @@ def batched_ransac_rerank(
     cand_indices: np.ndarray, 
     off_left: int,
     off_top: int,
-    max_matches: int = 512,
+    max_matches: int = 170,
     ratio_thresh: float = 0.8,
     iterations: int = 128,      # Increased for better convergence
     thresh_px: float = 5.0
@@ -1164,41 +1164,62 @@ def batched_ransac_rerank(
     gathered_pass = torch.gather(pass_ratio, 1, best_m_idx)
     num_valid = gathered_pass.sum(dim=1).clamp(min=4)
 
-    # 4. NORMALIZATION (Essential for DLT stability)
-    # DLT fails if coords are [0, 1000]. We normalize to ~[-1, 1]
-    norm_factor = max(q_kpts.max(), r_kpts.max())
-    src_pts_n = src_pts / norm_factor
-    dst_pts_n = dst_pts / norm_factor
+    # 3.5 CHEAP GEOMETRY: translation-consistency inliers (no homography)
+    # displacement vectors per match
+    d = dst_pts - src_pts                      # [B, M, 2]
+    mask = gathered_pass                       # [B, M] bool
 
-    # 5. VECTORIZED RANSAC
-    # (Sampling logic remains similar, but use normalized points for DLT)
-    rand_idx = (torch.rand((B, iterations, 4), device=device) * num_valid.view(B, 1, 1)).long()
-    batch_off = torch.arange(B, device=device).view(B, 1, 1) * max_matches
-    g_idx = (rand_idx + batch_off).view(-1)
-    
-    ps_src = src_pts_n.view(-1, 2)[g_idx].view(-1, 4, 2)
-    ps_dst = dst_pts_n.view(-1, 2)[g_idx].view(-1, 4, 2)
-    
-    H_n = find_homography_dlt(ps_src, ps_dst) # [B*iter, 3, 3]
-    
-    # 6. VERIFY (Use original scale for thresholding)
-    H_view = H_n.view(B, iterations, 3, 3)
-    # To use original thresh_px, we need to "un-normalize" H 
-    # but it's easier to just warp the normalized points and scale back
-    ones = torch.ones((B, 1, max_matches, 1), device=device)
-    src_h = torch.cat([src_pts_n.unsqueeze(1), ones], dim=3).transpose(2, 3)
-    
-    warped_h = H_view @ src_h
-    warped = (warped_h[:, :, :2, :] / (warped_h[:, :, 2:3, :] + 1e-8)) * norm_factor
-    
-    dist = torch.norm(warped - dst_pts.unsqueeze(1).transpose(2, 3), dim=2) # [B, iter, M]
-    
-    # Final Inlier Count
-    is_inlier = (dist < thresh_px) & gathered_pass.unsqueeze(1)
-    counts = is_inlier.sum(dim=2)
-    best_counts, _ = counts.max(dim=1)
+    # require >=4 valid matches; else score 0
+    ok = (mask.sum(dim=1) >= 4)
 
-    return best_counts.cpu().numpy().astype(np.int32)
+    # masked median displacement (use NaNs so nanmedian ignores invalids)
+    d_masked = d.masked_fill(~mask.unsqueeze(-1), float("nan"))  # [B, M, 2]
+    d_med = torch.nanmedian(d_masked, dim=1).values              # [B, 2] median dx,dy
+
+    # residual = how far each match's displacement is from the median displacement
+    res = torch.linalg.norm(d - d_med.unsqueeze(1), dim=2)        # [B, M]
+
+    # inliers: consistent displacements within thresh_px
+    inliers = ((res < thresh_px) & mask).sum(dim=1)              # [B]
+    inliers = torch.where(ok, inliers, torch.zeros_like(inliers))
+
+    return inliers.cpu().numpy().astype(np.int32)
+
+    # # 4. NORMALIZATION (Essential for DLT stability)
+    # # DLT fails if coords are [0, 1000]. We normalize to ~[-1, 1]
+    # norm_factor = max(q_kpts.max(), r_kpts.max())
+    # src_pts_n = src_pts / norm_factor
+    # dst_pts_n = dst_pts / norm_factor
+
+    # # 5. VECTORIZED RANSAC
+    # # (Sampling logic remains similar, but use normalized points for DLT)
+    # rand_idx = (torch.rand((B, iterations, 4), device=device) * num_valid.view(B, 1, 1)).long()
+    # batch_off = torch.arange(B, device=device).view(B, 1, 1) * max_matches
+    # g_idx = (rand_idx + batch_off).view(-1)
+    
+    # ps_src = src_pts_n.view(-1, 2)[g_idx].view(-1, 4, 2)
+    # ps_dst = dst_pts_n.view(-1, 2)[g_idx].view(-1, 4, 2)
+    
+    # H_n = find_homography_dlt(ps_src, ps_dst) # [B*iter, 3, 3]
+    
+    # # 6. VERIFY (Use original scale for thresholding)
+    # H_view = H_n.view(B, iterations, 3, 3)
+    # # To use original thresh_px, we need to "un-normalize" H 
+    # # but it's easier to just warp the normalized points and scale back
+    # ones = torch.ones((B, 1, max_matches, 1), device=device)
+    # src_h = torch.cat([src_pts_n.unsqueeze(1), ones], dim=3).transpose(2, 3)
+    
+    # warped_h = H_view @ src_h
+    # warped = (warped_h[:, :, :2, :] / (warped_h[:, :, 2:3, :] + 1e-8)) * norm_factor
+    
+    # dist = torch.norm(warped - dst_pts.unsqueeze(1).transpose(2, 3), dim=2) # [B, iter, M]
+    
+    # # Final Inlier Count
+    # is_inlier = (dist < thresh_px) & gathered_pass.unsqueeze(1)
+    # counts = is_inlier.sum(dim=2)
+    # best_counts, _ = counts.max(dim=1)
+
+    # return best_counts.cpu().numpy().astype(np.int32)
 
 def compute_inliers_2d_usac_fast_from_tensors(
     q_kpts_yx_t: torch.Tensor,   # [Nq,2] yx on GPU ok
@@ -1238,7 +1259,7 @@ def compute_inliers_2d_usac_fast_from_tensors(
     for m_n in matches:
         if len(m_n) == 2 and m_n[0].distance < ratio * m_n[1].distance:
             good.append(m_n[0])
-
+    print(good)
     if len(good) < 4:
         return 0
 
@@ -1298,9 +1319,9 @@ def usac_fast_inliers_from_refstore(
     r_kpts_t, r_desc_t, r_mask_t = ref_store.get_batch_tensor(cand_ids, device=q_kpts_yx_t.device)
 
     # move refs to CPU numpy for OpenCV
-    r_kpts = r_kpts_t.astype(np.float32)
-    r_desc = r_desc_t.astype(np.float32)
-    r_mask = r_mask_t.astype(bool)
+    r_kpts = r_kpts_t.detach().cpu().numpy().astype(np.float32)
+    r_desc = r_desc_t.detach().cpu().numpy().astype(np.float32)
+    r_mask = r_mask_t.detach().cpu().numpy().astype(bool)
 
     matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
 
@@ -1327,7 +1348,7 @@ def usac_fast_inliers_from_refstore(
 
         if len(good) < 4:
             continue
-
+               
         src_pts = np.float32([kpts_q[m.queryIdx] for m in good]).reshape(-1, 1, 2)
         dst_pts = np.float32([kpts_r[m.trainIdx] for m in good]).reshape(-1, 1, 2)
 

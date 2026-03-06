@@ -15,8 +15,6 @@ eventgem = {cmd = "pixi run python3 main.py"}
 inference = {cmd = "pixi run python3 eventgem/inference.py"}
 inference-jetson = {cmd = "pixi run python3 eventgem/inference-jetson.py"}
 
-install-trt = "pip install --extra-index-url https://pypi.nvidia.com tensorrt-cu12"
-
 [target.linux-64.dependencies]
 python = ">3.8"
 numpy = "*"
