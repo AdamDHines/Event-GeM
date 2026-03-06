@@ -40,6 +40,7 @@ from eventgem.external.backbone.model.ours_model.ours_model_pretrain import vit_
 from models.super_event import SuperEvent, SuperEventFullRes
 from models.util import fast_nms
 
+import matplotlib.pyplot as plt
 
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -64,9 +65,9 @@ class EventGeM:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
-    def GeM(self, feats, p=5):
+    def GeM(self, feats, p=5.0):
         return F.avg_pool2d((feats.clamp(min=1e-6)).pow(p), (feats.shape[-2], feats.shape[-1])).pow(1.0/p)
-
+    
     def extract_features(self):
         # Define backbone model (This is a ViT, as confirmed by your checkpoint)
         backbone = vit_contrastive_patch16_small(mask_ratio=0.0, in_chans=2, num_classes=512)
@@ -116,14 +117,14 @@ class EventGeM:
         query_dataset = EventGeMData(self.query_path)
         ref_loader = torch.utils.data.DataLoader(ref_dataset, batch_size=self.backbone_batch_size, shuffle=False, num_workers=4)
         query_loader = torch.utils.data.DataLoader(query_dataset, batch_size=self.backbone_batch_size, shuffle=False, num_workers=4)
-
-        # Run feature extraction for reference and query sets
-        outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")
-        os.makedirs(outdir, exist_ok=True)
-
+        # --- NEW: VISUALIZATION CALL ---
+        vis_out = os.path.join("/home/adam/heatmaps")
+        os.makedirs(vis_out, exist_ok=True)
         # Reference events
         ref_feats = []
-        for events in tqdm(ref_loader, desc="Extracting reference features", unit="batch"):
+        for idx, events in enumerate(tqdm(ref_loader, desc="Extracting reference features", unit="batch")):
+            # torch copy to a new variable
+            events_init = events.clone()
             events = events.to(self.device)
             events = backbone.patch_embed(events)
             events = events + backbone.pos_embed
@@ -140,7 +141,7 @@ class EventGeM:
             feats = self.GeM(patch_tokens)
             ref_feats.append(feats.squeeze(-1).squeeze(-1).detach().cpu())
         ref_feats = torch.cat(ref_feats, dim=0)
-        torch.save(ref_feats, os.path.join(outdir, f"{self.dataset}_{self.reference}_features.pt"))
+        torch.save(ref_feats, os.path.join(self.outdir, f"{self.dataset}_{self.reference}_features.pt"))
 
         # Query events
         query_feats = []
@@ -161,13 +162,13 @@ class EventGeM:
             feats = self.GeM(patch_tokens)
             query_feats.append(feats.squeeze(-1).squeeze(-1).detach().cpu())
         query_feats = torch.cat(query_feats, dim=0)
-        torch.save(query_feats, os.path.join(outdir, f"{self.dataset}_{self.query}_features.pt"))
+        torch.save(query_feats, os.path.join(self.outdir, f"{self.dataset}_{self.query}_features.pt"))
 
         # Compute cosine similarity
         ref_feats = F.normalize(ref_feats, p=2, dim=1)
         query_feats = F.normalize(query_feats, p=2, dim=1)
         sim_matrix = torch.matmul(query_feats, ref_feats.t()).T
-        torch.save(sim_matrix, os.path.join(outdir, f"{self.dataset}_{self.reference}_{self.query}_similarity.pt"))
+        torch.save(sim_matrix, os.path.join(self.outdir, f"{self.dataset}_{self.reference}_{self.query}_similarity.pt"))
 
     def feature_inference(self):
         # Check that the specified datasets exist - need frame reconstructued directories
@@ -175,8 +176,13 @@ class EventGeM:
         self.reference_path = os.path.join(root, self.dataset, self.reference, f"{self.reference}-frames-{self.recon_msec}")
         self.query_path = os.path.join(root, self.dataset, self.query, f"{self.query}-frames-{self.recon_msec}")
         update_config(root, self.dataset, self.reference, self.query, time=self.recon_msec)
-
-        self.extract_features()
+        # Run feature extraction for reference and query sets
+        self.outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")
+        os.makedirs(self.outdir, exist_ok=True)
+        if self.rerun_features or not os.path.exists(self.outdir):
+            self.extract_features()
+        else:
+            print("[INFO] Skipping feature extraction (already exists). Set --rerun-features to force re-extraction.")
 
     # ----------------------------------------------------------
     # SuperEvent / MCTS helpers
@@ -725,7 +731,7 @@ class EventGeM:
         # 4. Perform Keypoint Re-ranking
         self.rerank()
         # save the self.keypoint_ranked matrix
-        np.save('keypoint_reranked.npy', self.keypoint_reranked)
+        torch.save(self.keypoint_reranked, os.path.join(self.outdir, f"{self.dataset}_{self.reference}_{self.query}_similarity_kp.pt"))
 
         # 5. Optional: Chain Depth Re-ranking
         if mode == "both":

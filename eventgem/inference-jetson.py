@@ -456,7 +456,7 @@ def main():
                 t_total = (time.perf_counter() - cpu0) * 1000.0
                 t_read_list.append(t_read_ms)
 
-                if (frame_idx % 100) == 0:
+                if (frame_idx % 1) == 0:
                     hz = 1000.0 / max(1e-6, t_total)
                     # just print the total time lapsed
                     print(f"[LIVE] {frame_idx:5d} total={t_total:.1f}ms ({hz:.1f} Hz)", flush=True)

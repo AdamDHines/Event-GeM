@@ -130,7 +130,7 @@ def compute_inliers_2d(q_data, r_data, matcher, ransac_thresh):
     # 3. Geometric Verification (Homography + RANSAC)
     # RANSAC thresh: max reprojection error in pixels (e.g., 3.0 to 5.0)
     try:
-        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransac_thresh)
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.USAC_FAST, ransac_thresh, maxIters=100)
     except cv2.error:
         return 0
 

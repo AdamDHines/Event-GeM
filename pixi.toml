@@ -10,10 +10,10 @@ cuda = "12"
 libc = {family="glibc", version="2.35"}
 
 [tasks]
+eventgem = {cmd = "pixi run python3 main.py"}
+
 inference = {cmd = "pixi run python3 eventgem/inference.py"}
 inference-jetson = {cmd = "pixi run python3 eventgem/inference-jetson.py"}
-
-install-trt = "pip install --extra-index-url https://pypi.nvidia.com tensorrt-cu12"
 
 [target.linux-64.dependencies]
 python = ">3.8"
@@ -84,6 +84,7 @@ libcufile-dev = "*"
 libcufft-dev = "*"
 libcurand-dev = "*"
 libcusolver-dev = "*"
+onnxscript = "*"
 
 [target.linux-aarch64.dependencies]
 python = "*"
