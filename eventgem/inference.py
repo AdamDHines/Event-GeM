@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-import argparse
+import gzip
 import time
 from pathlib import Path
-import streamutils.stream as stream
+import eventgem.streamutils.stream as stream
 import os
-import streamutils.convert_ref as convert_ref
-
-import ctypes
-
+import eventgem.streamutils.convert_ref as convert_ref
+import tarfile 
+import requests
+import shutil
 
 import sys
 import h5py
@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from external.depthanyevent.models import fetch_model  # from the DepthAnyEvent repo
+from eventgem.external.depthanyevent.models import fetch_model  # from the DepthAnyEvent repo
 import imageio
 import matplotlib.pyplot as plt
 THIS_DIR = Path(__file__).resolve().parent
@@ -26,219 +26,113 @@ SUPEREVENT_ROOT = THIS_DIR / "external" / "superevent"
 sys.path.insert(0, str(SUPEREVENT_ROOT))
 sys.path.insert(0, str(BACKBONE_ROOT))
 
-lib = ctypes.CDLL("/home/adam/repo/Event-GeM/libtrt_runner.so")
-
-class TrtHandle(ctypes.Structure):
-    pass
-
-lib.trt_load.restype = ctypes.POINTER(TrtHandle)
-lib.trt_load.argtypes = [ctypes.c_char_p]
-
-lib.trt_num_io.restype = ctypes.c_int
-lib.trt_num_io.argtypes = [ctypes.POINTER(TrtHandle)]
-
-lib.trt_is_input.restype = ctypes.c_int
-lib.trt_is_input.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int]
-
-lib.trt_get_name.restype = ctypes.c_int
-lib.trt_get_name.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-
-lib.trt_get_dtype.restype = ctypes.c_int
-lib.trt_get_dtype.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int]
-
-lib.trt_get_ndim.restype = ctypes.c_int
-lib.trt_get_ndim.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int]
-
-lib.trt_get_dims.restype = ctypes.c_int
-lib.trt_get_dims.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
-
-lib.trt_set_ptr.restype = ctypes.c_int
-lib.trt_set_ptr.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_int, ctypes.c_void_p]
-
-lib.trt_set_stream.argtypes = [ctypes.POINTER(TrtHandle), ctypes.c_ulonglong]
-
-lib.trt_execute.restype = ctypes.c_int
-lib.trt_execute.argtypes = [ctypes.POINTER(TrtHandle)]
-
-lib.trt_destroy.argtypes = [ctypes.POINTER(TrtHandle)]
-
-# TRT DataType enum -> torch dtype (common cases)
-TRT_TO_TORCH = {
-    0: torch.float32,  # kFLOAT
-    1: torch.float16,  # kHALF
-    2: torch.int8,     # kINT8
-    3: torch.int32,    # kINT32
-    4: torch.bool,     # kBOOL
-}
-
-class TRTEngineCUDA12:
-    def __init__(self, engine_path: str):
-        self.h = lib.trt_load(engine_path.encode())
-        if not self.h:
-            raise RuntimeError("Failed to load engine (version mismatch?)")
-
-        self.n = lib.trt_num_io(self.h)
-        self.inputs = []
-        self.outputs = []
-        self._i_idx = []
-        self._o_idx = []
-        
-
-        # Static-shape allocation (throws if any dim is -1)
-        for i in range(self.n):
-            dt = lib.trt_get_dtype(self.h, i)
-            if dt not in TRT_TO_TORCH:
-                raise RuntimeError(f"Unsupported TRT dtype enum {dt} at io[{i}]")
-            torch_dtype = TRT_TO_TORCH[dt]
-
-            ndim = lib.trt_get_ndim(self.h, i)
-            buf = (ctypes.c_int * 16)()
-            ok = lib.trt_get_dims(self.h, i, buf, 16)
-            if not ok:
-                raise RuntimeError(f"Failed reading dims for io[{i}]")
-            shape = [buf[k] for k in range(ndim)]
-            if any(s < 0 for s in shape):
-                raise RuntimeError(f"io[{i}] is dynamic shape {shape}; handle dynamic separately")
-
-            t = torch.empty(tuple(shape), device="cuda", dtype=torch_dtype)
-            ok = lib.trt_set_ptr(self.h, i, ctypes.c_void_p(t.data_ptr()))
-            if not ok:
-                raise RuntimeError(f"Failed setTensorAddress for io[{i}]")
-
-            if lib.trt_is_input(self.h, i):
-                self.inputs.append(t); self._i_idx.append(i)
-            else:
-                self.outputs.append(t); self._o_idx.append(i)
-
-    def __call__(self, *args):
-        for k, a in enumerate(args):
-            self.inputs[k].copy_(a)
-
-        # run on the current PyTorch CUDA stream
-        stream = torch.cuda.current_stream().cuda_stream
-        lib.trt_set_stream(self.h, int(stream))
-
-        ok = lib.trt_execute(self.h)
-        if ok != 1:
-            raise RuntimeError("enqueueV3 failed")
-        return self.outputs[0] if len(self.outputs) == 1 else self.outputs
-
-    def close(self):
-        if self.h:
-            lib.trt_destroy(self.h)
-            self.h = None
-
 # ---------------------------
 # Main
 # ---------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    # Dataset parameters
-    ap.add_argument("--hdf5", type=str, required=True, 
-                    help="Path to the input hdf5 file containing events")
-    ap.add_argument("--dataset", type=str, required=True,
-                    help="Name of the dataset")
-    ap.add_argument("--reference", type=str, required=True,
-                    help="Name of the reference")
-    ap.add_argument("--query", type=str, required=True,
-                    help="Name of the query")
-    ap.add_argument("--time-scale", type=float, default=1e-9,
-                    help="Time scale for event accumulation")
-    ap.add_argument("--chunk-size", type=int, default=250_000,
-                    help="Number of events to process in each chunk (for streaming from hdf5)")
-    ap.add_argument("--start-time", type=float, default=None,
-                    help="Start time for event processing (in seconds)")
-    ap.add_argument("--max-frames", type=int, default=None,
-                    help="Maximum number of frames to process (None for no limit)")
-    ap.add_argument("--infer-full-scan", action="store_true",
-                help="Whether to run inference on the full scan of the dataset (instead of streaming in chunks)")
+def stream_file(args):
 
-    # Method parameters
-    ap.add_argument("--method", type=str,  default="eventgem", 
-                choices=["eventgem", "eventgem-d", "ecdpt", "superevent", "lens", "sparse", "eventvlad"],
-                help="Which method to run (for ablation or comparison)")
-    ap.add_argument('--extract-reference', action='store_true', 
-                    help="Whether to extract reference information (for initial mapping)")
-    ap.add_argument('--features-dir', type=str, default='features',
-                    help="Directory to save extracted features (if --extract-reference is set)")
-    ap.add_argument('--keypoint-dir', type=str, default='keypoints',
-                    help="Directory to save extracted keypoints (if --extract-reference is set)")
-    ap.add_argument('--depth-dir', type=str, default='depth',
-                    help="Directory to save extracted depth maps (if --extract-reference is set)")
-    ap.add_argument('--onnx', action='store_true',
-                    help="Whether to use ONNX Runtime for ViT inference (instead of PyTorch, GPU only)")
-    
-    # ViT backbone parameters
-    ap.add_argument("--backbone-ckpt", type=str, default="./eventgem/ckpt/pr.pt",
-                    help="Path to the ViT backbone checkpoint to load")
-    ap.add_argument("--resize", type=str, default="nearest", choices=["nearest", "bilinear"],
-                    help="Resize method to use when resizing input event frames for ViT (if needed)")
-    ap.add_argument("--amp", action="store_true",
-                    help="Whether to use automatic mixed precision for ViT inference (GPU only)")
-    ap.add_argument("--dt-ms", type=float, default=50,
-                    help="Time window (in ms) to accumulate events for each inference step")
+    # If extracting features, set sequence to reference
+    sequence = args.reference if args.extract_reference else args.query
 
-    # SuperEvent parameters
-    ap.add_argument("--retrieval-k", type=int, default=50,
-                    help="Number of top candidates to retrieve from ViT before re-ranking")
-    ap.add_argument("--se-config", type=str, default="eventgem/external/superevent/config/super_event.yaml",
-                    help="Path to the SuperEvent config file")
-    ap.add_argument("--se-weights", type=str, default="eventgem/external/superevent/saved_models/super_event_weights.pth",
-                    help="Path to the SuperEvent weights file")
-    ap.add_argument("--se-topk", type=int, default=170,
-                    help="Number of top candidates to keep after re-ranking")
-    ap.add_argument("--mcts-windows-ms", type=float, nargs="+", default=[10, 20, 30, 40, 50],
-                    help="List of time windows (in ms) for MCTS")
-    ap.add_argument("--ref-kp-pattern", type=str, default="ref_kp_{:05d}.npz",
-                    help="Pattern to match reference keypoint files (should include a placeholder for candidate ID)")
-    ap.add_argument("--ref-kp-cache", type=int, default=2048,
-                    help="Size of the cache for reference keypoints")
-    ap.add_argument("--ransac-thresh", type=float, default=5.0,
-                    help="RANSAC threshold for keypoint matching")
-    ap.add_argument("--inlier-weight", type=float, default=0.05,
-                    help="Weight for inliers in keypoint matching")
-    ap.add_argument("--match-ratio", type=float, default=0.8,
-                    help="Match ratio for keypoint matching")
-    
-    # Depth parameters
-    ap.add_argument('--depth-loadmodel', default='eventgem/external/depthanyevent/models/rec_dav2/synth/synth.pth',
-                        help='Path to model checkpoint')
-    ap.add_argument('--depth-config', type=str, default='eventgem/external/depthanyevent/configs/test/recdav2/rec_dav2_mvsec_test.json',
-                        help='Path to config file. If not specified, config from model folder/checkpoint is used')
-    ap.add_argument('--depthp-resize', type=int, default=28,
-                    help="Resize parameter for depth prediction (input will be resized to (depthp_resize, depthp_resize) before running depth model)")
-    ap.add_argument("--depth-pattern", type=str, default="depth_{:06d}.png",
-                    help="File pattern for depth maps")
-    # Evaluation metrics and parameters
-    ap.add_argument("--target-hz", type=float, default=20.0)
-    ap.add_argument("--gt-file", type=str, default=None,
-                    help="Path to the ground truth file")
-
-    # Direct streaming parameters
-    ap.add_argument('--live-davis', action='store_true',
-                    help="Whether to run on live DAVIS stream instead of hdf5")
-
-    args = ap.parse_args()
-
+    hdf5_path = Path(f"{args.data_root}/{args.dataset}/{sequence}/{sequence}.hdf5")
     # File path for hdf5
     if not args.live_davis:
-        hdf5_path = Path(args.hdf5)
         if not hdf5_path.exists():
             raise FileNotFoundError(hdf5_path)
     
     # If extracting reference information, set storage paths
     # if args.extract_reference:
-    ref_feats_dir = Path(args.features_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
+    ref_feats_dir = Path(args.feature_out) / args.dataset / f"{args.reference}-{args.dt_ms}"
     ref_feats_file = ref_feats_dir / f"{args.dataset}_{args.reference}_features.pt"
-    print(ref_feats_file)
-    ref_kp_dir = Path(args.keypoint_dir) / args.dataset / f"{args.reference}-{args.dt_ms}" / f"kps_{args.reference}"
-    ref_depth_dir = Path(args.depth_dir) / args.dataset / f"{args.reference}-{args.dt_ms}"
+
+    ref_kp_dir = Path(args.keypoint_out) / args.dataset / f"{args.reference}-{args.dt_ms}" / f"kps_{args.reference}"
+    ref_depth_dir = Path(args.depth_out) / args.dataset / f"{args.reference}-{args.dt_ms}"
     ref_feats_dir.mkdir(parents=True, exist_ok=True)
-    ref_kp_dir.mkdir(parents=True, exist_ok=True)
+    if not args.demo:
+        ref_kp_dir.mkdir(parents=True, exist_ok=True)
     ref_depth_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Extracted reference features will be saved to: {ref_feats_dir}")
     print(f"[INFO] Extracted reference keypoints will be saved to: {ref_kp_dir}")
     print(f"[INFO] Extracted reference depth maps will be saved to: {ref_depth_dir}")
+    gt_path = f"{args.data_root}/{args.dataset}/ground_truth/{args.reference}_{args.query}_GT.npy"
+    # If running the demo, download the reference features and kps
+    if args.demo:
+        feat_link = "https://huggingface.co/datasets/AdamHines/EventGeM/resolve/main/brisbane_event_sunset2_features.pt"
+        kps_link = "https://huggingface.co/datasets/AdamHines/EventGeM/resolve/main/kps_sunset2.tar.gz"
+        gt_link = "https://huggingface.co/datasets/AdamHines/EventGeM/resolve/main/sunset2_sunset1_GT.npy"
+
+        args.kp_pattern = "ref_kp_{:05d}.npz"
+        # download reference features to the ref_feats_file location
+        if not ref_feats_file.exists():
+            print(f"[INFO] Downloading reference features from {feat_link}...")
+            response = requests.get(feat_link)
+            with open(ref_feats_file, "wb") as f:
+                f.write(response.content)
+        # download and extract reference keypoints to the ref_kp_dir location
+        if not ref_kp_dir.exists():
+            ref_kp_dir.mkdir(parents=True, exist_ok=True)
+
+            archive_path = ref_kp_dir / "kps_sunset2.tar.gz"
+
+            print(f"[INFO] Downloading {kps_link} -> {archive_path}")
+
+            with requests.get(
+                kps_link,
+                stream=True,
+                allow_redirects=True,
+                timeout=120,
+                headers={"User-Agent": "Mozilla/5.0"},
+            ) as r:
+                r.raise_for_status()
+
+                with open(archive_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+
+            print(f"[INFO] Downloaded size: {archive_path.stat().st_size} bytes")
+
+            with gzip.open(archive_path, "rb") as f:
+                f.read(1)
+
+            print("[INFO] Valid gzip file")
+
+            if not tarfile.is_tarfile(archive_path):
+                raise RuntimeError(f"Downloaded file is not a valid tar archive: {archive_path}")
+
+            extracted = 0
+            with tarfile.open(archive_path, "r:gz") as tar:
+                members = tar.getmembers()
+                print(f"[INFO] Archive contents (first 10): {[m.name for m in members[:10]]}")
+
+                for member in members:
+                    if not member.isfile():
+                        continue
+                    if not member.name.endswith(".npz"):
+                        continue
+
+                    out_path = ref_kp_dir / Path(member.name).name  # strip all directories
+
+                    src = tar.extractfile(member)
+                    if src is None:
+                        continue
+
+                    with src, open(out_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+
+                    extracted += 1
+
+            print(f"[INFO] Extracted {extracted} .npz files directly to {ref_kp_dir}")
+
+        # download GT file to the dataset output directory
+        if not Path(gt_path).exists():
+            # make the ground truth directory if it doesn't exist
+            gt_dir = Path(gt_path).parent
+            gt_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[INFO] Downloading GT file from {gt_link}...")
+            response = requests.get(gt_link)
+            with open(gt_path, "wb") as f:
+                f.write(response.content)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
@@ -250,7 +144,7 @@ def main():
     if not args.live_davis:
         with h5py.File(hdf5_path, "r") as f:
             x_dset, y_dset, t_dset, p_dset = stream.find_event_datasets(f)
-            H, W = stream.infer_resolution(x_dset, y_dset, args.chunk_size, args.infer_full_scan)
+            H, W = stream.infer_resolution(x_dset, y_dset, args.chunk_size)
             
             t0_raw = int(t_dset[0]); tN_raw = int(t_dset[-1])
             print(f"[INFO] Sensor: {H}x{W}")
@@ -261,30 +155,23 @@ def main():
     print(args.method)
     # Load the corresponding model to run the inference on
     if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
-        if args.onnx:
-            vit = TRTEngineCUDA12("/home/adam/repo/Event-GeM/vit.engine")
-        else:
-            vit = stream.load_vit_backbone(args.backbone_ckpt, device)
+        vit = stream.load_vit_backbone(args.backbone_ckpt, device)
         vitH, vitW = 224, 224
         print(f"[INFO] ViT expects ~ {vitH}x{vitW}")
         if not args.extract_reference:
-            ref_db = stream.load_ref_vit_db(ref_feats_file, device=device, dtype=torch.float16 if args.amp else torch.float32)
+            ref_db = stream.load_ref_vit_db(ref_feats_file, device=device, dtype=torch.float32)
         stream_vit = torch.cuda.Stream()
 
     if args.method in ["superevent", "eventgem", "eventgem-d"]:
-        if args.onnx:
-            se_model = TRTEngineCUDA12("/home/adam/repo/Event-GeM/superevent.engine")
-            _, se_cfg = stream.build_superevent_model(Path(args.se_config), Path(args.se_weights), device)
-        else:
-            se_model, se_cfg = stream.build_superevent_model(Path(args.se_config), Path(args.se_weights), device)
+        se_model, se_cfg = stream.build_superevent_model(Path(args.se_config), Path(args.se_weights), device)
         from models.util import fast_nms
         off_top, off_left, _, _, h_end, w_end, Hc, Wc = stream.compute_superevent_crop_offsets(H, W, se_cfg)
         print(f"[INFO] SuperEvent crop: top={off_top} left={off_left} -> {Hc}x{Wc}")
         stream_se = torch.cuda.Stream()
-        windows_sec = torch.tensor(np.array(args.mcts_windows_ms, dtype=np.float32) * 1e-3, device=device)
+        windows_sec = torch.tensor(np.array(args.mcts_time, dtype=np.float32) * 1e-3, device=device)
         if args.method == "superevent":
             # Loading the reference keypoint descriptors
-            ref_descs = stream.preload_ref_descs(ref_kp_dir, args.ref_kp_pattern)
+            ref_descs = stream.preload_ref_descs(ref_kp_dir, args.kp_pattern)
 
     if args.method == "eventgem-d":
         # Load model + config
@@ -347,9 +234,9 @@ def main():
         
         ref_store = stream.BatchedRefStore(
             ref_dir=Path(ref_kp_dir),
-            pattern=args.ref_kp_pattern,
+            pattern=args.kp_pattern,
             cache_size=args.ref_kp_cache,
-            max_kpts=args.se_topk
+            max_kpts=args.se_topk,
         )
     raw_logger = None
 
@@ -380,7 +267,6 @@ def main():
     wall0 = time.perf_counter()
 
     print("[INFO] Starting Loop...", flush=True)
-    gate = stream.RerankGate(ckpt_dir="/home/adam/repo/Event-GeM/morning", device=device)
     # Pre-load your reference descriptors to GPU
     reranked_cols = []
     sims = []
@@ -394,18 +280,9 @@ def main():
                 davis1.record(stream_davis)
         else:
             event_iter = stream.stream_event_windows_raw(
-                hdf5_path, args.dt_ms, args.chunk_size, args.time_scale, args.start_time, args.max_frames
+                hdf5_path, args.dt_ms, args.chunk_size, args.time_scale, args.start_time, args.skip
             )
-            # -----------------------------
-        # Gate/Rerank output stash for evaluation
-        # Stores final (cand_ids, cand_dists) for EVERY query frame
-        # -----------------------------
-        stash_topk = (not args.extract_reference) and (args.method in ["eventgem", "eventgem-d"])
-        cand_ids_all: list[np.ndarray] = []
-        cand_dists_all: list[np.ndarray] = []
-        frame_ids_all: list[int] = []
-        rerank_mask_all: list[bool] = []
-        K_eval = int(args.retrieval_k)
+
         new_cols = []
         for (_, _, t_ref_raw, x, y, t_raw, p, frame_idx, t_read_ms) in event_iter:
             cpu0 = time.perf_counter()
@@ -416,9 +293,6 @@ def main():
             y = torch.from_numpy(y).to(device)
             t_raw = torch.from_numpy(t_raw).to(device)
             p = torch.from_numpy(p).to(device)
-            
-            # if x.size == 0:
-            #     continue
 
             if args.method in ["ecdpt", "eventgem", "eventgem-d"]:
                 with torch.cuda.stream(stream_vit):
@@ -426,19 +300,16 @@ def main():
                     pol_2hw, _ = stream.gpu_polarity_frame_2ch(x, y, p, H, W, device)
                     inp = stream.vit_preprocess_like_dataloader(pol_2hw, out_hw=(vitH, vitW))
                     if (H != vitH) or (W != vitW):
-                        mode = "nearest" if args.resize == "nearest" else "bilinear"
+                        mode = "nearest"
                         inp = F.interpolate(inp, size=(vitH, vitW), mode=mode, align_corners=False if mode=="bilinear" else None)
-                        if args.onnx:
-                            q_desc_vit = vit(inp)
-                        else:
-                            q_desc_vit = stream.vit_gem_descriptor(vit, inp)
+                        q_desc_vit = stream.vit_gem_descriptor(vit, inp)
 
                     if args.extract_reference:
                         ref_feats.append(q_desc_vit.cpu().numpy())
                     else:
                         ret0.record(stream_vit)
                         
-                        top_idx_t, top_dist_t, sims_t = stream.retrieve_topk(ref_db, q_desc_vit, k=int(args.retrieval_k), return_sims=True)
+                        top_idx_t, top_dist_t, sims_t = stream.retrieve_topk(ref_db, q_desc_vit, k=int(args.top_k), return_sims=True)
 
                         ret1.record(stream_vit)
                         vit1.record(stream_vit)
@@ -450,10 +321,8 @@ def main():
                     mcts = mcts[:, off_top:h_end, off_left:w_end] 
 
                     pred = se_model(mcts.unsqueeze(0))
-                    if args.onnx:
-                        prob, desc_map = pred[1], pred[3]
-                    else:
-                        prob, desc_map = pred['prob'], pred['descriptors']
+
+                    prob, desc_map = pred['prob'], pred['descriptors']
 
                     kpts_all, scores_all = fast_nms(prob, se_cfg, top_k=int(args.se_topk))
                     kpts_yx = kpts_all[0]
@@ -733,16 +602,14 @@ def main():
         print(f"Over budget ({args.dt_ms}ms): {np.sum(t_total_np > args.dt_ms)}/{n_frames}")
 
     # stack the reranked cols
-    if args.gt_file is not None:
+    if os.path.exists(gt_path):
         # make a big matrix of shape (n_frames, R) where each row is the reranked distance vector for that query frame
         S_in = np.stack(new_cols, axis=0)  # shape (n_frames, R)
         S_in = 1 - S_in.T
-        # plt.imshow(S_in, aspect='auto')
-        # plt.colorbar()
-        # plt.show()
+
         K = [1, 5, 10]
         # load ground truth file
-        gt = np.load(args.gt_file)
+        gt = np.load(gt_path)
 
         # resize to match shape of reranked_cols_stack if needed
         from skimage.transform import resize
@@ -755,6 +622,3 @@ def main():
             table.add_column(f"Recall@{k}", [stream.recallAtK(S_in, gt_resized, K=k)])
 
         print(table)
-
-if __name__ == "__main__":
-    main()

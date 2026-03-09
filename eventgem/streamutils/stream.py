@@ -16,8 +16,8 @@ from skimage.metrics import structural_similarity as ssim
 import sinabs.layers as sl
 from tqdm import tqdm
 import logging
-from streamutils.EventVLAD import Imagenet_vgg
-from streamutils.netvlad import NetVLAD, EmbedNet, TripletNet
+from eventgem.streamutils.EventVLAD import Imagenet_vgg
+from eventgem.streamutils.netvlad import NetVLAD, EmbedNet, TripletNet
 import stat
 
 from datetime import timedelta
@@ -420,7 +420,7 @@ def find_event_datasets(f: h5py.File):
     return x_ds, y_ds, t_ds, p_ds
 
 
-def infer_resolution(x_dset: h5py.Dataset, y_dset: h5py.Dataset, chunk_size: int, full_scan: bool) -> Tuple[int, int]:
+def infer_resolution(x_dset: h5py.Dataset, y_dset: h5py.Dataset, chunk_size: int) -> Tuple[int, int]:
     N = x_dset.size
     if N == 0:
         return 0, 0
@@ -428,23 +428,13 @@ def infer_resolution(x_dset: h5py.Dataset, y_dset: h5py.Dataset, chunk_size: int
     max_x = 0
     max_y = 0
 
-    if full_scan:
-        for i in range(0, N, chunk_size):
-            j = min(N, i + chunk_size)
-            x = x_dset[i:j]
-            y = y_dset[i:j]
-            if x.size:
-                max_x = max(max_x, int(np.max(x)))
-            if y.size:
-                max_y = max(max_y, int(np.max(y)))
-    else:
-        j = min(N, chunk_size)
-        x = x_dset[0:j]
-        y = y_dset[0:j]
-        if x.size:
-            max_x = int(np.max(x))
-        if y.size:
-            max_y = int(np.max(y))
+    j = min(N, chunk_size)
+    x = x_dset[0:j]
+    y = y_dset[0:j]
+    if x.size:
+        max_x = int(np.max(x))
+    if y.size:
+        max_y = int(np.max(y))
 
     return max_y + 1, max_x + 1
 
@@ -457,7 +447,7 @@ def stream_event_windows_raw(
     chunk_size: int,
     time_scale: float,
     start_time_sec: Optional[float],
-    max_frames: Optional[int],
+    skip: Optional[int] = None
 ):
     f = h5py.File(hdf5_path, "r")
     x_dset, y_dset, t_dset, p_dset = find_event_datasets(f)
@@ -492,7 +482,7 @@ def stream_event_windows_raw(
     frame_idx = 0
     t_buf_max = -1
 
-    while w_start_raw < tN_raw and (max_frames is None or frame_idx < max_frames):
+    while w_start_raw < tN_raw:
         w_end_raw = w_start_raw + dt_raw
         t_read0 = time.perf_counter()
 
@@ -552,14 +542,15 @@ def stream_event_windows_raw(
         t_read1 = time.perf_counter()
         t_read_ms = (t_read1 - t_read0) * 1000.0
 
-        yield (
-            raw_to_sec(w_start_raw, time_scale),
-            raw_to_sec(w_end_raw, time_scale),
-            w_end_raw,
-            x_win, y_win, t_win_raw, p_win,
-            frame_idx,
-            t_read_ms,
-        )
+        if skip is None or skip <= 1 or frame_idx % skip == 0:
+            yield (
+                raw_to_sec(w_start_raw, time_scale),
+                raw_to_sec(w_end_raw, time_scale),
+                w_end_raw,
+                x_win, y_win, t_win_raw, p_win,
+                frame_idx,
+                t_read_ms,
+            )
 
         w_start_raw = w_end_raw
         frame_idx += 1
@@ -842,7 +833,7 @@ def gpu_mcts(
 # Backbone (ViT + GeM)
 # ---------------------------
 def load_vit_backbone(backbone_ckpt: str, device: torch.device):
-    from external.backbone.model.ours_model.ours_model_pretrain import vit_contrastive_patch16_small
+    from eventgem.external.backbone.model.ours_model.ours_model_pretrain import vit_contrastive_patch16_small
 
     backbone = vit_contrastive_patch16_small(mask_ratio=0.0, in_chans=2, num_classes=512)
 

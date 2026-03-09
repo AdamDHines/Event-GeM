@@ -7,9 +7,12 @@
 [submodule "eventgem/external/eventlab"]
 	path = eventgem/external/eventlab
 	url = https://github.com/EventLAB-Team/Event-LAB.git
+	branch = 0.1.1
 [submodule "eventgem/external/vprtutorial"]
 	path = eventgem/external/vprtutorial
 	url = https://github.com/stschubert/VPR_Tutorial.git
 [submodule "eventgem/external/depthanyevent"]
 	path = eventgem/external/depthanyevent
 	url = https://github.com/bartn8/depthanyevent.git
+[submodule "external/eventlab"]
+	branch = 0.1.1

@@ -3,7 +3,7 @@ eventgem/ckpt/
 eventgem/features/
 eventgem/keypoints/
 eventgem/external/
-dataset/
+eventgem/data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -15,6 +15,8 @@ eventgem = {cmd = "pixi run python3 main.py"}
 inference = {cmd = "pixi run python3 eventgem/inference.py"}
 inference-jetson = {cmd = "pixi run python3 eventgem/inference-jetson.py"}
 
+demo = {cmd = "pixi run python3 main.py --dataset brisbane_event --reference sunset2 --query sunset1 --start-time 1587452582.35 --skip 20 --stream --demo"}
+
 [target.linux-64.dependencies]
 python = ">3.8"
 numpy = "*"
