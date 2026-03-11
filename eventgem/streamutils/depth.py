@@ -340,15 +340,10 @@ def save_depth_outputs(
     """
     parent_outdir = Path(parent_outdir)
 
-    if save_npy:   npy_dir.mkdir(parents=True, exist_ok=True)
-    if save_raw16: raw16_dir.mkdir(parents=True, exist_ok=True)
-    if save_viz:   viz_dir.mkdir(parents=True, exist_ok=True)
+    if save_raw16: parent_outdir.mkdir(parents=True, exist_ok=True)
 
     depth = np.nan_to_num(depth_m, nan=0.0, posinf=clip_distance, neginf=0.0)
     depth = np.clip(depth, 0.0, clip_distance).astype(np.float32)
-
-    if save_npy:
-        np.save(str(npy_dir / f"{frame_name}.npy"), depth)
 
     if save_raw16:
         if clip_distance <= 0:
@@ -357,14 +352,6 @@ def save_depth_outputs(
         ok = cv2.imwrite(str(parent_outdir / f"{frame_name}.png"), depth_u16)
         if not ok:
             raise RuntimeError(f"cv2.imwrite failed for {parent_outdir / f'{frame_name}.png'}")
-
-    if save_viz:
-        depth_norm = np.clip(depth / clip_distance, 0.0, 1.0)
-        depth_vis = (depth_norm ** gamma * 255.0).astype(np.uint8)
-        img_color = cv2.applyColorMap(depth_vis, cmapy.cmap('magma'))
-        ok = cv2.imwrite(str(viz_dir / f"{frame_name}.png"), img_color)
-        if not ok:
-            raise RuntimeError(f"cv2.imwrite failed for {viz_dir / f'{frame_name}.png'}")
 
 
 # ==========================
@@ -413,28 +400,19 @@ def load_and_merge_config(args):
         with open(args.config, 'r') as f:
             config = json.load(f)
 
-    if 'trainer' in config and not args.discard_train_args:
-        tr = config['trainer']
-        args.use_logdepth   = tr.get('use_logdepth',   args.use_logdepth)
-        args.reg_factor     = tr.get('reg_factor',     args.reg_factor)
-        args.clip_distance  = tr.get('clip_distance',  args.clip_distance)
-
     return ckpt, config
 
 
-def setup_device_and_seeds(args):
+def setup_device_and_seeds(args, seed=42):
     """
     Setup device (CPU/CUDA) and random seeds for reproducibility.
     """
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
 
-    if args.cuda:
-        torch.cuda.manual_seed(args.seed)
-        device = torch.device('cuda:0')
-    else:
-        device = torch.device('cpu')
+    torch.cuda.manual_seed(seed)
+    device = torch.device('cuda:0')
 
     print(f"[INFO] Using device {device}")
     autocast_device = 'cuda' if device.type == 'cuda' else 'cpu'
@@ -490,18 +468,25 @@ def process_depth(
     dirs = [ref_dir, qry_dir]
     ref_out = f"{args.depth_out}/{args.dataset}/{args.query}-{args.dt_ms}/depth"
     qry_out = f"{args.depth_out}/{args.dataset}/{args.query}-{args.dt_ms}/depth"
+    # make the dirs if they don't exist
+    os.makedirs(ref_out, exist_ok=True)
+    os.makedirs(qry_out, exist_ok=True)
     out_dirs = [ref_out, qry_out]
-    for d, idx in enumerate(dirs):
+    prev_states = None 
+    for idx, d in enumerate(dirs):
         # get the file list and sort it
         file_list = sorted(Path(d).glob("*.png"))
-        for file, file_idx in enumerate(file_list):
+        for file_idx, file in enumerate(file_list):
             # load tencode image
             tencode_img = Image.open(file).convert("RGB")
+            # convert img to numpy
+            tencode_img = np.array(tencode_img).astype(np.float32) / 255.0  # (H,W,3) in [0,1]
+            tencode_img = np.transpose(tencode_img, (2, 0, 1))  # (3,H,W)
             # To torch
             ev_tensor = torch.from_numpy(tencode_img).float().unsqueeze(0).to(device)  # (1,3,H,W)
 
             # Inference (no grad, via decorator)
-            with autocast(autocast_device, enabled=args.mixed_precision):
+            with autocast(autocast_device, enabled=False):
                 if model_name == 'DAv2':
                     pred = model.infer_image(ev_tensor)  # (1,1,H,W)
                 elif model_name == 'RecDAv2':
@@ -534,5 +519,3 @@ def process_depth(
             # Free per-frame tensors explicitly (belt-and-braces)
             del ev_tensor, pred
             torch.cuda.empty_cache() if device.type == 'cuda' else None
-
-            frame_idx += 1

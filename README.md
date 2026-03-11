@@ -33,7 +33,7 @@ Once installed, you can quickly try Event-GeM with our demo by running the follo
 pixi run demo
 ```
 
-## Running EventGeM & EventGeM-D
+## Running EventGeM & EventGeM-D :sparkles:
 ### Basic operation
 To run EventGeM and EventGeM-D, you simply need to input a dataset, reference, and query that you would like to run in a single command-line invocation:
 
@@ -78,7 +78,7 @@ pixi run eventgem --dataset brisbane_event --reference sunset2 --query sunset1 -
 - `--keypoint-out`: default directory for keypoints (default="./eventgem/keypoints")
 - `--depth-out`: default directory for depth maps (default="./eventgem/depth")
 
-## Citation
+## Citation :scroll:
 If you found our work interesting or use it as a baseline method, please cite the following:
 
 ```
@@ -93,5 +93,5 @@ If you found our work interesting or use it as a baseline method, please cite th
 }
 ```
 
-## Contributing and Issues
+## Contributing and Issues :question:
 If you encounter any issues or want to contribute a fix, please [open an issue](https://github.com/AdamDHines/Event-GeM/issues) or a [pull request](https://github.com/AdamDHines/Event-GeM/pulls).

@@ -60,6 +60,14 @@ def main():
                             help="Distance subtraction per inlier")
     parser.add_argument("--match-ratio", type=float, default=0.8,
                             help="Match ratio for keypoint matching")
+    parser.add_argument('--clip-distance', type=float, default=80.0,
+                        help='Max depth distance for visualization clipping.')
+    parser.add_argument('--gamma', type=float, default=0.2,
+                        help='Gamma for depth visualization.')
+    parser.add_argument('--use_logdepth', action='store_true', default=False,
+                        help='Model outputs log-depth in [0,1] instead of linear meters')
+    parser.add_argument('--reg_factor', type=float, default=3.70378,
+                        help='Regularization factor for log-depth conversion')
     parser.add_argument("--backbone-batch-size", type=int, default=32,
                             help="Batch size for feature extraction")
     parser.add_argument("--keypoint-batch-size", type=int, default=16,
@@ -112,7 +120,7 @@ def main():
         gt = np.load(gt_file)
 
         # Run re-ranking
-        original, reranked, reranked_depth = eventgem.rerank_inference(args)
+        original, reranked, reranked_depth = eventgem.rerank_inference()
 
         # Run recall evaluation
         recall(original, reranked, reranked_depth, gt)

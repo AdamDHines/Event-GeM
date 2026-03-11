@@ -255,7 +255,7 @@ def gpu_mcts(h5_path,
             chunk_size,
             start_time_sec,
             skip=0):
-    
+
     os.makedirs(out_dir, exist_ok=True)
     event_iter = stream.stream_event_windows_raw(
         h5_path, time_windows[-1], chunk_size, time_scale, start_time_sec, skip
@@ -276,7 +276,9 @@ def gpu_mcts(h5_path,
 
         valid = (x >= 0) & (x < W) & (y >= 0) & (y < H)
         if not torch.any(valid):
-            return out
+            out_path = out_dir / f"mcts_{frame_idx:05d}.npz"
+            np.savez_compressed(out_path, mcts=out.cpu().numpy())
+            continue
 
         x = x[valid]; y = y[valid]; t = t[valid]; p = p[valid]
 
@@ -287,7 +289,9 @@ def gpu_mcts(h5_path,
         Dt_max = float(windows_sec.max().item())
         m = t_rel >= -Dt_max
         if not torch.any(m):
-            return out
+            out_path = out_dir / f"mcts_{frame_idx:05d}.npz"
+            np.savez_compressed(out_path, mcts=out.cpu().numpy())
+            continue
         x = x[m]; y = y[m]; p = p[m]; t_rel = t_rel[m]
 
         lin = y * W + x  # int32
@@ -321,8 +325,6 @@ def gpu_mcts(h5_path,
         out_path = out_dir / f"mcts_{frame_idx:05d}.npz"
         np.savez_compressed(out_path, mcts=out.detach().cpu().numpy())
 
-        frame_idx += 1
-
 
 # ---------- Public entry: ref + query ----------
 
@@ -351,7 +353,6 @@ def gen_mcts(
     # Time scale and sensor size
     if dataset == "brisbane_event":
         time_scale = 1e-9  # (not used in epoch-ns branch, but keep)
-        t_is_epoch_ns = True
         H, W = 240, 346
         config_path = "./eventgem/external/eventlab/datasets/brisbane_event.yaml"
         config = yaml.safe_load(open(config_path, 'r'))
@@ -395,8 +396,5 @@ def gen_mcts(
             H=H,
             W=W,
             chunk_size=chunk_size,
-            max_frames=max_frames,
-            start_time_sec=query_start,
-            use_event_counts=use_event_counts,
-            t_is_epoch_ns=t_is_epoch_ns
+            start_time_sec=query_start
         )

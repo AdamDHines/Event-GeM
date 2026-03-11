@@ -733,11 +733,35 @@ class EventGeM:
         self.ref_depth = f"{args.depth_out}/{args.dataset}/{args.reference}-{args.dt_ms}/raw16"
         self.qry_depth = f"{args.depth_out}/{args.dataset}/{args.query}-{args.dt_ms}/raw16"
 
-        if not os.path.exists(self.ref_depth):
-            os.makedirs(self.ref_depth, exist_ok=True)
+        tencode_ref = f"{args.data_root}/{args.dataset}/{args.reference}/{args.reference}-tencode-{args.dt_ms}"
+        tencode_qry = f"{args.data_root}/{args.dataset}/{args.query}/{args.query}-tencode-{args.dt_ms}"
+
+        # Time scale and sensor size
+        if self.dataset == "brisbane_event":
+            time_scale = 1e-9  # (not used in epoch-ns branch, but keep)
+            H, W = 240, 346
+            config_path = "./eventgem/external/eventlab/datasets/brisbane_event.yaml"
+            config = yaml.safe_load(open(config_path, 'r'))
+            ref_start = config['other']['offset'][self.reference]
+            query_start = config['other']['offset'][self.query]
+        elif self.dataset == "nsavp":
+            time_scale = 1e-9  # nanoseconds to seconds
+            ref_start = 0.0
+            query_start = 0.0
+            H, W = 480, 640
+        elif self.dataset == "fast_slow" or self.dataset == "qcr_event":
+            time_scale = 1e-6  # microseconds to seconds
+            ref_start = 0.0
+            query_start = 0.0
+            H, W = 240, 346
+        else:
+            raise NotImplementedError(f"Dataset not supported for MCTS generation: {self.dataset}")
+
+        if not os.path.exists(tencode_ref):
+            os.makedirs(tencode_ref, exist_ok=True)
             hdf5_path = f"{args.data_root}/{args.dataset}/{args.reference}/{args.reference}.hdf5"
             event_iter = stream.stream_event_windows_raw(
-                hdf5_path, args.dt_ms, args.chunk_size, args.time_scale, args.start_time, args.skip
+                hdf5_path, args.dt_ms, args.chunk_size, time_scale, ref_start, args.skip
             )
             for (_, _, _, x, y, t_raw, p, frame_idx, _) in event_iter:
 
@@ -753,13 +777,13 @@ class EventGeM:
                 else:
                     img = np.clip(tencode.detach().cpu().numpy(), 0, 255).astype(np.uint8)
                 img = np.transpose(img, (1, 2, 0))  # (3,H,W) -> (H,W,3), RGB
-                Image.fromarray(img, mode="RGB").save(f"{args.depth_out}/{args.dataset}/{args.reference}-{args.dt_ms}/tencode/tencode_{frame_idx:05d}.png")
+                Image.fromarray(img, mode="RGB").save(f"{args.data_root}/{args.dataset}/{args.reference}/{args.reference}-tencode-{args.dt_ms}/tencode_{frame_idx:05d}.png")
 
-        if not os.path.exists(self.qry_depth):
-            os.makedirs(self.qry_depth, exist_ok=True)
+        if not os.path.exists(tencode_qry):
+            os.makedirs(tencode_qry, exist_ok=True)
             hdf5_path = f"{args.data_root}/{args.dataset}/{args.query}/{args.query}.hdf5"
             event_iter = stream.stream_event_windows_raw(
-                hdf5_path, args.dt_ms, args.chunk_size, args.time_scale, args.start_time, args.skip
+                hdf5_path, args.dt_ms, args.chunk_size, time_scale, query_start, args.skip
             )
             for (_, _, _, x, y, t_raw, p, frame_idx, _) in event_iter:
 
@@ -775,9 +799,10 @@ class EventGeM:
                 else:
                     img = np.clip(tencode.detach().cpu().numpy(), 0, 255).astype(np.uint8)
                 img = np.transpose(img, (1, 2, 0))  # (3,H,W) -> (H,W,3), RGB
-                Image.fromarray(img, mode="RGB").save(f"{args.depth_out}/{args.dataset}/{args.query}-{args.dt_ms}/tencode/tencode_{frame_idx:05d}.png")
+                Image.fromarray(img, mode="RGB").save(f"{args.data_root}/{args.dataset}/{args.query}/{args.query}-tencode-{args.dt_ms}/tencode_{frame_idx:05d}.png")
 
-        dp.process_depth(depth_model, model_name, device, autocast_device, self.ref_depth, self.qry_depth, args)
+        if not os.path.exists(self.ref_depth) or not os.path.exists(self.qry_depth):
+            dp.process_depth(depth_model, model_name, device, autocast_device, tencode_ref, tencode_qry, args)
 
     
     def rerank_inference(self):
