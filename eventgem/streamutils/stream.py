@@ -452,11 +452,13 @@ def stream_event_windows_raw(
     f = h5py.File(hdf5_path, "r")
     x_dset, y_dset, t_dset, p_dset = find_event_datasets(f)
     N = len(t_dset)
+
     if N == 0:
         f.close()
         return
 
     dt_raw = int(round((dt_ms / 1000.0) / float(time_scale)))
+
     if dt_raw <= 0:
         raise ValueError(f"dt_ms too small for time_scale (dt_raw={dt_raw})")
 
@@ -554,7 +556,7 @@ def stream_event_windows_raw(
 
         w_start_raw = w_end_raw
         frame_idx += 1
-
+        
         if read_idx >= N and t_buf.size == 0 and t_buf_max < w_start_raw:
             break
 

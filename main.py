@@ -46,6 +46,10 @@ def main():
                     help="Path to the SuperEvent config file")
     parser.add_argument("--se-weights", type=str, default="eventgem/external/superevent/saved_models/super_event_weights.pth",
                     help="Path to the SuperEvent weights file")
+    parser.add_argument('--depth-model', default='eventgem/external/depthanyevent/models/rec_dav2/synth/synth.pth', 
+                        help='Path to model checkpoint')
+    parser.add_argument('--depth-config', type=str, default='eventgem/external/depthanyevent/configs/test/recdav2/rec_dav2_mvsec_test.json',
+                        help='Path to config file. If not specified, config from model folder/checkpoint is used')
     parser.add_argument("--top-k", type=int, default=50,
                             help="Number of top candidates to re-rank using 2D-homography")
     parser.add_argument("--se-topk", type=int, default=170,
@@ -56,6 +60,14 @@ def main():
                             help="Distance subtraction per inlier")
     parser.add_argument("--match-ratio", type=float, default=0.8,
                             help="Match ratio for keypoint matching")
+    parser.add_argument('--clip-distance', type=float, default=80.0,
+                        help='Max depth distance for visualization clipping.')
+    parser.add_argument('--gamma', type=float, default=0.2,
+                        help='Gamma for depth visualization.')
+    parser.add_argument('--use_logdepth', action='store_true', default=False,
+                        help='Model outputs log-depth in [0,1] instead of linear meters')
+    parser.add_argument('--reg_factor', type=float, default=3.70378,
+                        help='Regularization factor for log-depth conversion')
     parser.add_argument("--backbone-batch-size", type=int, default=32,
                             help="Batch size for feature extraction")
     parser.add_argument("--keypoint-batch-size", type=int, default=16,
@@ -98,11 +110,17 @@ def main():
     eventgem = EventGeM(args)
     eventgem.feature_inference()
     if not args.stream:
-        original, reranked, reranked_depth = eventgem.keypoint_inference()
+        # Generate keypoints
+        eventgem.keypoint_inference()
+        # Generate depth maps
+        eventgem.depth_inference(args)
         
         # GT file from eventlab
         gt_file = f"{args.data_root}/{args.dataset}/ground_truth/{args.reference}_{args.query}_GT.npy"
         gt = np.load(gt_file)
+
+        # Run re-ranking
+        original, reranked, reranked_depth = eventgem.rerank_inference()
 
         # Run recall evaluation
         recall(original, reranked, reranked_depth, gt)

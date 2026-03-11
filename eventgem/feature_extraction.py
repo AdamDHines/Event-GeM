@@ -5,20 +5,22 @@ import os
 import sys
 import torch
 import yaml
-import math
-import requests
+import cv2
 
 import numpy as np
 import torch.nn.functional as F
-import cv2
-from skimage.metrics import structural_similarity as ssim
+
+from PIL import Image
 from tqdm import tqdm
 from pathlib import Path
 from joblib import Parallel, delayed
+import eventgem.streamutils.depth as dp
 from eventgem.inference import stream_file
+import eventgem.streamutils.stream as stream
 from eventgem.utils.generate_mcts import gen_mcts
 from eventgem.dataset import EventGeMData, EventGeMMCTS
 from eventgem.utils.eventlab_config import update_config
+from skimage.metrics import structural_similarity as ssim
 from eventgem.utils.ckpt_downloader import download_backbone_ckpt
 from eventgem.utils.rerank_utils import load_event_features, process_single_query
 
@@ -121,14 +123,10 @@ class EventGeM:
         query_dataset = EventGeMData(self.query_path)
         ref_loader = torch.utils.data.DataLoader(ref_dataset, batch_size=self.backbone_batch_size, shuffle=False, num_workers=4)
         query_loader = torch.utils.data.DataLoader(query_dataset, batch_size=self.backbone_batch_size, shuffle=False, num_workers=4)
-        # --- NEW: VISUALIZATION CALL ---
-        vis_out = os.path.join("/home/adam/heatmaps")
-        os.makedirs(vis_out, exist_ok=True)
+
         # Reference events
         ref_feats = []
         for idx, events in enumerate(tqdm(ref_loader, desc="Extracting reference features", unit="batch")):
-            # torch copy to a new variable
-            events_init = events.clone()
             events = events.to(self.device)
             events = backbone.patch_embed(events)
             events = events + backbone.pos_embed
@@ -621,10 +619,10 @@ class EventGeM:
         """
         R, Q = self.original.shape
 
-        ref_depth_dir = Path(getattr(self, "reference_depth_dir"))
-        qry_depth_dir = Path(getattr(self, "query_depth_dir"))
+        ref_depth_dir = Path(getattr(self, "ref_depth"))
+        qry_depth_dir = Path(getattr(self, "qry_depth"))
 
-        depth_pattern = getattr(self, "depth_pattern", "depth_{:06d}.png")
+        depth_pattern = getattr(self, "depth_pattern", "depth_{:05d}.png")
         depth_index_offset = int(getattr(self, "depth_index_offset", 0))
         depth_weight = float(getattr(self, "depth_weight", 0.15))
         depth_down_hw = getattr(self, "depth_down_hw", (28, 28))
@@ -697,6 +695,117 @@ class EventGeM:
         """
         Orchestrates the re-ranking pipeline based on self.rerank_mode.
         """
+
+        # 3. Keypoint/Both Mode: Ensure MCTS files exist
+        root = self.data_root
+        self.reference_path = os.path.join(root, self.dataset, self.reference, f"mcts_{self.reference}_{self.mcts_time[-1]}")
+        self.query_path = os.path.join(root, self.dataset, self.query, f"mcts_{self.query}_{self.mcts_time[-1]}")
+
+        # Ensure keypoints are extracted
+        if (not os.path.exists(self.reference_path)) or (not os.path.exists(self.query_path)):
+            gen_mcts(root, self.dataset, self.reference, self.query, self.mcts_time)
+        
+        # Ensure keypoint directories are defined
+        self.reference_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.reference}")
+        self.query_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.query}")
+
+        if (not os.path.exists(self.reference_keypoints)) or (not os.path.exists(self.query_keypoints)):
+            self.extract_keypoints()
+
+    
+    def depth_inference(self, args):
+        # Device / seeds
+        device, autocast_device = dp.setup_device_and_seeds(args)
+
+        # Load model + config
+        ckpt, config = dp.load_and_merge_config(args)
+        depth_model = dp.fetch_model(config['model'], args, device, test=True, _state_dict=ckpt)
+        model_name = config['model']['model_type']
+        depth_model.eval()
+        normalize = True
+
+        if args.dataset == "brisbane_event" or args.dataset == "fast_slow":
+            H, W = 260, 346
+        else:
+            H, W = 480, 640
+
+        # check for tencode images
+        self.ref_depth = f"{args.depth_out}/{args.dataset}/{args.reference}-{args.dt_ms}/raw16"
+        self.qry_depth = f"{args.depth_out}/{args.dataset}/{args.query}-{args.dt_ms}/raw16"
+
+        tencode_ref = f"{args.data_root}/{args.dataset}/{args.reference}/{args.reference}-tencode-{args.dt_ms}"
+        tencode_qry = f"{args.data_root}/{args.dataset}/{args.query}/{args.query}-tencode-{args.dt_ms}"
+
+        # Time scale and sensor size
+        if self.dataset == "brisbane_event":
+            time_scale = 1e-9  # (not used in epoch-ns branch, but keep)
+            H, W = 240, 346
+            config_path = "./eventgem/external/eventlab/datasets/brisbane_event.yaml"
+            config = yaml.safe_load(open(config_path, 'r'))
+            ref_start = config['other']['offset'][self.reference]
+            query_start = config['other']['offset'][self.query]
+        elif self.dataset == "nsavp":
+            time_scale = 1e-9  # nanoseconds to seconds
+            ref_start = 0.0
+            query_start = 0.0
+            H, W = 480, 640
+        elif self.dataset == "fast_slow" or self.dataset == "qcr_event":
+            time_scale = 1e-6  # microseconds to seconds
+            ref_start = 0.0
+            query_start = 0.0
+            H, W = 240, 346
+        else:
+            raise NotImplementedError(f"Dataset not supported for MCTS generation: {self.dataset}")
+
+        if not os.path.exists(tencode_ref):
+            os.makedirs(tencode_ref, exist_ok=True)
+            hdf5_path = f"{args.data_root}/{args.dataset}/{args.reference}/{args.reference}.hdf5"
+            event_iter = stream.stream_event_windows_raw(
+                hdf5_path, args.dt_ms, args.chunk_size, time_scale, ref_start, args.skip
+            )
+            for (_, _, _, x, y, t_raw, p, frame_idx, _) in event_iter:
+
+                x = torch.from_numpy(x).to(device)
+                y = torch.from_numpy(y).to(device)
+                t_raw = torch.from_numpy(t_raw).to(device)
+                p = torch.from_numpy(p).to(device)
+
+                tencode = stream.tencode(x, y, t_raw, p, height=H, width=W, white_frame=False, normalize=normalize, device=device)
+                # save tencode as png
+                if normalize:
+                    img = np.clip(tencode.detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+                else:
+                    img = np.clip(tencode.detach().cpu().numpy(), 0, 255).astype(np.uint8)
+                img = np.transpose(img, (1, 2, 0))  # (3,H,W) -> (H,W,3), RGB
+                Image.fromarray(img, mode="RGB").save(f"{args.data_root}/{args.dataset}/{args.reference}/{args.reference}-tencode-{args.dt_ms}/tencode_{frame_idx:05d}.png")
+
+        if not os.path.exists(tencode_qry):
+            os.makedirs(tencode_qry, exist_ok=True)
+            hdf5_path = f"{args.data_root}/{args.dataset}/{args.query}/{args.query}.hdf5"
+            event_iter = stream.stream_event_windows_raw(
+                hdf5_path, args.dt_ms, args.chunk_size, time_scale, query_start, args.skip
+            )
+            for (_, _, _, x, y, t_raw, p, frame_idx, _) in event_iter:
+
+                x = torch.from_numpy(x).to(device)
+                y = torch.from_numpy(y).to(device)
+                t_raw = torch.from_numpy(t_raw).to(device)
+                p = torch.from_numpy(p).to(device)
+
+                tencode = stream.tencode(x, y, t_raw, p, height=H, width=W, white_frame=False, normalize=normalize, device=device)
+                # save tencode as png
+                if normalize:
+                    img = np.clip(tencode.detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+                else:
+                    img = np.clip(tencode.detach().cpu().numpy(), 0, 255).astype(np.uint8)
+                img = np.transpose(img, (1, 2, 0))  # (3,H,W) -> (H,W,3), RGB
+                Image.fromarray(img, mode="RGB").save(f"{args.data_root}/{args.dataset}/{args.query}/{args.query}-tencode-{args.dt_ms}/tencode_{frame_idx:05d}.png")
+
+        if not os.path.exists(self.ref_depth) or not os.path.exists(self.qry_depth):
+            dp.process_depth(depth_model, model_name, device, autocast_device, tencode_ref, tencode_qry, args)
+
+    
+    def rerank_inference(self):
         # 1. Load Global Similarity Matrix
         sim_matrix_path = os.path.join(
             self.feature_out, 
@@ -718,27 +827,9 @@ class EventGeM:
         if mode == "depth":
             self.rerank_depth()
             return self.original, None, self.depth_reranked
-
-        # 3. Keypoint/Both Mode: Ensure MCTS files exist
-        root = self.data_root
-        self.reference_path = os.path.join(root, self.dataset, self.reference, f"mcts_{self.reference}_{self.mcts_time[-1]}")
-        self.query_path = os.path.join(root, self.dataset, self.query, f"mcts_{self.query}_{self.mcts_time[-1]}")
-
-        # Ensure keypoints are extracted
-        if (not os.path.exists(self.reference_path)) or (not os.path.exists(self.query_path)):
-            gen_mcts(root, self.dataset, self.reference, self.query, self.mcts_time)
         
-        # Ensure keypoint directories are defined
-        self.reference_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.reference}")
-        self.query_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.query}")
-
-        if (not os.path.exists(self.reference_keypoints)) or (not os.path.exists(self.query_keypoints)):
-            self.extract_keypoints()
-
-        # 4. Perform Keypoint Re-ranking
+                # 4. Perform Keypoint Re-ranking
         self.rerank()
-        # save the self.keypoint_ranked matrix
-        torch.save(self.keypoint_reranked, os.path.join(self.outdir, f"{self.dataset}_{self.reference}_{self.query}_similarity_kp.pt"))
 
         # 5. Optional: Chain Depth Re-ranking
         if mode == "both":
