@@ -138,4 +138,5 @@ def compute_inliers_2d(q_data, r_data, matcher, ransac_thresh):
         return 0
     
     # Sum the mask (1 = inlier, 0 = outlier)
+
     return int(np.sum(mask))

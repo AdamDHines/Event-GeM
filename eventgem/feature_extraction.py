@@ -21,7 +21,7 @@ from eventgem.utils.generate_mcts import gen_mcts
 from eventgem.dataset import EventGeMData, EventGeMMCTS
 from eventgem.utils.eventlab_config import update_config
 from skimage.metrics import structural_similarity as ssim
-from eventgem.utils.ckpt_downloader import download_backbone_ckpt
+from eventgem.utils.ckpt_downloader import download_google_drive_file
 from eventgem.utils.rerank_utils import load_event_features, process_single_query
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -80,14 +80,12 @@ class EventGeM:
         
         # Ensure the backbone checkpoint exists
         if not os.path.exists(self.backbone_ckpt):
-            # ... (your download logic) ...
-            pass
+            download_google_drive_file()  # This will download the checkpoint to eventgem/ckpt/pr.pt
             
         print(f"Loading checkpoint from: {self.backbone_ckpt}")
         checkpoint = torch.load(self.backbone_ckpt, map_location='cpu')
 
-        # --- FIX 1: UNWRAP THE NESTED DICTIONARY ---
-        # The weights are hidden inside the "checkpoint" key
+        # Modify checkpoint keys
         if isinstance(checkpoint, dict) and "checkpoint" in checkpoint:
             state_dict = checkpoint["checkpoint"]
         elif isinstance(checkpoint, dict) and "model" in checkpoint:
@@ -97,21 +95,14 @@ class EventGeM:
         else:
             state_dict = checkpoint
 
-        # --- FIX 2: CLEAN PREFIXES ---
         new_state_dict = {}
         for k, v in state_dict.items():
             # Remove "encoder_q." (seen in your debug output) and "module."
             new_key = k.replace("encoder_q.", "").replace("module.", "")
             new_state_dict[new_key] = v
-
-        # --- FIX 3: LOAD AND VERIFY ---
-        # strict=False is required because the checkpoint contains extra keys 
-        # (momentum encoder 'encoder_k', queues, etc.) that we don't need.
         msg = backbone.load_state_dict(new_state_dict, strict=False)
         
-        # Validation: We expect 'missing_keys' to mostly be the head (event_head/image_head).
-        # We expect 'unexpected_keys' to be the momentum encoder stuff.
-        # CRITICAL: If 'patch_embed.proj.weight' is missing, the load actually failed.
+        # Safety check
         if "patch_embed.proj.weight" in msg.missing_keys:
              raise RuntimeError("CRITICAL FAILURE: The input layer (patch_embed) did not load!")
         
@@ -679,8 +670,6 @@ class EventGeM:
                     errs[j] = self._compute_robust_depth_distance(rD, qD)
 
                 # --- IMPROVED SCORING LOGIC ---
-                # Using a fixed tau (0.2 - 0.5) ensures we only boost matches that are 
-                # actually structurally similar, rather than just 'the best of a bad bunch'.
                 tau = 0.3 
                 sims = np.exp(-errs / tau).astype(np.float32)
 
@@ -730,8 +719,8 @@ class EventGeM:
             H, W = 480, 640
 
         # check for tencode images
-        self.ref_depth = f"{args.depth_out}/{args.dataset}/{args.reference}-{args.dt_ms}/raw16"
-        self.qry_depth = f"{args.depth_out}/{args.dataset}/{args.query}-{args.dt_ms}/raw16"
+        self.ref_depth = f"{args.depth_out}/{args.dataset}/{args.reference}-{args.dt_ms}"
+        self.qry_depth = f"{args.depth_out}/{args.dataset}/{args.query}-{args.dt_ms}"
 
         tencode_ref = f"{args.data_root}/{args.dataset}/{args.reference}/{args.reference}-tencode-{args.dt_ms}"
         tencode_qry = f"{args.data_root}/{args.dataset}/{args.query}/{args.query}-tencode-{args.dt_ms}"

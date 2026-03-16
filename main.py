@@ -122,6 +122,11 @@ def main():
         # Run re-ranking
         original, reranked, reranked_depth = eventgem.rerank_inference()
 
+        # save all the sim mats
+        np.save("original_sim_mat.npy", original)
+        np.save("reranked_sim_mat.npy", reranked)
+        np.save("reranked_depth_sim_mat.npy", reranked_depth)
+
         # Run recall evaluation
         recall(original, reranked, reranked_depth, gt)
 

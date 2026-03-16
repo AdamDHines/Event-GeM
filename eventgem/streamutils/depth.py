@@ -466,14 +466,16 @@ def process_depth(
     args,
 ):
     dirs = [ref_dir, qry_dir]
-    ref_out = f"{args.depth_out}/{args.dataset}/{args.query}-{args.dt_ms}/depth"
-    qry_out = f"{args.depth_out}/{args.dataset}/{args.query}-{args.dt_ms}/depth"
-    # make the dirs if they don't exist
-    os.makedirs(ref_out, exist_ok=True)
-    os.makedirs(qry_out, exist_ok=True)
+    ref_out = f"{args.depth_out}/{args.dataset}/{args.reference}-{args.dt_ms}"
+    qry_out = f"{args.depth_out}/{args.dataset}/{args.query}-{args.dt_ms}"
     out_dirs = [ref_out, qry_out]
     prev_states = None 
     for idx, d in enumerate(dirs):
+        temp_out = out_dirs[idx]
+        if os.path.isdir(temp_out):
+            continue
+        else:
+            os.makedirs(temp_out, exist_ok=True)
         # get the file list and sort it
         file_list = sorted(Path(d).glob("*.png"))
         for file_idx, file in enumerate(file_list):
