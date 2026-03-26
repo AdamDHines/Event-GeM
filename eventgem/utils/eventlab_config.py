@@ -57,6 +57,7 @@ def update_config(root, dataset, reference, query, time=50,
     config['timewindows'] = [time]
 
     # 4. Make sure the frame_accumulator method is set to polarity
+    config['frame_generator'] = 'frames'
     config['frame_accumulator'] = 'polarity'
 
     # Change the tolerance based on the dataset for ground truth
@@ -79,6 +80,9 @@ def update_config(root, dataset, reference, query, time=50,
         qry_path = f"{root}/{dataset}/{query}/{query}-frames-{time}"
         os.makedirs(ref_path, exist_ok=True)
         os.makedirs(qry_path, exist_ok=True)
+        config['stream'] = True
+    else:
+        config['stream'] = False
 
     # -------- Run Event-LAB getdata via pixi (from EVENTLAB_ROOT) --------
     command = ["pixi", "run", "-e", "default", "getdata", "config.yaml"]

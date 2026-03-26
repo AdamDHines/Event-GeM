@@ -112,8 +112,10 @@ def main():
     if not args.stream:
         # Generate keypoints
         eventgem.keypoint_inference()
-        # Generate depth maps
-        eventgem.depth_inference(args)
+
+        if args.method == "eventgem-d":
+            # Generate depth maps
+            eventgem.depth_inference(args)
         
         # GT file from eventlab
         gt_file = f"{args.data_root}/{args.dataset}/ground_truth/{args.reference}_{args.query}_GT.npy"

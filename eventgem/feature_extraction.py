@@ -74,7 +74,7 @@ class EventGeM:
     def GeM(self, feats, p=5.0):
         return F.avg_pool2d((feats.clamp(min=1e-6)).pow(p), (feats.shape[-2], feats.shape[-1])).pow(1.0/p)
     
-    def extract_features(self):
+    def extract_features(self, sim_file):
         # Define backbone model (This is a ViT, as confirmed by your checkpoint)
         backbone = vit_contrastive_patch16_small(mask_ratio=0.0, in_chans=2, num_classes=512)
         
@@ -161,7 +161,7 @@ class EventGeM:
         ref_feats = F.normalize(ref_feats, p=2, dim=1)
         query_feats = F.normalize(query_feats, p=2, dim=1)
         sim_matrix = torch.matmul(query_feats, ref_feats.t()).T
-        torch.save(sim_matrix, os.path.join(self.outdir, f"{self.dataset}_{self.reference}_{self.query}_similarity.pt"))
+        torch.save(sim_matrix, sim_file)
 
     def feature_inference(self):
         # Check that the specified datasets exist - need frame reconstructued directories
@@ -172,8 +172,9 @@ class EventGeM:
         # Run feature extraction for reference and query sets
         self.outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")
         os.makedirs(self.outdir, exist_ok=True)
-        if self.rerun_features or not os.path.exists(self.outdir) and not self.stream:
-            self.extract_features()
+        sim_file = os.path.join(self.outdir, f"{self.dataset}_{self.reference}_{self.query}_similarity.pt")
+        if self.rerun_features or not os.path.exists(sim_file) and not self.stream:
+            self.extract_features(sim_file)
         elif self.stream:
             print("[INFO] Running in streaming mode. Extracting features on-the-fly without saving to disk.")
             stream_file(self.args)  # This will run the streaming inference logic defined in inference.py
@@ -692,6 +693,8 @@ class EventGeM:
 
         # Ensure keypoints are extracted
         if (not os.path.exists(self.reference_path)) or (not os.path.exists(self.query_path)):
+            print("[INFO] MCTS frames not found. Generating MCTS frames for reference and query sets...")
+            print("Generating MCTS frames for reference and query sets...")
             gen_mcts(root, self.dataset, self.reference, self.query, self.mcts_time)
         
         # Ensure keypoint directories are defined

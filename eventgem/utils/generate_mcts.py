@@ -264,6 +264,7 @@ def gpu_mcts(h5_path,
     windows_sec = torch.tensor(np.array(time_windows, dtype=np.float32) * 1e-3, device=device)
     S = int(windows_sec.numel())
     flat = H * W
+    print(f"Processing {h5_path} with GPU MCTS on device {device}...")
     for (_, _, t_ref_raw, x, y, t, p, frame_idx, _) in event_iter:
         out = torch.zeros((2 * S, H, W), device=device, dtype=torch.float32)
 
