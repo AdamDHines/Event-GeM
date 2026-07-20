@@ -54,7 +54,9 @@ def process_single_query(
     ref_kp_dir, 
     kp_pattern, 
     ransac_thresh,
-    inlier_weight
+    inlier_weight,
+    match_filter="ratio",
+    match_ratio=0.8
 ):
     """
     Worker function for parallel processing.
@@ -81,7 +83,8 @@ def process_single_query(
         # Load ref data on demand
         r_data = load_event_features(ref_kp_dir, r_idx, kp_pattern)
         
-        num_inliers = compute_inliers_2d(q_data, r_data, matcher, ransac_thresh)
+        num_inliers = compute_inliers_2d(q_data, r_data, matcher, ransac_thresh,
+                                         match_filter=match_filter, match_ratio=match_ratio)
 
         if num_inliers > 0:
             # Re-ranking logic:
@@ -91,7 +94,34 @@ def process_single_query(
 
     return q_idx, new_dists_col
 
-def compute_inliers_2d(q_data, r_data, matcher, ransac_thresh):
+def mutual_nn_matches(desc_q, desc_r):
+    """
+    Mutual nearest-neighbour correspondences: keep i <-> j only when j is i's nearest neighbour
+    and i is j's.
+
+    This replaces Lowe's ratio test for cross-condition event matching. With ~160 keypoints on a
+    repetitive road scene the second nearest neighbour is routinely almost as close as the first,
+    so the ratio test rejects correct matches wholesale -- measured at over 90% of ground-truth-true
+    pairs on the morning and daytime traverses, which leaves fewer than the 4 points a homography
+    needs and stops RANSAC running at all. Symmetry survives appearance change far better, and
+    outlier rejection is left to RANSAC, which is what it is for.
+
+    Returns (src_idx, dst_idx) index arrays.
+    """
+    # Squared L2 via expansion, then sqrt -- same metric as cv2.NORM_L2.
+    d2 = ((desc_q * desc_q).sum(1)[:, None]
+          + (desc_r * desc_r).sum(1)[None, :]
+          - 2.0 * (desc_q @ desc_r.T))
+    D = np.sqrt(np.maximum(d2, 0.0))
+
+    nn_qr = D.argmin(axis=1)
+    nn_rq = D.argmin(axis=0)
+    src = np.flatnonzero(nn_rq[nn_qr] == np.arange(len(nn_qr)))
+    return src, nn_qr[src]
+
+
+def compute_inliers_2d(q_data, r_data, matcher, ransac_thresh, match_filter="ratio",
+                       match_ratio=0.8):
     """
     Matches descriptors and runs 2D Homography RANSAC.
     Returns: number of inliers (int).
@@ -108,24 +138,31 @@ def compute_inliers_2d(q_data, r_data, matcher, ransac_thresh):
         return 0
 
     # 1. Descriptor Matching
-    # SuperEvent descriptors are Float -> Use NORM_L2
-    try:
-        matches = matcher.knnMatch(desc_q, desc_r, k=2)
-    except cv2.error:
-        return 0
+    if match_filter == "mutual":
+        src_idx, dst_idx = mutual_nn_matches(desc_q, desc_r)
+        if len(src_idx) < 4:
+            return 0
+        src_pts = kpts_q[src_idx].reshape(-1, 1, 2).astype(np.float32)
+        dst_pts = kpts_r[dst_idx].reshape(-1, 1, 2).astype(np.float32)
+    else:
+        # SuperEvent descriptors are Float -> Use NORM_L2
+        try:
+            matches = matcher.knnMatch(desc_q, desc_r, k=2)
+        except cv2.error:
+            return 0
 
-    good = []
-    # Ratio Test (0.75 - 0.8 is standard)
-    for m_n in matches:
-        if len(m_n) == 2 and m_n[0].distance < 0.8 * m_n[1].distance:
-            good.append(m_n[0])
+        good = []
+        # Ratio Test (0.75 - 0.8 is standard)
+        for m_n in matches:
+            if len(m_n) == 2 and m_n[0].distance < match_ratio * m_n[1].distance:
+                good.append(m_n[0])
 
-    if len(good) < 4:
-        return 0
+        if len(good) < 4:
+            return 0
 
-    # 2. Extract matched points
-    src_pts = np.float32([kpts_q[m.queryIdx] for m in good]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kpts_r[m.trainIdx] for m in good]).reshape(-1, 1, 2)
+        # 2. Extract matched points
+        src_pts = np.float32([kpts_q[m.queryIdx] for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kpts_r[m.trainIdx] for m in good]).reshape(-1, 1, 2)
 
     # 3. Geometric Verification (Homography + RANSAC)
     # RANSAC thresh: max reprojection error in pixels (e.g., 3.0 to 5.0)

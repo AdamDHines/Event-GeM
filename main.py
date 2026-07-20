@@ -20,7 +20,7 @@ def main():
                             help="Reconstruction time window in milliseconds for event datasets")
     parser.add_argument("--mcts-time", type=float, nargs='+', default=[10, 20, 30, 40, 50],
                             help="Space-separated list of temporal window sizes in msec.")
-    parser.add_argument("--data-root", type=str, default="./eventgem/data", 
+    parser.add_argument("--data-root", type=str, default="/media/adam/vprdatasets/eventgem/", 
                             help="Root directory for datasets")
     parser.add_argument("--kp-pattern", type=str, default="kp_{:05d}.feat.npz",
                             help="File pattern for keypoint features")
@@ -42,6 +42,15 @@ def main():
     # Model parameters
     parser.add_argument("--backbone-ckpt", type=str, default="./eventgem/ckpt/pr.pt",
                             help="Path to the backbone checkpoint")
+    parser.add_argument("--global-backbone", type=str, default="ecdpt", choices=["ecdpt", "superevent"],
+                            help="Which backbone produces the global GeM descriptor: the ECDPT ViT (default) "
+                                 "or GeM over SuperEvent's pre-head FPN map (single-backbone pipeline)")
+    parser.add_argument("--gem-p", type=float, default=5.0,
+                            help="GeM pooling exponent for the global descriptor")
+    parser.add_argument("--gem-whiten", action="store_true",
+                            help="PCA-whiten the global descriptor, fit on the reference bank only. "
+                                 "Equalises the badly anisotropic channel variances that GeM "
+                                 "produces; large gain in shortlist recall for the superevent path")
     parser.add_argument("--se-config", type=str, default="eventgem/external/superevent/config/super_event.yaml",
                     help="Path to the SuperEvent config file")
     parser.add_argument("--se-weights", type=str, default="eventgem/external/superevent/saved_models/super_event_weights.pth",
@@ -59,7 +68,11 @@ def main():
     parser.add_argument("--inlier-weight", type=float, default=0.05, 
                             help="Distance subtraction per inlier")
     parser.add_argument("--match-ratio", type=float, default=0.8,
-                            help="Match ratio for keypoint matching")
+                            help="Match ratio for keypoint matching (only used by --match-filter ratio)")
+    parser.add_argument("--match-filter", type=str, default="ratio", choices=["ratio", "mutual"],
+                            help="Correspondence filter before RANSAC. 'ratio' is Lowe's ratio test; "
+                                 "'mutual' keeps only mutual nearest neighbours, which survives "
+                                 "cross-condition appearance change far better on event data")
     parser.add_argument('--clip-distance', type=float, default=80.0,
                         help='Max depth distance for visualization clipping.')
     parser.add_argument('--gamma', type=float, default=0.2,

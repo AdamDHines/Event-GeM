@@ -73,7 +73,101 @@ class EventGeM:
 
     def GeM(self, feats, p=5.0):
         return F.avg_pool2d((feats.clamp(min=1e-6)).pow(p), (feats.shape[-2], feats.shape[-1])).pow(1.0/p)
-    
+
+    def fit_whitening(self, ref_feats, eps=1e-8):
+        """
+        PCA-whitening for the global descriptor, fit on the reference bank only.
+
+        GeM with a large exponent produces descriptors whose channel variances differ by orders of
+        magnitude, so a handful of channels dominate the cosine similarity. Equalising them is worth
+        far more than it costs: base R@50 on the sunset2->morning pair rises 69.9 -> 79.9%. Only the
+        reference bank is used to fit, which is the database side and is always available offline,
+        so no query information leaks into the transform.
+
+        Note this is *whitening*, not plain PCA -- centring and rotating without equalising the
+        variances makes retrieval substantially worse.
+        """
+        mu = ref_feats.mean(dim=0, keepdim=True)
+        centred = ref_feats - mu
+        # SVD of the centred bank; eigenvalues of the covariance are S^2 / (N - 1).
+        _, S, Vh = torch.linalg.svd(centred, full_matrices=False)
+        scale = 1.0 / torch.sqrt(torch.clamp(S.pow(2) / max(len(ref_feats) - 1, 1), min=eps))
+
+        def transform(x):
+            return ((x - mu) @ Vh.t()) * scale
+
+        print(f"[INFO] PCA-whitening fit on {len(ref_feats)} reference descriptors "
+              f"({ref_feats.shape[1]}-D)")
+        return transform
+
+    def extract_superevent_features(self, sim_file):
+        """
+        Global descriptors from SuperEvent's pre-head feature map, as a drop-in
+        replacement for the ECDPT ViT.
+
+        `SuperEvent.forward` computes `features = self.fpn(self.backbone(x))` and only then
+        branches to the detector and descriptor heads. GeM pooling that shared map yields a
+        128-D global descriptor from the same forward pass keypoint extraction already runs,
+        so this path removes the ECDPT backbone entirely rather than adding to it.
+
+        Descriptors come from the MCTS frames (the input SuperEvent expects), not the
+        polarity frames the ECDPT path consumes, so the resulting matrix can differ by a
+        frame or two per sequence.
+        """
+        device = self.device
+
+        model, se_config = self.build_superevent_model(
+            Path(self.se_config), Path(self.se_weights), device
+        )
+
+        root = Path(self.data_root)
+        ref_mcts_dir = root / self.dataset / self.reference / f"mcts_{self.reference}_{self.mcts_time[-1]}"
+        query_mcts_dir = root / self.dataset / self.query / f"mcts_{self.query}_{self.mcts_time[-1]}"
+
+        if (not ref_mcts_dir.exists()) or (not query_mcts_dir.exists()):
+            print("[INFO] MCTS frames not found. Generating MCTS frames for reference and query sets...")
+            gen_mcts(str(root), self.dataset, self.reference, self.query, self.mcts_time)
+
+        ref_dataset = EventGeMMCTS(str(ref_mcts_dir), se_config)
+        query_dataset = EventGeMMCTS(str(query_mcts_dir), se_config)
+        ref_loader = torch.utils.data.DataLoader(
+            ref_dataset, batch_size=self.keypoint_batch_size, shuffle=False, num_workers=4
+        )
+        query_loader = torch.utils.data.DataLoader(
+            query_dataset, batch_size=self.keypoint_batch_size, shuffle=False, num_workers=4
+        )
+
+        def pool_loader(loader, desc):
+            feats = []
+            with torch.inference_mode():
+                for batch in tqdm(loader, desc=desc, unit="batch"):
+                    batch = batch.to(device, non_blocking=True)
+                    # Stop at the FPN: the detector head and the x8 descriptor
+                    # interpolation are not needed for a global descriptor.
+                    features = model.fpn(model.backbone(batch))
+                    pooled = self.GeM(features.float(), p=self.gem_p)
+                    feats.append(pooled.squeeze(-1).squeeze(-1).detach().cpu())
+            return torch.cat(feats, dim=0)
+
+        ref_feats = pool_loader(ref_loader, "Extracting reference features (SuperEvent)")
+        torch.save(ref_feats, os.path.join(self.outdir, f"{self.dataset}_{self.reference}_features.pt"))
+
+        query_feats = pool_loader(query_loader, "Extracting query features (SuperEvent)")
+        torch.save(query_feats, os.path.join(self.outdir, f"{self.dataset}_{self.query}_features.pt"))
+
+        print(f"[INFO] SE-GeM descriptors: ref {tuple(ref_feats.shape)} | query {tuple(query_feats.shape)}")
+
+        if getattr(self, "gem_whiten", False):
+            whiten = self.fit_whitening(ref_feats)
+            ref_feats, query_feats = whiten(ref_feats), whiten(query_feats)
+
+        # Same cosine convention as the ECDPT path: rows = references, cols = queries.
+        ref_feats = F.normalize(ref_feats, p=2, dim=1)
+        query_feats = F.normalize(query_feats, p=2, dim=1)
+        sim_matrix = torch.matmul(query_feats, ref_feats.t()).T
+        torch.save(sim_matrix, sim_file)
+
+
     def extract_features(self, sim_file):
         # Define backbone model (This is a ViT, as confirmed by your checkpoint)
         backbone = vit_contrastive_patch16_small(mask_ratio=0.0, in_chans=2, num_classes=512)
@@ -169,12 +263,22 @@ class EventGeM:
         self.reference_path = os.path.join(root, self.dataset, self.reference, f"{self.reference}-frames-{self.dt_ms}")
         self.query_path = os.path.join(root, self.dataset, self.query, f"{self.query}-frames-{self.dt_ms}")
         update_config(root, self.dataset, self.reference, self.query, time=self.dt_ms, stream=self.stream, demo=self.demo)
-        # Run feature extraction for reference and query sets
-        self.outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")
+        # Run feature extraction for reference and query sets. The SuperEvent global
+        # descriptors live in their own directory so they never clobber the ECDPT baseline.
+        pair_dir = f"{self.reference}-{self.query}"
+        if self.global_backbone != "ecdpt":
+            pair_dir = f"{pair_dir}-{self.global_backbone}"
+        if getattr(self, "gem_whiten", False):
+            pair_dir = f"{pair_dir}-whiten"
+        self.outdir = os.path.join(self.feature_out, self.dataset, pair_dir)
         os.makedirs(self.outdir, exist_ok=True)
         sim_file = os.path.join(self.outdir, f"{self.dataset}_{self.reference}_{self.query}_similarity.pt")
+        self.sim_file = sim_file
         if self.rerun_features or not os.path.exists(sim_file) and not self.stream:
-            self.extract_features(sim_file)
+            if self.global_backbone == "superevent":
+                self.extract_superevent_features(sim_file)
+            else:
+                self.extract_features(sim_file)
         elif self.stream:
             print("[INFO] Running in streaming mode. Extracting features on-the-fly without saving to disk.")
             stream_file(self.args)  # This will run the streaming inference logic defined in inference.py
@@ -545,6 +649,8 @@ class EventGeM:
                 kp_pattern=kp_pattern,
                 ransac_thresh=self.ransac_thresh,
                 inlier_weight=self.inlier_weight,
+                match_filter=getattr(self, "match_filter", "ratio"),
+                match_ratio=float(getattr(self, "match_ratio", 0.8)),
             )
             for i in tqdm(range(Q), desc="Re-ranking (Keypoints)")
         )
@@ -798,14 +904,15 @@ class EventGeM:
 
     
     def rerank_inference(self):
-        # 1. Load Global Similarity Matrix
-        sim_matrix_path = os.path.join(
-            self.feature_out, 
-            self.dataset, 
-            f"{self.reference}-{self.query}", 
+        # 1. Load Global Similarity Matrix (set by feature_inference, which knows which
+        #    global backbone produced it)
+        sim_matrix_path = getattr(self, "sim_file", None) or os.path.join(
+            self.feature_out,
+            self.dataset,
+            f"{self.reference}-{self.query}",
             f"{self.dataset}_{self.reference}_{self.query}_similarity.pt"
         )
-        
+
         if not os.path.exists(sim_matrix_path):
             raise FileNotFoundError(f"Similarity matrix not found: {sim_matrix_path}")
 
