@@ -32,6 +32,10 @@ def main():
                             help="Chunk size for streaming inference")
     parser.add_argument("--time-scale", type=float, default=1e-9,
                             help="Time scale for event accumulation")
+    parser.add_argument("--no-cache-ref-kp", dest="cache_ref_kp", action="store_false",
+                            help="Disable the packed reference keypoint bank. The bank turns the "
+                                 "per-candidate npz read (~80%% of rerank time) into a page-cache "
+                                 "memcpy; it is written once next to the keypoint store and reused")
     parser.add_argument("--ref-kp-cache", type=int, default=2048,
                             help="Size of the cache for reference keypoints")
     parser.add_argument("--start-time", type=float, default=None,

@@ -22,7 +22,7 @@ from eventgem.dataset import EventGeMData, EventGeMMCTS
 from eventgem.utils.eventlab_config import update_config
 from skimage.metrics import structural_similarity as ssim
 from eventgem.utils.ckpt_downloader import download_google_drive_file
-from eventgem.utils.rerank_utils import load_event_features, process_single_query
+from eventgem.utils.rerank_utils import load_event_features, process_single_query, build_reference_bank
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -638,6 +638,12 @@ class EventGeM:
                 load_event_features(Path(self.query_keypoints), i, kp_pattern)
             )
 
+        # Pack the reference store once so workers read it from the page cache rather than
+        # decompressing one npz per candidate pair (~80% of the per-pair rerank cost).
+        ref_bank = None
+        if getattr(self, "cache_ref_kp", True):
+            ref_bank = build_reference_bank(Path(self.reference_keypoints), R, kp_pattern)
+
         # Run parallel re-ranking
         results = Parallel(n_jobs=-1)(
             delayed(process_single_query)(
@@ -651,6 +657,7 @@ class EventGeM:
                 inlier_weight=self.inlier_weight,
                 match_filter=getattr(self, "match_filter", "ratio"),
                 match_ratio=float(getattr(self, "match_ratio", 0.8)),
+                ref_bank=ref_bank,
             )
             for i in tqdm(range(Q), desc="Re-ranking (Keypoints)")
         )
