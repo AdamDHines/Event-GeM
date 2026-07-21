@@ -12,7 +12,6 @@ from torch.nn import functional as F
 import time
 import json
 import os
-from skimage.metrics import structural_similarity as ssim
 import sinabs.layers as sl
 from tqdm import tqdm
 import logging
@@ -22,7 +21,6 @@ import stat
 
 from datetime import timedelta
 from collections import deque
-import dv_processing as dv
 
 import struct
 

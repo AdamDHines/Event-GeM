@@ -1,2 +1,4 @@
-{"chat.extensionUnification.enabled": false
+{
+    "chat.extensionUnification.enabled": false,
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }

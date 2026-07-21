@@ -16,7 +16,7 @@ def create_GTtol(GT: np.ndarray, tolerance: int) -> np.ndarray:
         GTtol[r0:r1, c0:c1] = 1
     return GTtol
 
-def recall(original, keypoint, depth, gt, k=[1, 5, 10]):
+def recall(original, keypoint, gt, k=[1, 5, 10]):
     """
     Computes Recall@K for original and re-ranked results.
     Args:
@@ -45,10 +45,9 @@ def recall(original, keypoint, depth, gt, k=[1, 5, 10]):
     rec_base = {k: recallAtK((1 - original), gt, k) for k in ks}
 
     has_kp = keypoint is not None
-    has_depth = depth is not None
 
     # ---- 1) Keypoint-only table ----
-    if has_kp and not has_depth:
+    if has_kp:
         table = PrettyTable()
         table.field_names = ["K", "Recall (Base)", "Recall (Keypoint)"]
 
@@ -56,31 +55,6 @@ def recall(original, keypoint, depth, gt, k=[1, 5, 10]):
             r_b = rec_base[k]
             r_kp = recallAtK((1 - keypoint), gt, k)
             table.add_row([k, f"{r_b:.4f}", f"{r_kp:.4f}"])
-
-        print(table)
-
-    # ---- 2) Depth-only table ----
-    elif has_depth and not has_kp:
-        table = PrettyTable()
-        table.field_names = ["K", "Recall (Base)", "Recall (Depth)"]
-
-        for k in ks:
-            r_b = rec_base[k]
-            r_d = recallAtK((1 - depth), gt, k)
-            table.add_row([k, f"{r_b:.4f}", f"{r_d:.4f}"])
-
-        print(table)
-
-    # ---- 3) Both table ----
-    elif has_kp and has_depth:
-        table = PrettyTable()
-        table.field_names = ["K", "Recall (Base)", "Recall (Keypoint)", "Recall (Depth)"]
-
-        for k in ks:
-            r_b = rec_base[k]
-            r_kp = recallAtK((1 - keypoint), gt, k)
-            r_d = recallAtK((1 - depth), gt, k)
-            table.add_row([k, f"{r_b:.4f}", f"{r_kp:.4f}", f"{r_d:.4f}"])
 
         print(table)
 
