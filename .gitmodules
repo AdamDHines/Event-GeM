@@ -1,6 +1,3 @@
-[submodule "eventgem/external/backbone"]
-	path = eventgem/external/backbone
-	url = https://github.com/AdamDHines/Event-Camera-Data-Pre-training.git
 [submodule "eventgem/external/superevent"]
 	path = eventgem/external/superevent
 	url = https://github.com/ethz-mrl/SuperEvent.git
@@ -11,8 +8,5 @@
 [submodule "eventgem/external/vprtutorial"]
 	path = eventgem/external/vprtutorial
 	url = https://github.com/stschubert/VPR_Tutorial.git
-[submodule "eventgem/external/depthanyevent"]
-	path = eventgem/external/depthanyevent
-	url = https://github.com/bartn8/depthanyevent.git
 [submodule "external/eventlab"]
 	branch = 0.1.1

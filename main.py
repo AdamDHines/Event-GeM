@@ -2,7 +2,6 @@ import os
 import argparse
 import numpy as np
 from eventgem.analysis import recall
-from eventgem.inference import stream
 from eventgem.feature_extraction import EventGeM
 
 def main():
@@ -24,32 +23,38 @@ def main():
                             help="Root directory for datasets")
     parser.add_argument("--kp-pattern", type=str, default="kp_{:05d}.feat.npz",
                             help="File pattern for keypoint features")
-    parser.add_argument("--depth-pattern", type=str, default="depth_{:05d}.png",
-                            help="File pattern for depth maps")
     parser.add_argument("--stream", action="store_true",
                             help="Whether to use streaming inference (for large datasets that don't fit in memory)")
     parser.add_argument("--chunk-size", type=int, default=250_000,
                             help="Chunk size for streaming inference")
     parser.add_argument("--time-scale", type=float, default=1e-9,
                             help="Time scale for event accumulation")
+    parser.add_argument("--no-cache-ref-kp", dest="cache_ref_kp", action="store_false",
+                            help="Disable the packed reference keypoint bank. The bank turns the "
+                                 "per-candidate npz read (~80%% of rerank time) into a page-cache "
+                                 "memcpy; it is written once next to the keypoint store and reused")
     parser.add_argument("--ref-kp-cache", type=int, default=2048,
                             help="Size of the cache for reference keypoints")
     parser.add_argument("--start-time", type=float, default=None,
                              help="Start time for event processing (in seconds)")
     parser.add_argument("--skip", type=int, default=0,
                             help="Number of initial frames to skip (for streaming)")
+    parser.add_argument("--ref-offset", type=int, default=0,
+                            help="Offset for reference keypoint event stream start")
+    parser.add_argument("--query-offset", type=int, default=0,
+                            help="Offset for query keypoint event stream start")
 
     # Model parameters
-    parser.add_argument("--backbone-ckpt", type=str, default="./eventgem/ckpt/pr.pt",
-                            help="Path to the backbone checkpoint")
+    parser.add_argument("--gem-p", type=float, default=5.0,
+                            help="GeM pooling exponent for the global descriptor")
+    parser.add_argument("--gem-whiten", action="store_false",
+                            help="PCA-whiten the global descriptor, fit on the reference bank only. "
+                                 "Equalises the badly anisotropic channel variances that GeM "
+                                 "produces; large gain in shortlist recall for the superevent path")
     parser.add_argument("--se-config", type=str, default="eventgem/external/superevent/config/super_event.yaml",
                     help="Path to the SuperEvent config file")
     parser.add_argument("--se-weights", type=str, default="eventgem/external/superevent/saved_models/super_event_weights.pth",
                     help="Path to the SuperEvent weights file")
-    parser.add_argument('--depth-model', default='eventgem/external/depthanyevent/models/rec_dav2/synth/synth.pth', 
-                        help='Path to model checkpoint')
-    parser.add_argument('--depth-config', type=str, default='eventgem/external/depthanyevent/configs/test/recdav2/rec_dav2_mvsec_test.json',
-                        help='Path to config file. If not specified, config from model folder/checkpoint is used')
     parser.add_argument("--top-k", type=int, default=50,
                             help="Number of top candidates to re-rank using 2D-homography")
     parser.add_argument("--se-topk", type=int, default=170,
@@ -59,29 +64,19 @@ def main():
     parser.add_argument("--inlier-weight", type=float, default=0.05, 
                             help="Distance subtraction per inlier")
     parser.add_argument("--match-ratio", type=float, default=0.8,
-                            help="Match ratio for keypoint matching")
-    parser.add_argument('--clip-distance', type=float, default=80.0,
-                        help='Max depth distance for visualization clipping.')
-    parser.add_argument('--gamma', type=float, default=0.2,
-                        help='Gamma for depth visualization.')
-    parser.add_argument('--use_logdepth', action='store_true', default=False,
-                        help='Model outputs log-depth in [0,1] instead of linear meters')
-    parser.add_argument('--reg_factor', type=float, default=3.70378,
-                        help='Regularization factor for log-depth conversion')
-    parser.add_argument("--backbone-batch-size", type=int, default=32,
-                            help="Batch size for feature extraction")
+                            help="Match ratio for keypoint matching (only used by --match-filter ratio)")
+    parser.add_argument("--match-filter", type=str, default="mutual", choices=["ratio", "mutual"],
+                            help="Correspondence filter before RANSAC. 'ratio' is Lowe's ratio test; "
+                                 "'mutual' keeps only mutual nearest neighbours, which survives "
+                                 "cross-condition appearance change far better on event data")
     parser.add_argument("--keypoint-batch-size", type=int, default=16,
                             help="Batch size for feature extraction")
     parser.add_argument("--feature-out", type=str, default="./eventgem/features",
                             help="Directory to save extracted features")
     parser.add_argument("--keypoint-out", type=str, default="./eventgem/keypoints",
                             help="Directory to save detected keypoints")
-    parser.add_argument("--depth-out", type=str, default="./eventgem/depth",
-                            help="Directory to save predicted depth maps")
-    parser.add_argument("--rerank_mode", type=str, default="keypoints", choices=["keypoints", "depth", "both"],
-                            help="Which results to evaluate: original, reranked, or both")
     parser.add_argument("--method", type=str,  default="eventgem", 
-                choices=["eventgem", "eventgem-d", "ecdpt", "superevent", "lens", "sparse", "eventvlad"],
+                choices=["eventgem", "ecdpt", "superevent", "lens", "sparse", "eventvlad"],
                 help="Which method to run (for ablation or comparison)")
     
     # Re-run options
@@ -89,8 +84,6 @@ def main():
                             help="Whether to re-run feature extraction even if features already exist")
     parser.add_argument("--rerun-keypoints", action="store_true",
                             help="Whether to re-run keypoint inference even if keypoints already exist")
-    parser.add_argument("--rerun-depth", action="store_true",
-                            help="Whether to re-run depth inference even if depth already exist")
     parser.add_argument("--extract-reference", action="store_true",
                             help="Whether to extract features for the reference sequence (only needed if not using pre-generated features)")
 
@@ -109,28 +102,22 @@ def main():
     # Initialize and run Event-GeM inference
     eventgem = EventGeM(args)
     eventgem.feature_inference()
-    if not args.stream:
-        # Generate keypoints
-        eventgem.keypoint_inference()
 
-        if args.method == "eventgem-d":
-            # Generate depth maps
-            eventgem.depth_inference(args)
-        
+    if not args.stream:
         # GT file from eventlab
         gt_file = f"{args.data_root}/{args.dataset}/ground_truth/{args.reference}_{args.query}_GT.npy"
         gt = np.load(gt_file)
 
         # Run re-ranking
-        original, reranked, reranked_depth = eventgem.rerank_inference()
+        original, reranked = eventgem.rerank_inference()
 
         # save all the sim mats
-        np.save("original_sim_mat.npy", original)
-        np.save("reranked_sim_mat.npy", reranked)
-        np.save("reranked_depth_sim_mat.npy", reranked_depth)
+        os.makedirs(f"{args.data_root}/{args.dataset}/{args.reference}-{args.query}-similarity", exist_ok=True)
+        np.save(f"{args.data_root}/{args.dataset}/{args.reference}-{args.query}-similarity/original_sim_mat.npy", original)
+        np.save(f"{args.data_root}/{args.dataset}/{args.reference}-{args.query}-similarity/reranked_sim_mat.npy", reranked)
 
         # Run recall evaluation
-        recall(original, reranked, reranked_depth, gt)
+        recall(original, reranked, gt)
 
 if __name__ == "__main__":
     main()

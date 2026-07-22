@@ -15,16 +15,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from eventgem.external.depthanyevent.models import fetch_model  # from the DepthAnyEvent repo
 import imageio
 import matplotlib.pyplot as plt
 THIS_DIR = Path(__file__).resolve().parent
-BACKBONE_ROOT = THIS_DIR / "external" / "backbone"
 SUPEREVENT_ROOT = THIS_DIR / "external" / "superevent"
 
 # Order matters: backbone's `utils` must win
 sys.path.insert(0, str(SUPEREVENT_ROOT))
-sys.path.insert(0, str(BACKBONE_ROOT))
 
 # ---------------------------
 # Main
@@ -53,7 +50,6 @@ def stream_file(args):
     ref_depth_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Extracted reference features will be saved to: {ref_feats_dir}")
     print(f"[INFO] Extracted reference keypoints will be saved to: {ref_kp_dir}")
-    print(f"[INFO] Extracted reference depth maps will be saved to: {ref_depth_dir}")
     gt_path = f"{args.data_root}/{args.dataset}/ground_truth/{args.reference}_{args.query}_GT.npy"
     # If running the demo, download the reference features and kps
     if args.demo:

@@ -2,12 +2,11 @@
 authors = ["Adam D. Hines <adam.hines@qut.edu.au>, Gokul B. Nair, Nicolas Guillermo Marticorena Vidal, Michael Milford, Tobias Fischer"]
 channels = ["conda-forge", "adamhines"]
 name = "EventGeM"
-platforms = ["linux-64", "linux-aarch64"]
+platforms = [
+    { platform = "linux-64", cuda = "12", glibc = "2.35" },
+    { platform = "linux-aarch64", cuda = "12", glibc = "2.35" },
+]
 version = "0.1.0"
-
-[system-requirements]
-cuda = "12"
-libc = {family="glibc", version="2.35"}
 
 [tasks]
 eventgem = {cmd = "pixi run python3 main.py"}
@@ -17,19 +16,27 @@ inference-jetson = {cmd = "pixi run python3 eventgem/inference-jetson.py"}
 
 demo = {cmd = "pixi run python3 main.py --dataset brisbane_event --reference sunset2 --query sunset1 --start-time 1587452582.35 --skip 20 --stream --demo"}
 
-[target.linux-64.dependencies]
-python = ">3.8"
+# Paper specific comparisons
+sunset2-sunset1 = {cmd = "pixi run eventgem -d brisbane_event -r sunset2 -q sunset1 --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints --ref-offset 1587540271650 --query-offset 1587452582350"}
+sunset2-morning = {cmd = "pixi run eventgem -d brisbane_event -r sunset2 -q morning --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints --ref-offset 1587540271650 --query-offset 1588029265730"}
+sunset2-daytime = {cmd = "pixi run eventgem -d brisbane_event -r sunset2 -q daytime --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints --ref-offset 1587540271650 --query-offset 1587705130800"}
+sunset2-sunrise = {cmd = "pixi run eventgem -d brisbane_event -r sunset2 -q sunrise --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints --ref-offset 1587540271650 --query-offset 1588105232910"}
+sunset2-night = {cmd = "pixi run eventgem -d brisbane_event -r sunset2 -q night --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints --ref-offset 1587540271650 --query-offset 1587975221100"}
+
+
+R0FA0-R0FS0 = {cmd = "pixi run eventgem -d nsavp -r R0_FA0 -q R0_FS0 --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints"}
+R0FA0-R1DA0 = {cmd = "pixi run eventgem -d nsavp -r R0_FA0 -q R1_DA0 --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints"}
+R0FA0-R1FA0 = {cmd = "pixi run eventgem -d nsavp -r R0_FA0 -q R1_FA0 --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints"}
+
+[dependencies]
+python = "=3.12"
 numpy = "*"
 pytorch = "*"
 pandas = "*"
 sinabs = "*"
 torchvision = "*"
-pytorch-lightning  = "*"
-einops = "*"
-timm = "*"
 yaml = "*"
 pyyaml = "*"
-flatten-dict = "*"
 opencv = "*"
 tqdm = "*"
 scikit-learn = "*"
@@ -87,59 +94,6 @@ libcufft-dev = "*"
 libcurand-dev = "*"
 libcusolver-dev = "*"
 onnxscript = "*"
-
-[target.linux-aarch64.dependencies]
-python = "*"
-numpy = "*"
-pytorch = {version = "*", channel = "adamhines"}
-libtorch = {version = "*", channel = "adamhines"}
-sinabs = "*"
-torchvision = {version = "*", channel = "adamhines"}
-pytorch-lightning  = "*"
-einops = "*"
-timm = "*"
-yaml = "*"
-pyyaml = "*"
-flatten-dict = "*"
-opencv = "*"
-tqdm = "*"
-scikit-learn = "*"
-pynmea2 = "*"
-pyarrow = "*"
-cmapy = "*"
-contourpy = "*"
-cycler = "*"
-filelock = "*"
-fonttools = "*" 
-fsspec = "*"
-h5py = "*"
-hdf5plugin = "*"
-imageio = "*"
-Jinja2 = "*"
-joblib = "*"
-kiwisolver = "*"
-kornia = "*"
-lazy_loader = "*"
-llvmlite = "*"
-MarkupSafe = "*"
-matplotlib = "*"
-mpmath = "*"
-networkx = "*"
-numba = "*"
-packaging = "*"
-pillow = "*"
-pyparsing = "*"
-python-dateutil = "*"
-scikit-image = "*"
-scipy = "*"
-six = "*"
-sympy = "*"
-threadpoolctl = "*"
-tifffile = "*"
-triton = "*"
-typing_extensions = "*"
-prettytable = "*"
-onnxscript = "*"
-
-[pypi-dependencies]
-dv-processing = "*"
+eventcv = "*"
+loguru = "*"
+requests = "*"

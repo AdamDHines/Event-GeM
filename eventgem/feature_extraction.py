@@ -5,39 +5,39 @@ import os
 import sys
 import torch
 import yaml
-import cv2
+import gc
 
+import cv2
 import numpy as np
+import eventcv as ecv
 import torch.nn.functional as F
 
-from PIL import Image
+try:
+    from threadpoolctl import threadpool_limits
+except ImportError:  # optional; without it BLAS keeps its own thread count and rerank is slower
+    from contextlib import contextmanager
+
+    @contextmanager
+    def threadpool_limits(limits=None, user_api=None):
+        yield
+
 from tqdm import tqdm
 from pathlib import Path
 from joblib import Parallel, delayed
-import eventgem.streamutils.depth as dp
 from eventgem.inference import stream_file
-import eventgem.streamutils.stream as stream
-from eventgem.utils.generate_mcts import gen_mcts
-from eventgem.dataset import EventGeMData, EventGeMMCTS
+from eventgem.dataset import EventGeMMCTS
 from eventgem.utils.eventlab_config import update_config
-from skimage.metrics import structural_similarity as ssim
-from eventgem.utils.ckpt_downloader import download_google_drive_file
-from eventgem.utils.rerank_utils import load_event_features, process_single_query
+from eventgem.utils.rerank_utils import process_single_query, open_keypoint_bank, bank_lookup
+from eventgem.utils.kp_store import KeypointStoreWriter
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Backbone path (already working)
-BACKBONE_ROOT = os.path.join(THIS_DIR, "external", "backbone")
 
 # Superevent root — where the "models" package lives
 SUPEREVENT_ROOT = os.path.join(THIS_DIR, "external", "superevent")
 
-for path in (BACKBONE_ROOT, SUPEREVENT_ROOT):
+for path in (SUPEREVENT_ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
-
-# Backbone import (unchanged)
-from eventgem.external.backbone.model.ours_model.ours_model_pretrain import vit_contrastive_patch16_small
 
 # Now "models" resolves to eventgem/external/superevent/models
 from models.super_event import SuperEvent, SuperEventFullRes
@@ -46,16 +46,10 @@ from models.util import fast_nms
 import matplotlib.pyplot as plt
 
 
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-BACKBONE_ROOT = os.path.join(THIS_DIR, "external", "backbone")
-if BACKBONE_ROOT not in sys.path:
-    sys.path.insert(0, BACKBONE_ROOT)
-from eventgem.external.backbone.model.ours_model.ours_model_pretrain import vit_contrastive_patch16_small
-
 class EventGeM:
     def __init__(self, args):
         # Before running, ensure repository was cloned with --recurse-submodules
-        submodule_paths = ["./eventgem/external/backbone", "./eventgem/external/eventlab"]
+        submodule_paths = ["./eventgem/external/superevent", "./eventgem/external/eventlab"]
         for path in submodule_paths:
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Submodule path '{path}' not found. Please clone Event-GeM with --recurse-submodules.")
@@ -73,108 +67,208 @@ class EventGeM:
 
     def GeM(self, feats, p=5.0):
         return F.avg_pool2d((feats.clamp(min=1e-6)).pow(p), (feats.shape[-2], feats.shape[-1])).pow(1.0/p)
-    
-    def extract_features(self, sim_file):
-        # Define backbone model (This is a ViT, as confirmed by your checkpoint)
-        backbone = vit_contrastive_patch16_small(mask_ratio=0.0, in_chans=2, num_classes=512)
-        
-        # Ensure the backbone checkpoint exists
-        if not os.path.exists(self.backbone_ckpt):
-            download_google_drive_file()  # This will download the checkpoint to eventgem/ckpt/pr.pt
-            
-        print(f"Loading checkpoint from: {self.backbone_ckpt}")
-        checkpoint = torch.load(self.backbone_ckpt, map_location='cpu')
 
-        # Modify checkpoint keys
-        if isinstance(checkpoint, dict) and "checkpoint" in checkpoint:
-            state_dict = checkpoint["checkpoint"]
-        elif isinstance(checkpoint, dict) and "model" in checkpoint:
-            state_dict = checkpoint["model"]
-        elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-            state_dict = checkpoint["state_dict"]
-        else:
-            state_dict = checkpoint
+    def fit_whitening(self, ref_feats, eps=1e-8):
+        """
+        PCA-whitening for the global descriptor, fit on the reference bank only.
 
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            # Remove "encoder_q." (seen in your debug output) and "module."
-            new_key = k.replace("encoder_q.", "").replace("module.", "")
-            new_state_dict[new_key] = v
-        msg = backbone.load_state_dict(new_state_dict, strict=False)
-        
-        # Safety check
-        if "patch_embed.proj.weight" in msg.missing_keys:
-             raise RuntimeError("CRITICAL FAILURE: The input layer (patch_embed) did not load!")
-        
-        print("Backbone loaded successfully.")
-        backbone.to(self.device).eval()
+        GeM with a large exponent produces descriptors whose channel variances differ by orders of
+        magnitude, so a handful of channels dominate the cosine similarity. Equalising them is worth
+        far more than it costs: base R@50 on the sunset2->morning pair rises 69.9 -> 79.9%. Only the
+        reference bank is used to fit, which is the database side and is always available offline,
+        so no query information leaks into the transform.
 
-        # Define the DataLoaders
-        ref_dataset = EventGeMData(self.reference_path)
-        query_dataset = EventGeMData(self.query_path)
-        ref_loader = torch.utils.data.DataLoader(ref_dataset, batch_size=self.backbone_batch_size, shuffle=False, num_workers=4)
-        query_loader = torch.utils.data.DataLoader(query_dataset, batch_size=self.backbone_batch_size, shuffle=False, num_workers=4)
+        Note this is *whitening*, not plain PCA -- centring and rotating without equalising the
+        variances makes retrieval substantially worse.
+        """
+        mu = ref_feats.mean(dim=0, keepdim=True)
+        centred = ref_feats - mu
+        # SVD of the centred bank; eigenvalues of the covariance are S^2 / (N - 1).
+        _, S, Vh = torch.linalg.svd(centred, full_matrices=False)
+        scale = 1.0 / torch.sqrt(torch.clamp(S.pow(2) / max(len(ref_feats) - 1, 1), min=eps))
 
-        # Reference events
-        ref_feats = []
-        for idx, events in enumerate(tqdm(ref_loader, desc="Extracting reference features", unit="batch")):
-            events = events.to(self.device)
-            events = backbone.patch_embed(events)
-            events = events + backbone.pos_embed
-            cls_tokens = backbone.tokens.expand(events.shape[0], -1, -1)
-            events = torch.cat((cls_tokens, events), dim=1)
-            for blk in backbone.blocks:
-                events = blk(events)
-            events = backbone.norm(events)
-            patch_tokens = events[:, 2:, :]
-            B, N, C = patch_tokens.shape
-            H = W = int(N**0.5)
-            patch_tokens = patch_tokens.transpose(1, 2).reshape(B, C, H, W)
-            # Perform GeM pooling
-            feats = self.GeM(patch_tokens)
-            ref_feats.append(feats.squeeze(-1).squeeze(-1).detach().cpu())
-        ref_feats = torch.cat(ref_feats, dim=0)
+        def transform(x):
+            return ((x - mu) @ Vh.t()) * scale
+
+        print(f"[INFO] PCA-whitening fit on {len(ref_feats)} reference descriptors "
+              f"({ref_feats.shape[1]}-D)")
+        return transform
+
+    def extract_superevent_features(self, sim_file):
+        """
+        Global descriptors from SuperEvent's pre-head feature map, as a drop-in
+        replacement for the ECDPT ViT.
+
+        `SuperEvent.forward` computes `features = self.fpn(self.backbone(x))` and only then
+        branches to the detector and descriptor heads. GeM pooling that shared map yields a
+        128-D global descriptor from the same forward pass keypoint extraction already runs,
+        so this path removes the ECDPT backbone entirely rather than adding to it.
+
+        Descriptors come from the MCTS frames (the input SuperEvent expects), not the
+        polarity frames the ECDPT path consumes, so the resulting matrix can differ by a
+        frame or two per sequence.
+        """
+        device = self.device
+
+        model, se_config = self.build_superevent_model(
+            Path(self.se_config), Path(self.se_weights), device
+        )
+        ref_dir = f"{self.data_root}/{self.dataset}/{self.reference}/{self.reference}.hdf5"
+        query_dir = f"{self.data_root}/{self.dataset}/{self.query}/{self.query}.hdf5"
+
+        ref_dataset = EventGeMMCTS(ref_dir, se_config, offset=self.ref_offset)
+        query_dataset = EventGeMMCTS(query_dir, se_config, offset=self.query_offset)
+        self.ref_loader = torch.utils.data.DataLoader(
+            ref_dataset, batch_size=self.keypoint_batch_size, shuffle=False, num_workers=4, collate_fn=ecv.collate
+        )
+        self.query_loader = torch.utils.data.DataLoader(
+            query_dataset, batch_size=self.keypoint_batch_size, shuffle=False, num_workers=4, collate_fn=ecv.collate
+        )
+
+        top_k = ref_dataset.get_topk()
+        off_top, off_left, _, _ = ref_dataset.get_offsets()
+        H, W = ref_dataset.H, ref_dataset.W
+        Hc, Wc = ref_dataset.Hc, ref_dataset.Wc
+
+        def pool_loader(loader, se_config, top_k, off_top, off_left, H, W, Hc, Wc, seq, desc):
+            """
+            One pass over a sequence: GeM global descriptors *and* keypoints, from a single
+            forward of the shared trunk.
+
+            Global descriptors are small enough to accumulate (N x 128 floats), so they are
+            returned. Keypoints are not -- at up to top_k per frame over >14k frames the padded
+            descriptor block runs to gigabytes -- so they are streamed straight into one
+            memory-mapped `<seq>_kps.pt` store under `self.kps_out`, a batch at a time. Nothing
+            per-frame is retained here and nothing lands on the GPU past the batch it came from.
+            """
+            n_frames = len(loader.dataset)
+            desc_dim = int(se_config["descriptor_size"])
+            writer = KeypointStoreWriter(
+                out_path=os.path.join(self.kps_out, f"{self.dataset}_{seq}_kps.pt"),
+                n_frames=n_frames,
+                k_max=top_k,
+                desc_dim=desc_dim,
+                image_shape=(H, W),
+            )
+
+            feats = []
+            try:
+                with torch.inference_mode():
+                    for batch in tqdm(loader, desc=desc, unit="batch"):
+                        batch = batch.to(device, non_blocking=True)
+                        # The trunk is the dominant cost (4.0 ms/frame vs 0.1 for the detector),
+                        # so it is run once and both heads branch off it, exactly as
+                        # SuperEvent.forward does -- calling model(batch) here would pay for the
+                        # backbone and FPN a second time.
+                        features = model.fpn(model.backbone(batch))
+                        pooled = self.GeM(features.float(), p=self.gem_p)
+                        feats.append(pooled.squeeze(-1).squeeze(-1).detach().cpu())
+
+                        _, prob = model.detector(features)      # (B, Hc, Wc)
+                        _, desc_map = model.descriptor(features) # (B, D, Hc, Wc)
+
+                        # NMS to get keypoints + scores per image in batch
+                        kpts_all, scores_all = fast_nms(prob, se_config, top_k=top_k)
+
+                        B = batch.shape[0]
+
+                        # One padded block per batch, filled on the GPU and copied down in a
+                        # single transfer rather than three small copies per frame.
+                        blk_kpts = torch.zeros(B, top_k, 2, device=device)
+                        blk_desc = torch.zeros(B, top_k, desc_dim, device=device)
+                        blk_scores = torch.zeros(B, top_k, device=device)
+                        blk_counts = torch.zeros(B, dtype=torch.int32)
+
+                        for b in range(B):
+                            n = min(len(kpts_all[b]), top_k)
+                            if n == 0:
+                                continue
+
+                            # Keypoints and scores for this image
+                            kpts = kpts_all[b][:n].float()  # (n, 2) (y, x) in cropped coords
+                            scores = scores_all[b][:n]      # (n,)
+
+                            # Sample descriptors at keypoints, from this image's slice of the map
+                            blk_desc[b, :n] = self.sample_descriptors_at_kpts(
+                                kpts.to(device),
+                                desc_map[b:b + 1],
+                                Hc,
+                                Wc,
+                            )  # (n, D)
+
+                            # Undo crop: back to original full image coords, as (x, y)
+                            blk_kpts[b, :n, 0] = kpts[:, 1] + off_left  # x
+                            blk_kpts[b, :n, 1] = kpts[:, 0] + off_top   # y
+                            blk_scores[b, :n] = scores
+                            blk_counts[b] = n
+
+                        # .cpu() so the store is device-agnostic downstream
+                        writer.add_batch(
+                            keypoints=blk_kpts.cpu(),
+                            descriptors=blk_desc.float().cpu(),
+                            scores=blk_scores.float().cpu(),
+                            counts=blk_counts,
+                        )
+
+                writer.save()
+            finally:
+                writer.cleanup()
+
+            return torch.cat(feats, dim=0)
+
+        ref_feats = pool_loader(self.ref_loader, se_config, top_k, off_top, off_left, H, W, Hc, Wc,
+                                self.reference, "Extracting reference features (SuperEvent)")
         torch.save(ref_feats, os.path.join(self.outdir, f"{self.dataset}_{self.reference}_features.pt"))
 
-        # Query events
-        query_feats = []
-        for events in tqdm(query_loader, desc="Extracting query features", unit="batch"):
-            events = events.to(self.device)
-            events = backbone.patch_embed(events)
-            events = events + backbone.pos_embed
-            cls_tokens = backbone.tokens.expand(events.shape[0], -1, -1)
-            events = torch.cat((cls_tokens, events), dim=1)
-            for blk in backbone.blocks:
-                events = blk(events)
-            events = backbone.norm(events)
-            patch_tokens = events[:, 2:, :]
-            B, N, C = patch_tokens.shape
-            H = W = int(N**0.5)
-            patch_tokens = patch_tokens.transpose(1, 2).reshape(B, C, H, W)
-            # Perform GeM pooling
-            feats = self.GeM(patch_tokens)
-            query_feats.append(feats.squeeze(-1).squeeze(-1).detach().cpu())
-        query_feats = torch.cat(query_feats, dim=0)
+        query_feats = pool_loader(self.query_loader, se_config, top_k, off_top, off_left, H, W, Hc, Wc,
+                                  self.query, "Extracting query features (SuperEvent)")
         torch.save(query_feats, os.path.join(self.outdir, f"{self.dataset}_{self.query}_features.pt"))
 
-        # Compute cosine similarity
+        print(f"[INFO] SE-GeM descriptors: ref {tuple(ref_feats.shape)} | query {tuple(query_feats.shape)}")
+
+        if getattr(self, "gem_whiten", False):
+            whiten = self.fit_whitening(ref_feats)
+            ref_feats, query_feats = whiten(ref_feats), whiten(query_feats)
+
+        # Same cosine convention as the ECDPT path: rows = references, cols = queries.
         ref_feats = F.normalize(ref_feats, p=2, dim=1)
         query_feats = F.normalize(query_feats, p=2, dim=1)
         sim_matrix = torch.matmul(query_feats, ref_feats.t()).T
         torch.save(sim_matrix, sim_file)
+
+        # delete the matrices for memory
+        del ref_feats
+        del query_feats
+        del sim_matrix
+
+        # Drop the loaders too: they hold the open event streams and their worker state, and
+        # nothing downstream of extraction needs them. Reranking starts immediately after this
+        # and is the peak-memory phase of the run.
+        self.ref_loader = self.query_loader = None
+        del model
+
+        # clear cuda cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
 
     def feature_inference(self):
         # Check that the specified datasets exist - need frame reconstructued directories
         root = self.data_root
         self.reference_path = os.path.join(root, self.dataset, self.reference, f"{self.reference}-frames-{self.dt_ms}")
         self.query_path = os.path.join(root, self.dataset, self.query, f"{self.query}-frames-{self.dt_ms}")
-        update_config(root, self.dataset, self.reference, self.query, time=self.dt_ms, stream=self.stream, demo=self.demo)
-        # Run feature extraction for reference and query sets
-        self.outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")
+        # update_config(root, self.dataset, self.reference, self.query, time=self.dt_ms, stream=self.stream, demo=self.demo)
+        # Run feature extraction for reference and query sets. The SuperEvent global
+        # descriptors live in their own directory so they never clobber the ECDPT baseline.
+        pair_dir = f"{self.reference}-{self.query}"
+        self.outdir = os.path.join(self.feature_out, self.dataset, pair_dir)
+        self.kps_out = os.path.join(self.keypoint_out, self.dataset, pair_dir)
         os.makedirs(self.outdir, exist_ok=True)
+        os.makedirs(self.kps_out, exist_ok=True)
         sim_file = os.path.join(self.outdir, f"{self.dataset}_{self.reference}_{self.query}_similarity.pt")
+        self.sim_file = sim_file
         if self.rerun_features or not os.path.exists(sim_file) and not self.stream:
-            self.extract_features(sim_file)
+            self.extract_superevent_features(sim_file)
         elif self.stream:
             print("[INFO] Running in streaming mode. Extracting features on-the-fly without saving to disk.")
             stream_file(self.args)  # This will run the streaming inference logic defined in inference.py
@@ -257,27 +351,6 @@ class EventGeM:
         desc_sampled = desc_sampled[0, :, 0, :].t()
         desc_sampled = F.normalize(desc_sampled, p=2, dim=1)
         return desc_sampled
-
-    def debug_plot_keypoints(self, mcts_img, kpts_yx, save_path="debug_kpts.png"):
-        """
-        mcts_img: The tensor or numpy array [H, W] or [H, W, 3]
-        kpts_yx: The keypoints in [N, 2] format (y, x)
-        """
-        if torch.is_tensor(mcts_img):
-            img = mcts_img.detach().cpu().numpy()
-        else:
-            img = mcts_img
-
-        # Normalize image for visualization if it's raw event data
-        img = ((img - img.min()) / (img.max() - img.min() + 1e-8) * 255).astype(np.uint8)
-        if len(img.shape) == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-        for y, x in kpts_yx:
-            cv2.circle(img, (int(x), int(y)), 2, (0, 255, 0), -1)
-
-        cv2.imwrite(save_path, img)
-        print(f"[DEBUG] Keypoint visualization saved to {save_path}")
 
     def extract_superevent_features_for_dir(
         self,
@@ -439,396 +512,99 @@ class EventGeM:
                 device=device
             )
 
-    # ----------------------------------------------------------
-    # Depth helpers (kept consistent)
-    # ----------------------------------------------------------
-
-    class _DepthLRUCache:
-        """Tiny LRU cache for *downsampled* reference depth maps."""
-        def __init__(self, max_items: int = 512):
-            from collections import OrderedDict
-            self.max_items = int(max_items)
-            self._d = OrderedDict()
-
-        def get(self, key: int):
-            if key in self._d:
-                self._d.move_to_end(key)
-                return self._d[key]
-            return None
-
-        def put(self, key: int, value: np.ndarray):
-            self._d[key] = value
-            self._d.move_to_end(key)
-            if len(self._d) > self.max_items:
-                self._d.popitem(last=False)
-
-    def _load_depth_map(self, depth_dir: Path, idx: int, pattern: str, index_offset: int = 0, down_hw=None):
-        """
-        Load a single depth PNG (expected 16-bit), return float32.
-        Optionally downsamples to down_hw=(H,W) for speed.
-        """
-        import cv2
-        path = depth_dir / pattern.format(idx + index_offset)
-        if not path.exists():
-            return None
-        D = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-        if D is None:
-            return None
-        if D.ndim == 3:
-            D = D[..., 0]
-        D = D.astype(np.float32)
-        if down_hw is not None:
-            Ht, Wt = int(down_hw[0]), int(down_hw[1])
-            D = cv2.resize(D, (Wt, Ht), interpolation=cv2.INTER_AREA)
-        return D
-
-    def _huber_mean(self, x: np.ndarray, delta: float) -> float:
-        ax = np.abs(x)
-        quad = np.minimum(ax, delta)
-        lin = ax - quad
-        return float(np.mean(0.5 * quad * quad + delta * lin))
-
-    def _depth_affine_distance_resized(self, Rr: np.ndarray, Qr: np.ndarray) -> float:
-        """
-        Per-pair scale+shift align Q->R and compute robust residual.
-        Assumes Rr and Qr are already resized to the same shape.
-        """
-        if Rr is None or Qr is None:
-            return np.inf
-
-        valid = np.isfinite(Rr) & np.isfinite(Qr) & (Rr > 0) & (Qr > 0)
-        if valid.sum() < 500:
-            return np.inf
-
-        r = Rr[valid].reshape(-1)
-        q = Qr[valid].reshape(-1)
-
-        A = np.stack([q, np.ones_like(q)], axis=1)
-        (s, t), *_ = np.linalg.lstsq(A, r, rcond=None)
-
-        diff = (s * Qr + t - Rr)[valid]
-
-        spread = float(np.percentile(r, 95) - np.percentile(r, 5))
-        delta = max(1e-6, 0.05 * spread)
-        return self._huber_mean(diff, delta)
-
-    # ----------------------------------------------------------
-    # Keypoint rerank (memory-safe)
-    # ----------------------------------------------------------
-
 # ----------------------------------------------------------
     # Keypoint rerank (Parallelized)
     # ----------------------------------------------------------
 
-    def rerank(self, kp_pattern="mcts_{:05d}.feat.npz"):
+    def kp_store_path(self, seq):
+        """Path of the single-file keypoint store for one sequence, as written by `pool_loader`."""
+        return os.path.join(self.kps_out, f"{self.dataset}_{seq}_kps.pt")
+
+    def rerank(self):
         """
         Re-rank the top-k candidates using 2D-homology/inliers.
         Parallelized using joblib for speed.
+
+        Both sides come from the `<seq>_kps.pt` stores written during feature extraction. They are
+        already packed and padded, so there is no per-frame file to open and no bank to build:
+        the reference store is memory-mapped once per worker (see `open_keypoint_bank`) and query
+        frames are cut out of the query store as tasks are dispatched, which keeps resident memory
+        at a few frames rather than the whole ~2 GB traverse.
         """
         R, Q = self.original.shape
 
-        # Pre-load all query features into memory to avoid redundant disk I/O in workers
-        queries_data = []
-        for i in tqdm(range(Q), desc="Pre-loading query features"):
-            queries_data.append(
-                load_event_features(Path(self.query_keypoints), i, kp_pattern)
-            )
+        ref_store = self.kp_store_path(self.reference)
+        query_store = self.kp_store_path(self.query)
+        for path in (ref_store, query_store):
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"Keypoint store not found: {path}. Re-run feature extraction "
+                    f"(--rerun-features) to write it.")
 
-        # Run parallel re-ranking
-        results = Parallel(n_jobs=-1)(
-            delayed(process_single_query)(
-                q_idx=i,
-                base_dists=self.original[:, i],
-                top_k=self.top_k,
-                q_data=queries_data[i],
-                ref_kp_dir=Path(self.reference_keypoints),
-                kp_pattern=kp_pattern,
-                ransac_thresh=self.ransac_thresh,
-                inlier_weight=self.inlier_weight,
-            )
-            for i in tqdm(range(Q), desc="Re-ranking (Keypoints)")
-        )
+        query_bank = open_keypoint_bank(query_store)
+        n_query_frames = len(query_bank[2])
+        if n_query_frames != Q:
+            print(f"[WARN] query store has {n_query_frames} frames but the similarity matrix has "
+                  f"{Q} columns; reranking the overlap only")
 
-        # Assemble results
+        # Assemble into the output up front so completed columns can be written straight into it.
         self.keypoint_reranked = self.original.copy()
-        for q_idx, new_col in results:
-            self.keypoint_reranked[:, q_idx] = new_col
 
-    # ----------------------------------------------------------
-    # Updated Depth Helpers
-    # ----------------------------------------------------------
-
-    def _compute_robust_depth_distance(self, Rr: np.ndarray, Qr: np.ndarray) -> float:
-        """
-        Computes a structural distance between two depth maps.
-        Uses SSIM on normalized, masked depth to handle viewpoint shifts.
-        """
-        if Rr is None or Qr is None:
-            return np.inf
-
-        # 1. Create a mask of valid pixels (non-zero in both)
-        mask = (Rr > 0) & (Qr > 0)
-        
-        # Safety check: if overlap is non-existent, it's a mismatch
-        if np.sum(mask) < 100: 
-            return 1.0
-
-        # 2. Normalize intensity to [0, 1] based on valid percentiles
-        def normalize_depth(D, m):
-            vals = D[m]
-            if len(vals) == 0: return D
-            v_min, v_max = np.percentile(vals, [1, 99])
-            # Avoid division by zero
-            denom = v_max - v_min if v_max > v_min else 1.0
-            return np.clip((D - v_min) / denom, 0, 1)
-
-        Rr_n = normalize_depth(Rr, mask)
-        Qr_n = normalize_depth(Qr, mask)
-
-        # 3. Compute SSIM
-        # mssim: the global average (scalar)
-        # ssim_map: the per-pixel similarity map (array)
-        mssim, ssim_map = ssim(Rr_n, Qr_n, full=True, data_range=1.0, win_size=7)
-        
-        # 4. Correctly index the MAP, not the scalar
-        valid_scores = ssim_map[mask]
-        
-        if valid_scores.size == 0:
-            return 1.0
-            
-        avg_structural_sim = np.mean(valid_scores)
-        
-        # Return 1.0 (worst) to 0.0 (perfect structural match)
-        return 1.0 - float(avg_structural_sim)
-    # ----------------------------------------------------------
-    # Updated rerank_depth
-    # ----------------------------------------------------------
-
-    def rerank_depth(self):
-        """
-        Improved depth rerank using Structural Similarity and 
-        absolute thresholding to prevent R@1 degradation.
-        """
-        R, Q = self.original.shape
-
-        ref_depth_dir = Path(getattr(self, "ref_depth"))
-        qry_depth_dir = Path(getattr(self, "qry_depth"))
-
-        depth_pattern = getattr(self, "depth_pattern", "depth_{:05d}.png")
-        depth_index_offset = int(getattr(self, "depth_index_offset", 0))
-        depth_weight = float(getattr(self, "depth_weight", 0.15))
-        depth_down_hw = getattr(self, "depth_down_hw", (28, 28))
-        depth_query_batch_size = int(getattr(self, "depth_query_batch_size", 64))
-        depth_ref_cache_size = int(getattr(self, "depth_ref_cache_size", 512))
-
-        outdir = os.path.join(self.feature_out, self.dataset, f"{self.reference}-{self.query}")
-        os.makedirs(outdir, exist_ok=True)
-        out_path = os.path.join(outdir, f"{self.dataset}_{self.reference}_{self.query}_rerank_depth_dist.npy")
-
-        new_dist = np.memmap(out_path, dtype=np.float32, mode="w+", shape=(R, Q))
-        K = int(self.top_k)
-        cache = self._DepthLRUCache(max_items=depth_ref_cache_size)
-
-        # if the re-rank is both
-        if self.rerank_mode == "both":
-            original = self.keypoint_reranked.copy()
-        else:
-            original = self.original.copy()
-
-        for q0 in tqdm(range(0, Q, depth_query_batch_size), desc="Re-ranking (depth)", unit="batch"):
-            q1 = min(Q, q0 + depth_query_batch_size)
-            B = q1 - q0
-
-            base_block = original[:, q0:q1].astype(np.float32, copy=False)
-            new_dist[:, q0:q1] = base_block
-
-            # Top-K indices
-            part = np.argpartition(base_block, kth=K - 1, axis=0)[:K, :].astype(np.int32)
-            topk_idx = np.empty_like(part)
-            for bi in range(B):
-                inds = part[:, bi]
-                topk_idx[:, bi] = inds[np.argsort(base_block[inds, bi])]
-
-            # Load query depths
-            q_depths = [self._load_depth_map(qry_depth_dir, qi, depth_pattern, depth_index_offset, depth_down_hw) 
-                        for qi in range(q0, q1)]
-
-            for bi, qi in enumerate(range(q0, q1)):
-                qD = q_depths[bi]
-                if qD is None: continue
-
-                refs = topk_idx[:, bi]
-                errs = np.zeros(len(refs), dtype=np.float32)
-
-                for j, r_idx in enumerate(refs):
-                    r_idx_int = int(r_idx)
-                    rD = cache.get(r_idx_int)
-                    if rD is None:
-                        rD = self._load_depth_map(ref_depth_dir, r_idx_int, depth_pattern, depth_index_offset, depth_down_hw)
-                        if rD is not None: cache.put(r_idx_int, rD)
-                    
-                    # Use the new robust distance
-                    errs[j] = self._compute_robust_depth_distance(rD, qD)
-
-                # --- IMPROVED SCORING LOGIC ---
-                tau = 0.3 
-                sims = np.exp(-errs / tau).astype(np.float32)
-
-                # Optional: Only apply boost if SSIM distance is reasonably low (e.g. < 0.7)
-                mask_good = errs < 0.7
-                new_dist[refs[mask_good], qi] = base_block[refs[mask_good], bi] - (depth_weight * sims[mask_good])
-
-        new_dist.flush()
-        self.depth_reranked = new_dist
-
-    def keypoint_inference(self):
-        """
-        Orchestrates the re-ranking pipeline based on self.rerank_mode.
-        """
-
-        # 3. Keypoint/Both Mode: Ensure MCTS files exist
-        root = self.data_root
-        self.reference_path = os.path.join(root, self.dataset, self.reference, f"mcts_{self.reference}_{self.mcts_time[-1]}")
-        self.query_path = os.path.join(root, self.dataset, self.query, f"mcts_{self.query}_{self.mcts_time[-1]}")
-
-        # Ensure keypoints are extracted
-        if (not os.path.exists(self.reference_path)) or (not os.path.exists(self.query_path)):
-            print("[INFO] MCTS frames not found. Generating MCTS frames for reference and query sets...")
-            print("Generating MCTS frames for reference and query sets...")
-            gen_mcts(root, self.dataset, self.reference, self.query, self.mcts_time)
-        
-        # Ensure keypoint directories are defined
-        self.reference_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.reference}")
-        self.query_keypoints = os.path.join(self.keypoint_out, self.dataset, f"kps_{self.query}")
-
-        if (not os.path.exists(self.reference_keypoints)) or (not os.path.exists(self.query_keypoints)):
-            self.extract_keypoints()
-
-    
-    def depth_inference(self, args):
-        # Device / seeds
-        device, autocast_device = dp.setup_device_and_seeds(args)
-
-        # Load model + config
-        ckpt, config = dp.load_and_merge_config(args)
-        depth_model = dp.fetch_model(config['model'], args, device, test=True, _state_dict=ckpt)
-        model_name = config['model']['model_type']
-        depth_model.eval()
-        normalize = True
-
-        if args.dataset == "brisbane_event" or args.dataset == "fast_slow":
-            H, W = 260, 346
-        else:
-            H, W = 480, 640
-
-        # check for tencode images
-        self.ref_depth = f"{args.depth_out}/{args.dataset}/{args.reference}-{args.dt_ms}"
-        self.qry_depth = f"{args.depth_out}/{args.dataset}/{args.query}-{args.dt_ms}"
-
-        tencode_ref = f"{args.data_root}/{args.dataset}/{args.reference}/{args.reference}-tencode-{args.dt_ms}"
-        tencode_qry = f"{args.data_root}/{args.dataset}/{args.query}/{args.query}-tencode-{args.dt_ms}"
-
-        # Time scale and sensor size
-        if self.dataset == "brisbane_event":
-            time_scale = 1e-9  # (not used in epoch-ns branch, but keep)
-            H, W = 240, 346
-            config_path = "./eventgem/external/eventlab/datasets/brisbane_event.yaml"
-            config = yaml.safe_load(open(config_path, 'r'))
-            ref_start = config['other']['offset'][self.reference]
-            query_start = config['other']['offset'][self.query]
-        elif self.dataset == "nsavp":
-            time_scale = 1e-9  # nanoseconds to seconds
-            ref_start = 0.0
-            query_start = 0.0
-            H, W = 480, 640
-        elif self.dataset == "fast_slow" or self.dataset == "qcr_event":
-            time_scale = 1e-6  # microseconds to seconds
-            ref_start = 0.0
-            query_start = 0.0
-            H, W = 240, 346
-        else:
-            raise NotImplementedError(f"Dataset not supported for MCTS generation: {self.dataset}")
-
-        if not os.path.exists(tencode_ref):
-            os.makedirs(tencode_ref, exist_ok=True)
-            hdf5_path = f"{args.data_root}/{args.dataset}/{args.reference}/{args.reference}.hdf5"
-            event_iter = stream.stream_event_windows_raw(
-                hdf5_path, args.dt_ms, args.chunk_size, time_scale, ref_start, args.skip
+        # Threads, not processes. The matching inner loop is BLAS and cv2, both of which release
+        # the GIL, so a thread pool parallelises it just as well -- and it does so in one address
+        # space. joblib's default loky backend would instead start eight interpreters that each
+        # import torch and each mmap the ~2 GB reference store: measured at +3.9 GB peak against
+        # +18 MB for threads, and that spike lands immediately after extraction has filled the
+        # page cache, which is what was getting the run killed by systemd-oomd.
+        #
+        # BLAS is pinned to one thread per worker: the per-pair gemm is only 160x256x160, where
+        # MKL's own threading buys nothing and eight workers x eight MKL threads collapses into
+        # oversubscription (measured 9.10 -> 5.29 ms/query when pinned).
+        #
+        # `return_as` streams results back rather than collecting a list, which would hold a full
+        # R-vector per query -- another copy of the whole distance matrix (~740 MB here).
+        cv2.setNumThreads(1)
+        with threadpool_limits(limits=1):
+            results = Parallel(n_jobs=-1, backend="threading", return_as="generator_unordered")(
+                delayed(process_single_query)(
+                    q_idx=i,
+                    base_dists=self.original[:, i],
+                    top_k=self.top_k,
+                    q_data=bank_lookup(query_bank, i) if i < n_query_frames else None,
+                    ref_store=ref_store,
+                    ransac_thresh=self.ransac_thresh,
+                    inlier_weight=self.inlier_weight,
+                    match_filter=getattr(self, "match_filter", "ratio"),
+                    match_ratio=float(getattr(self, "match_ratio", 0.8)),
+                )
+                for i in tqdm(range(Q), desc="Re-ranking (Keypoints)")
             )
-            for (_, _, _, x, y, t_raw, p, frame_idx, _) in event_iter:
 
-                x = torch.from_numpy(x).to(device)
-                y = torch.from_numpy(y).to(device)
-                t_raw = torch.from_numpy(t_raw).to(device)
-                p = torch.from_numpy(p).to(device)
+            # Assemble results as they complete; each column is freed once written.
+            for q_idx, new_col in results:
+                self.keypoint_reranked[:, q_idx] = new_col
 
-                tencode = stream.tencode(x, y, t_raw, p, height=H, width=W, white_frame=False, normalize=normalize, device=device)
-                # save tencode as png
-                if normalize:
-                    img = np.clip(tencode.detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
-                else:
-                    img = np.clip(tencode.detach().cpu().numpy(), 0, 255).astype(np.uint8)
-                img = np.transpose(img, (1, 2, 0))  # (3,H,W) -> (H,W,3), RGB
-                Image.fromarray(img, mode="RGB").save(f"{args.data_root}/{args.dataset}/{args.reference}/{args.reference}-tencode-{args.dt_ms}/tencode_{frame_idx:05d}.png")
-
-        if not os.path.exists(tencode_qry):
-            os.makedirs(tencode_qry, exist_ok=True)
-            hdf5_path = f"{args.data_root}/{args.dataset}/{args.query}/{args.query}.hdf5"
-            event_iter = stream.stream_event_windows_raw(
-                hdf5_path, args.dt_ms, args.chunk_size, time_scale, query_start, args.skip
-            )
-            for (_, _, _, x, y, t_raw, p, frame_idx, _) in event_iter:
-
-                x = torch.from_numpy(x).to(device)
-                y = torch.from_numpy(y).to(device)
-                t_raw = torch.from_numpy(t_raw).to(device)
-                p = torch.from_numpy(p).to(device)
-
-                tencode = stream.tencode(x, y, t_raw, p, height=H, width=W, white_frame=False, normalize=normalize, device=device)
-                # save tencode as png
-                if normalize:
-                    img = np.clip(tencode.detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
-                else:
-                    img = np.clip(tencode.detach().cpu().numpy(), 0, 255).astype(np.uint8)
-                img = np.transpose(img, (1, 2, 0))  # (3,H,W) -> (H,W,3), RGB
-                Image.fromarray(img, mode="RGB").save(f"{args.data_root}/{args.dataset}/{args.query}/{args.query}-tencode-{args.dt_ms}/tencode_{frame_idx:05d}.png")
-
-        if not os.path.exists(self.ref_depth) or not os.path.exists(self.qry_depth):
-            dp.process_depth(depth_model, model_name, device, autocast_device, tencode_ref, tencode_qry, args)
-
-    
     def rerank_inference(self):
-        # 1. Load Global Similarity Matrix
-        sim_matrix_path = os.path.join(
-            self.feature_out, 
-            self.dataset, 
-            f"{self.reference}-{self.query}", 
+        # 1. Load Global Similarity Matrix (set by feature_inference, which knows which
+        #    global backbone produced it)
+        sim_matrix_path = getattr(self, "sim_file", None) or os.path.join(
+            self.feature_out,
+            self.dataset,
+            f"{self.reference}-{self.query}",
             f"{self.dataset}_{self.reference}_{self.query}_similarity.pt"
         )
-        
+
         if not os.path.exists(sim_matrix_path):
             raise FileNotFoundError(f"Similarity matrix not found: {sim_matrix_path}")
 
-        sim = torch.load(sim_matrix_path, map_location="cpu")
-        self.original = (1.0 - sim.float()).numpy()
-        del sim # Free memory
+        # Distances in place: `1.0 - sim.float()` would hold the loaded matrix and its complement
+        # at once, which is ~1.5 GB on brisbane_event for no reason.
+        sim = torch.load(sim_matrix_path, map_location="cpu").float()
+        sim.neg_().add_(1.0)
+        self.original = sim.numpy()
+        del sim # the numpy view keeps the storage alive
 
-        mode = getattr(self, "rerank_mode", "keypoints") # "keypoints" | "depth" | "both"
-
-        # 2. Handle Depth-Only Mode
-        if mode == "depth":
-            self.rerank_depth()
-            return self.original, None, self.depth_reranked
-        
-                # 4. Perform Keypoint Re-ranking
+        # 4. Perform Keypoint Re-ranking
         self.rerank()
-
-        # 5. Optional: Chain Depth Re-ranking
-        if mode == "both":
-            # Use keypoint-refined distances as the base for depth refinement
-            self.distance_matrix = self.keypoint_reranked.copy()
-            self.rerank_depth()
-
-            return self.original, self.keypoint_reranked, self.depth_reranked
         
-        return self.original, self.keypoint_reranked, None
+        return self.original, self.keypoint_reranked

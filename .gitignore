@@ -212,3 +212,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+.codex
+CLAUDE.md
+agents/
+*.npy
+AGENTS.md
+

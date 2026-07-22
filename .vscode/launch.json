@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "eventgem: sunset2 -> sunset1",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "python": "${workspaceFolder}/.pixi/envs/default/bin/python3",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONUNBUFFERED": "1",
+                "PYDEVD_DISABLE_FILE_VALIDATION": "1"
+            },
+            "args": [
+                "-d", "brisbane_event",
+                "-r", "sunset2",
+                "-q", "sunset1",
+                "--data-root", "/media/adam/vprdatasets/eventgem",
+                "--feature-out", "/media/adam/vprdatasets/eventgem/features",
+                "--keypoint-out", "/media/adam/vprdatasets/eventgem/keypoints"
+            ]
+        }
+    ]
+}
