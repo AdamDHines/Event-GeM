@@ -2,12 +2,11 @@
 authors = ["Adam D. Hines <adam.hines@qut.edu.au>, Gokul B. Nair, Nicolas Guillermo Marticorena Vidal, Michael Milford, Tobias Fischer"]
 channels = ["conda-forge", "adamhines"]
 name = "EventGeM"
-platforms = ["linux-64", "linux-aarch64"]
+platforms = [
+    { platform = "linux-64", cuda = "12", glibc = "2.35" },
+    { platform = "linux-aarch64", cuda = "12", glibc = "2.35" },
+]
 version = "0.1.0"
-
-[system-requirements]
-cuda = "12"
-libc = {family="glibc", version="2.35"}
 
 [tasks]
 eventgem = {cmd = "pixi run python3 main.py"}
