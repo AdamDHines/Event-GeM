@@ -43,11 +43,11 @@ def stream_file(args):
     ref_feats_file = ref_feats_dir / f"{args.dataset}_{args.reference}_features.pt"
 
     ref_kp_dir = Path(args.keypoint_out) / args.dataset / f"{args.reference}-{args.dt_ms}" / f"kps_{args.reference}"
-    ref_depth_dir = Path(args.depth_out) / args.dataset / f"{args.reference}-{args.dt_ms}"
+    # ref_depth_dir = Path(args.depth_out) / args.dataset / f"{args.reference}-{args.dt_ms}"
     ref_feats_dir.mkdir(parents=True, exist_ok=True)
     if not args.demo:
         ref_kp_dir.mkdir(parents=True, exist_ok=True)
-    ref_depth_dir.mkdir(parents=True, exist_ok=True)
+    # ref_depth_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Extracted reference features will be saved to: {ref_feats_dir}")
     print(f"[INFO] Extracted reference keypoints will be saved to: {ref_kp_dir}")
     gt_path = f"{args.data_root}/{args.dataset}/ground_truth/{args.reference}_{args.query}_GT.npy"
