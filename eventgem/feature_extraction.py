@@ -116,8 +116,14 @@ class EventGeM:
         ref_dir = f"{self.data_root}/{self.dataset}/{self.reference}/{self.reference}.hdf5"
         query_dir = f"{self.data_root}/{self.dataset}/{self.query}/{self.query}.hdf5"
 
-        ref_dataset = EventGeMMCTS(ref_dir, se_config, offset=self.ref_offset)
-        query_dataset = EventGeMMCTS(query_dir, se_config, offset=self.query_offset)
+        ref_dataset = EventGeMMCTS(
+            ref_dir, se_config, offset=self.ref_offset,
+            dt_ms=self.dt_ms, max_window_ms=getattr(self, "max_window_ms", None),
+        )
+        query_dataset = EventGeMMCTS(
+            query_dir, se_config, offset=self.query_offset,
+            dt_ms=self.dt_ms, max_window_ms=getattr(self, "max_window_ms", None),
+        )
         self.ref_loader = torch.utils.data.DataLoader(
             ref_dataset, batch_size=self.keypoint_batch_size, shuffle=False, num_workers=4, collate_fn=ecv.collate
         )

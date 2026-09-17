@@ -9,7 +9,7 @@ def main():
     
     # Dataset parameters
     parser.add_argument("--dataset", "-d", type=str,  
-                            choices=["brisbane_event", "nsavp", "fast_slow"],
+                            choices=["brisbane_event", "nsavp", "fast_slow", "qut_event_walking"],
                             help="Dataset to use for evaluation")
     parser.add_argument("--reference", "-r", type=str, 
                             help="Reference directory to use for evaluation")
@@ -17,6 +17,11 @@ def main():
                             help="Query directory to use for evaluation")
     parser.add_argument("--dt-ms", type=int, default=50,
                             help="Reconstruction time window in milliseconds for event datasets")
+    parser.add_argument("--max-window-ms", type=float, default=None,
+                            help="MCTS integration window in milliseconds. Default: tied to --dt-ms, "
+                                 "so each frame integrates its full window (2026-08-25 decision; "
+                                 "eventcv's own default of 30 ms silently discarded 40%% of each "
+                                 "50 ms window). Pass 30 to reproduce legacy numbers")
     parser.add_argument("--mcts-time", type=float, nargs='+', default=[10, 20, 30, 40, 50],
                             help="Space-separated list of temporal window sizes in msec.")
     parser.add_argument("--data-root", type=str, default="./eventgem/data", 
@@ -98,6 +103,8 @@ def main():
                             help="Whether to run a quick demo with a small subset of the data")
 
     args = parser.parse_args()
+    if args.max_window_ms is None:
+        args.max_window_ms = float(args.dt_ms)
 
     # Initialize and run Event-GeM inference
     eventgem = EventGeM(args)

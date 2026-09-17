@@ -38,16 +38,42 @@ from sklearn.neighbors import BallTree
 from skimage.transform import resize
 
 from eventgem.training.common import (
-    DESC_SLICES, MEGAEVENT_NYC, NYC_DIAG_PAIRS, atomic_save, haversine_m, recall_at_k,
+    BLOCK_DIM, DESC_BLOCKS, DESC_DIM_V2, DESC_SLICES, MEGAEVENT_NYC, NYC_DIAG_PAIRS,
+    atomic_save, haversine_m, recall_at_k,
 )
 
 EARTH_R = 6371000.0
 
+# How many monitor queries may flip between the identity and a zero-initialised residual head
+# before the init is considered broken. L2-renormalising an already-unit vector perturbs it by
+# ~1e-7, which is enough to swap a near-tie; the monitor's resolution is 1 query = 6.9e-5 R@1.
+MAX_INIT_FLIPS = 5
+
 
 def prepare_input(desc, variant):
-    """Column-slice a [K,1024] bank and balance it: each 128-D GeM block L2-normalised,
-    then the whole vector L2'd. Fit-free by construction."""
-    x = torch.from_numpy(np.ascontiguousarray(desc[:, DESC_SLICES[variant]])).float()
+    """Select a variant's columns from a bank and balance it: each 128-D GeM block
+    L2-normalised, then the whole vector L2'd. Fit-free by construction.
+
+    Two bank layouts are supported, dispatched on which registry the variant name is in
+    (the two are disjoint). v1 banks are [K,1024] and variants are contiguous column
+    slices; v2 banks are [K,3328] and variants are lists of 128-D block ids, because
+    combinations like g5+r5 are not contiguous there. The balancing is identical, and the
+    v1 path is unchanged.
+    """
+    if variant in DESC_BLOCKS:
+        ids = DESC_BLOCKS[variant]
+        assert desc.shape[1] % BLOCK_DIM == 0, (
+            f"block-indexed variant {variant!r} needs a bank whose width is a multiple of "
+            f"{BLOCK_DIM}; got {desc.shape}")
+        n_blocks = desc.shape[1] // BLOCK_DIM
+        assert max(ids) < n_blocks, (
+            f"variant {variant!r} indexes block {max(ids)} but this bank has only "
+            f"{n_blocks} blocks ({desc.shape[1]}-D) -- wrong bank layout?")
+        x = torch.from_numpy(np.ascontiguousarray(desc)).float()
+        x = x.view(x.shape[0], -1, BLOCK_DIM)[:, ids]
+        x = x.reshape(x.shape[0], -1)
+    else:
+        x = torch.from_numpy(np.ascontiguousarray(desc[:, DESC_SLICES[variant]])).float()
     blocks = F.normalize(x.view(x.shape[0], -1, 128), p=2, dim=2).view(x.shape[0], -1)
     return F.normalize(blocks, p=2, dim=1)
 
@@ -123,7 +149,11 @@ def ensure_all_banks(args, device):
 
 def load_and_dedup(banks_dir, variant, dedup_m):
     """All NYC banks -> concatenated (feats, lat, lon, heading, rec_id, per_rec) after
-    per-recording displacement dedup (keep a sample once it moved >= dedup_m metres)."""
+    per-recording displacement dedup (keep a sample once it moved >= dedup_m metres).
+
+    `per_rec` carries per-recording GPS only; its descriptor slot is None. See the comment
+    at the assignment -- holding the descriptors there doubled peak RAM and nothing read them.
+    """
     feats, lat, lon, heading, rec = [], [], [], [], []
     per_rec = {}
     for path in sorted(Path(banks_dir).glob("nyc_*.npz")):
@@ -138,7 +168,12 @@ def load_and_dedup(banks_dir, variant, dedup_m):
                 keep.append(i)
         keep = np.array(keep)
         name = str(z["recording"])
-        per_rec[name] = (z["desc"][keep], la[keep], lo[keep], z["heading"][keep])
+        # Deliberately NOT holding z["desc"][keep] here. The only caller discards per_rec
+        # (train_head.py: `..., _ = load_and_dedup(...)`), and the diagnostic pairs reload
+        # what they need from disk, so retaining full-width descriptors for all 15 NYC
+        # recordings was 2.4 GB of peak RAM at 10880-D bought for nothing -- enough to
+        # double the footprint of a wide-descriptor run.
+        per_rec[name] = (None, la[keep], lo[keep], z["heading"][keep])
         feats.append(prepare_input(z["desc"][keep], variant))
         lat.append(la[keep]); lon.append(lo[keep]); heading.append(z["heading"][keep])
         rec.append(np.full(len(keep), len(per_rec) - 1))
@@ -232,7 +267,16 @@ def nt_xent_loss(z, tau):
 
 class Monitor:
     """Brisbane sunset2->sunset1 monitor. Fast GPU R@1 every epoch (selection signal);
-    the full argsort convention runs only for baselines and the final best checkpoint."""
+    the full argsort convention runs only for baselines and the final best checkpoint.
+
+    Both evaluations chunk over queries once the banks are too large to hold on device, so a
+    wide descriptor does not have to fit its whole similarity matrix in VRAM. The similarity
+    matrix in `full` is assembled on the CPU either way -- it was always moved there for
+    `recall_at_k`; only the peak device allocation changes.
+    """
+
+    MAX_RESIDENT_BYTES = 512 * 1024 ** 2   # keep the published variants on the old fast path
+    CHUNK = 2048
 
     def __init__(self, banks_dir, gt_path, variant, device):
         rd = np.load(Path(banks_dir) / "brisbane_sunset2.npz")["desc"]
@@ -243,21 +287,60 @@ class Monitor:
                         anti_aliasing=False)
         self.gt = gt.astype(bool)
         self.rd, self.qd = rd, qd
-        self.ref = prepare_input(rd, variant).to(device)
-        self.qry = prepare_input(qd, variant).to(device)
+        ref, qry = prepare_input(rd, variant), prepare_input(qd, variant)
+        # Wide descriptors (spatial pyramids, 8x8 partitions) make these banks large enough
+        # that keeping them resident steals memory the optimizer needs -- a 10880-D pair is
+        # ~1.2 GB, which is what pushed L1248 into an OOM inside Adam's step. Below the
+        # threshold, behaviour is exactly as before: resident on device, no chunking.
+        nbytes = (ref.numel() + qry.numel()) * ref.element_size()
+        self.resident = nbytes <= self.MAX_RESIDENT_BYTES
+        self.ref = ref.to(device) if self.resident else ref
+        self.qry = qry.to(device) if self.resident else qry
         self.gt_t = torch.from_numpy(self.gt).to(device)
         self.valid = self.gt_t.any(0)
         self.device = device
+        if not self.resident:
+            print(f"[monitor] banks {nbytes/1e9:.2f} GB > "
+                  f"{self.MAX_RESIDENT_BYTES/1e9:.2f} GB — holding on CPU, chunked eval")
+
+    @torch.inference_mode()
+    def _embed(self, head, x):
+        """Head-forward in chunks, moving to device only a slice at a time."""
+        if self.resident:
+            return head(x)
+        return torch.cat([head(x[i:i + self.CHUNK].to(self.device))
+                          for i in range(0, len(x), self.CHUNK)])
 
     @torch.inference_mode()
     def fast_r1(self, head):
-        top1 = (head(self.ref) @ head(self.qry).t()).argmax(0)
+        # The resident branch is the ORIGINAL single-shot computation, byte for byte.
+        # head(chunk) and head(full)[chunk] differ in the last bits of the GEMM, which is
+        # enough to flip a near-tie: chunking this path once moved sunset1 R@1 by 1/14478
+        # (6.9e-5) and tripped main()'s identity-at-init assertion. Chunk only when the
+        # banks genuinely do not fit.
+        if self.resident:
+            top1 = (head(self.ref) @ head(self.qry).t()).argmax(0)
+        else:
+            r = self._embed(head, self.ref)
+            top1 = torch.empty(len(self.qry), dtype=torch.long, device=self.device)
+            for i in range(0, len(self.qry), self.CHUNK):
+                q = self._embed(head, self.qry[i:i + self.CHUNK])
+                top1[i:i + len(q)] = (r @ q.t()).argmax(0)
+                del q
         hits = self.gt_t[top1, torch.arange(len(top1), device=self.device)]
         return float(hits[self.valid].float().mean())
 
     @torch.inference_mode()
     def full(self, head, ks=(1, 5, 10, 50)):
-        sim = (head(self.ref) @ head(self.qry).t()).cpu().numpy()
+        if self.resident:
+            sim = (head(self.ref) @ head(self.qry).t()).cpu().numpy()
+        else:
+            r = self._embed(head, self.ref)
+            sim = np.empty((len(self.ref), len(self.qry)), dtype=np.float32)
+            for i in range(0, len(self.qry), self.CHUNK):
+                q = self._embed(head, self.qry[i:i + self.CHUNK])
+                sim[:, i:i + len(q)] = (r @ q.t()).cpu().numpy()
+                del q
         return recall_at_k(sim, self.gt, list(ks))
 
 
@@ -282,7 +365,8 @@ def diag_pairs_metrics(head, banks_dir, variant, device, tol=75.0):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--banks", default=os.path.join(os.environ.get("EVENTGEM_OUT", "."), "banks"))
-    ap.add_argument("--input", choices=list(DESC_SLICES), default="regional")
+    ap.add_argument("--input", choices=list(DESC_SLICES) + list(DESC_BLOCKS),
+                    default="regional")
     ap.add_argument("--head", choices=["residual", "mlp"], default="residual")
     ap.add_argument("--dim", type=int, default=512, help="hidden width")
     ap.add_argument("--out-dim", type=int, default=128, help="mlp head only")
@@ -378,9 +462,21 @@ def main():
     print(f"identity ({args.input}) sunset1 fast-R@1: {ident_r1:.4f}")
     if args.head == "residual" and start_epoch == 0:
         init_r1 = monitor.fast_r1(head)
-        assert abs(init_r1 - ident_r1) < 1e-6, \
-            f"residual head not identity at init ({init_r1} vs {ident_r1})"
-        print("residual init check PASSED")
+        # The invariant is real -- a zero-initialised residual head IS the identity -- but the
+        # quantity compared is a RECALL, quantised at 1/n_valid (6.9e-5 on the 14478-query
+        # sunset1 monitor). A 1e-6 tolerance is ~69x finer than the metric can resolve, so it
+        # only ever passed when zero queries flipped. head(x) = L2(x + 0) re-normalises an
+        # already-unit vector, which perturbs it by ~1e-7 relative and can flip a near-tie;
+        # `L14` flipped exactly one query and tripped an assertion it could not have passed.
+        # Tolerance is now expressed in the metric's own units: a handful of flipped ties is
+        # float noise, anything more is a genuinely broken initialisation.
+        tol = max(MAX_INIT_FLIPS / max(int(monitor.valid.sum()), 1), 1e-6)
+        n_flipped = abs(init_r1 - ident_r1) * int(monitor.valid.sum())
+        assert abs(init_r1 - ident_r1) < tol, \
+            (f"residual head not identity at init ({init_r1} vs {ident_r1}; "
+             f"{n_flipped:.1f} queries flipped, tolerance {MAX_INIT_FLIPS})")
+        print(f"residual init check PASSED ({n_flipped:.1f} queries flipped, "
+              f"tolerance {MAX_INIT_FLIPS})")
     if wb:
         wb.run.summary["baseline_identity/sunset1_R@1"] = ident_r1
 

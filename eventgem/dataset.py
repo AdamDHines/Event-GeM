@@ -11,10 +11,17 @@ from pathlib import Path
 from torch.utils.data import Dataset
     
 class EventGeMMCTS(Dataset):
-    def __init__(self, datapath, config, offset=0):
+    def __init__(self, datapath, config, offset=0, dt_ms=None, max_window_ms=None):
 
-        # create eventcv object
-        self.stream = ecv.open(datapath, repr="mcts", dt_ms=config.get("dt_ms", 50), offset=offset, hot_pixel_filter=True)
+        # create eventcv object. dt_ms is the frame step; max_window_ms is the MCTS
+        # integration window (eventcv default 30 ms when None).
+        dt = dt_ms if dt_ms is not None else config.get("dt_ms", 50)
+        if max_window_ms is None:
+            self.stream = ecv.open(datapath, repr="mcts", dt_ms=dt, offset=offset, hot_pixel_filter=True)
+        else:
+            self.stream = ecv.open(datapath, dt_ms=dt, offset=offset, hot_pixel_filter=True).with_repr(
+                "mcts", max_window_ms=float(max_window_ms)
+            )
 
         # Use same logic as load_mcts_npz on the first file
         arr0 = self.stream.slice(0).numpy()

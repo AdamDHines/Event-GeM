@@ -29,6 +29,7 @@ from eventgem.feature_extraction import EventGeM
 from eventgem.training.common import (
     BRISBANE_OFFSETS, BRISBANE_ROWS, DESC_SLICES, MEGAEVENT_NYC, NYC_SENSOR_SIZE,
     crop_offsets, discover_nyc_recordings, haversine_m, pool_descriptor,
+    pool_descriptor_v2,
 )
 
 
@@ -62,8 +63,13 @@ def _frame_prep(to_brisbane_scale):
 
 
 def _pool_batches(frame_iter, n_frames, model, se_config, device, batch_size, tag,
-                  to_brisbane_scale=False):
-    """MCTS frames from `frame_iter` through the frozen trunk -> [n_frames, 1024]."""
+                  to_brisbane_scale=False, pool_fn=None):
+    """MCTS frames from `frame_iter` through the frozen trunk -> [n_frames, D].
+
+    `pool_fn` defaults to the v1 1024-D `pool_descriptor`; pass `pool_descriptor_v2` to
+    build a v2 superset bank instead (2026-08-27 exponent factorial). The trunk pass,
+    the frame prep and the crop are identical either way -- only the pooling differs."""
+    pool_fn = pool_fn or pool_descriptor
     prep = _frame_prep(to_brisbane_scale)
     descs, buf, t0, done = [], [], time.time(), 0
     crop = None
@@ -79,7 +85,7 @@ def _pool_batches(frame_iter, n_frames, model, se_config, device, batch_size, ta
         ot, he, ol, we = crop
         with torch.inference_mode():
             feats = model.fpn(model.backbone(x[:, :, ot:he, ol:we].to(device))).float()
-            descs.append(pool_descriptor(feats).cpu())
+            descs.append(pool_fn(feats).cpu())
         done += len(buf)
         buf.clear()
         if (done // batch_size) % 25 == 0:
@@ -113,7 +119,7 @@ def _nyc_frame(npz_path):
 
 def ensure_nyc_bank(name, rows, out_dir, model, se_config, device,
                     batch_size=8, min_speed=0.0, limit_frames=0, overwrite=False,
-                    to_brisbane_scale=False):
+                    to_brisbane_scale=False, pool_fn=None):
     """Build (or reuse) the descriptor bank for one NYC traverse from megaevent samples.
 
     Banks carry every sample (min_speed defaults to 0 since the campaign rework):
@@ -146,7 +152,7 @@ def ensure_nyc_bank(name, rows, out_dir, model, se_config, device,
 
     frames = (_nyc_frame(rows[i]["path"]) for i in keep)
     desc = _pool_batches(frames, len(keep), model, se_config, device, batch_size, name,
-                         to_brisbane_scale=to_brisbane_scale)
+                         to_brisbane_scale=to_brisbane_scale, pool_fn=pool_fn)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_savez(out_path, desc=desc, lat=lat[keep], lon=lon[keep],
                   heading=heading[keep], t_epoch=t[keep], recording=name)
@@ -156,7 +162,7 @@ def ensure_nyc_bank(name, rows, out_dir, model, se_config, device,
 
 def ensure_brisbane_bank(seq, bris_root, out_dir, model, se_config, device,
                          batch_size=16, limit_frames=0, overwrite=False,
-                         verify_against=None):
+                         verify_against=None, pool_fn=None):
     """Build (or reuse) the descriptor bank for one Brisbane traverse — every 50 ms frame,
     framed by the production offset, straight from the eventcv reader."""
     out_path = Path(out_dir) / f"brisbane_{seq}.npz"
@@ -170,9 +176,11 @@ def ensure_brisbane_bank(seq, bris_root, out_dir, model, se_config, device,
         assert n == BRISBANE_ROWS[seq], f"{seq}: {n} slices vs expected {BRISBANE_ROWS[seq]}"
     indices = range(min(n, limit_frames) if limit_frames else n)
     frames = (reader[int(i)] for i in indices)
-    desc = _pool_batches(frames, len(indices), model, se_config, device, batch_size, seq)
+    desc = _pool_batches(frames, len(indices), model, se_config, device, batch_size, seq,
+                         pool_fn=pool_fn)
 
     if verify_against:
+        assert pool_fn is None, "verify_against reads the v1 p=5 slice; only valid for v1 banks"
         bank = torch.load(verify_against, map_location="cpu").float().numpy()
         m = min(len(desc), len(bank))
         a, b = desc[:m, DESC_SLICES["p5"]], bank[:m]
