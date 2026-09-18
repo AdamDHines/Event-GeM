@@ -38,6 +38,7 @@ from sklearn.neighbors import BallTree
 from skimage.transform import resize
 
 from eventgem.training.common import (
+    ResidualHead,
     BLOCK_DIM, DESC_BLOCKS, DESC_DIM_V2, DESC_SLICES, MEGAEVENT_NYC, NYC_DIAG_PAIRS,
     atomic_save, haversine_m, recall_at_k,
 )
@@ -88,21 +89,6 @@ class Head(nn.Module):
 
     def forward(self, x):
         return F.normalize(self.net(x), p=2, dim=1)
-
-
-class ResidualHead(nn.Module):
-    """z = L2(x + MLP(x)), MLP's last layer zero-initialised: identity at epoch 0, so the
-    monitor starts at the statistics-free descriptor's score and training carves upward."""
-
-    def __init__(self, dim, hidden, dropout=0.0):
-        super().__init__()
-        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.ReLU(inplace=True),
-                                 nn.Dropout(dropout), nn.Linear(hidden, dim))
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
-
-    def forward(self, x):
-        return F.normalize(x + self.mlp(x), p=2, dim=1)
 
 
 def ensure_all_banks(args, device):

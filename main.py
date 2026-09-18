@@ -50,12 +50,6 @@ def main():
                             help="Offset for query keypoint event stream start")
 
     # Model parameters
-    parser.add_argument("--gem-p", type=float, default=5.0,
-                            help="GeM pooling exponent for the global descriptor")
-    parser.add_argument("--gem-whiten", action="store_false",
-                            help="PCA-whiten the global descriptor, fit on the reference bank only. "
-                                 "Equalises the badly anisotropic channel variances that GeM "
-                                 "produces; large gain in shortlist recall for the superevent path")
     parser.add_argument("--se-config", type=str, default="eventgem/external/superevent/config/super_event.yaml",
                     help="Path to the SuperEvent config file")
     parser.add_argument("--se-weights", type=str, default="eventgem/external/superevent/saved_models/super_event_weights.pth",

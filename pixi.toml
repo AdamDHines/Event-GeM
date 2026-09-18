@@ -6,27 +6,24 @@ platforms = [
     { platform = "linux-64", cuda = "12", glibc = "2.35" },
     { platform = "linux-aarch64", cuda = "12", glibc = "2.35" },
 ]
-version = "0.1.0"
+version = "1.0.0"
 
 [tasks]
-eventgem = {cmd = "pixi run python3 main.py"}
+eventgem = {cmd = "python3 main.py"}
 
-inference = {cmd = "pixi run python3 eventgem/inference.py"}
-inference-jetson = {cmd = "pixi run python3 eventgem/inference-jetson.py"}
+inference-jetson = {cmd = "python3 eventgem/inference-jetson.py"}
 
-demo = {cmd = "pixi run python3 main.py --dataset brisbane_event --reference sunset2 --query sunset1 --start-time 1587452582.35 --skip 20 --stream --demo"}
+# Paper specific comparisons. These use the default in-repo data directories; override by
+# appending e.g. `--data-root /path/to/datasets` to the `pixi run` invocation.
+sunset2-sunset1 = {cmd = "python3 main.py -d brisbane_event -r sunset2 -q sunset1 --ref-offset 1587540271650 --query-offset 1587452582350"}
+sunset2-morning = {cmd = "python3 main.py -d brisbane_event -r sunset2 -q morning --ref-offset 1587540271650 --query-offset 1588029265730"}
+sunset2-daytime = {cmd = "python3 main.py -d brisbane_event -r sunset2 -q daytime --ref-offset 1587540271650 --query-offset 1587705130800"}
+sunset2-sunrise = {cmd = "python3 main.py -d brisbane_event -r sunset2 -q sunrise --ref-offset 1587540271650 --query-offset 1588105232910"}
+sunset2-night = {cmd = "python3 main.py -d brisbane_event -r sunset2 -q night --ref-offset 1587540271650 --query-offset 1587975221100"}
 
-# Paper specific comparisons
-sunset2-sunset1 = {cmd = "pixi run eventgem -d brisbane_event -r sunset2 -q sunset1 --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints --ref-offset 1587540271650 --query-offset 1587452582350"}
-sunset2-morning = {cmd = "pixi run eventgem -d brisbane_event -r sunset2 -q morning --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints --ref-offset 1587540271650 --query-offset 1588029265730"}
-sunset2-daytime = {cmd = "pixi run eventgem -d brisbane_event -r sunset2 -q daytime --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints --ref-offset 1587540271650 --query-offset 1587705130800"}
-sunset2-sunrise = {cmd = "pixi run eventgem -d brisbane_event -r sunset2 -q sunrise --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints --ref-offset 1587540271650 --query-offset 1588105232910"}
-sunset2-night = {cmd = "pixi run eventgem -d brisbane_event -r sunset2 -q night --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints --ref-offset 1587540271650 --query-offset 1587975221100"}
-
-
-R0FA0-R0FS0 = {cmd = "pixi run eventgem -d nsavp -r R0_FA0 -q R0_FS0 --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints"}
-R0FA0-R1DA0 = {cmd = "pixi run eventgem -d nsavp -r R0_FA0 -q R1_DA0 --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints"}
-R0FA0-R1FA0 = {cmd = "pixi run eventgem -d nsavp -r R0_FA0 -q R1_FA0 --data-root /media/adam/vprdatasets/eventgem --feature-out /media/adam/vprdatasets/eventgem/features --keypoint-out /media/adam/vprdatasets/eventgem/keypoints"}
+R0FA0-R0FS0 = {cmd = "python3 main.py -d nsavp -r R0_FA0 -q R0_FS0"}
+R0FA0-R1DA0 = {cmd = "python3 main.py -d nsavp -r R0_FA0 -q R1_DA0"}
+R0FA0-R1FA0 = {cmd = "python3 main.py -d nsavp -r R0_FA0 -q R1_FA0"}
 
 [dependencies]
 python = "=3.12"
@@ -97,4 +94,5 @@ onnxscript = "*"
 eventcv = "*"
 loguru = "*"
 requests = "*"
+huggingface_hub = "*"
 wandb = "*"

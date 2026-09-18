@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 DESC_DIM = 1024
@@ -83,6 +84,21 @@ DESC_BLOCKS = {
 # The three v2 variants that must reproduce a v1 variant exactly (verify_v2.py asserts this).
 V1_EQUIVALENTS = {"gmulti": "multi_p", "g5": "p5", "g5_r5": "p5_regional",
                   "gmulti_r5": "regional", "g1": "p1", "g2": "p2", "g3": "p3"}
+
+
+class ResidualHead(nn.Module):
+    """z = L2(x + MLP(x)), MLP's last layer zero-initialised: identity at epoch 0, so the
+    monitor starts at the statistics-free descriptor's score and training carves upward."""
+
+    def __init__(self, dim, hidden, dropout=0.0):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.ReLU(inplace=True),
+                                 nn.Dropout(dropout), nn.Linear(hidden, dim))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, x):
+        return F.normalize(x + self.mlp(x), p=2, dim=1)
 
 
 # --- spatial pyramid layout (2026-08-28 pyramid-gem) ------------------------------------

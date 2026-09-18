@@ -1,16 +1,16 @@
 # :gem: EventGeM: Global-to-Local Feature Matching for Event-Based Visual Place Recognition
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](./LICENSE)
 [![Pixi Badge](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/prefix-dev/pixi/main/assets/badge/v0.json)](https://pixi.sh)
 [![stars](https://img.shields.io/github/stars/AdamDHines/Event-GeM.svg?style=flat-square)](https://github.com/AdamDHines/Event-GeM/stargazers)
 [![GitHub repo size](https://img.shields.io/github/repo-size/AdamDHines/Event-GeM.svg?style=flat-square)](./README.md)
 
-This repository contains the code for Event-GeM — an event-based visual place recognition (VPR) pipeline that uses a pre-trained transformer vision backbone for feature extraction, generalized mean pooling, and keypoint detection for 2D homology match re-ranking.
+This repository contains the code for Event-GeM — an event-based visual place recognition (VPR) pipeline that runs global retrieval and local re-ranking off a **single** pre-trained backbone. One forward pass over an event frame produces both the global descriptor that builds the shortlist and the local keypoints that re-rank it.
 
-<p style="width: 200%; display: block; margin-left: auto; margin-right: auto">
-  <img src="./assets/eventgem.gif" alt="Event-GeM animation gif"/>
+<p align="center">
+  <img src="./assets/eventgem.png" alt="Backbone feature map activations under different pooling schemes"/>
 </p>
 
-Event-GeM uses features from the [Event-Camera-Data-Pre-Training](https://github.com/Yan98/Event-Camera-Data-Pre-training) and a generalized mean (GeM) pooling layer to generate initial matches from event frames. [SuperEvent](https://github.com/ethz-mrl/SuperEvent) then allows for 2D homology re-ranking of the TopK matches based on keypoint selection for improved recall performance. Optional additional re-ranking can be performed with [Depth AnyEvent](https://github.com/bartn8/depthanyevent) using a structural similarity index. Datasets for VPR are managed and generated using [Event-LAB](https://github.com/EventLAB-Team/Event-LAB).
+Event frames are constructed as multi-channel time surfaces (MCTS) and passed through [SuperEvent](https://github.com/ethz-mrl/SuperEvent). Its pre-head FPN feature map is generalized-mean (GeM) pooled over a 4×4 grid into a 2048-D global descriptor — one learned exponent per grid row, rising from sky to road — projected through a pre-trained head and matched by cosine similarity to produce a top-K shortlist. The keypoints and descriptors from the same forward pass then re-rank that shortlist: correspondences are filtered by mutual nearest neighbours and scored by RANSAC homography inliers. Datasets and pseudo-ground-truth files for VPR are managed and generated using [Event-LAB](https://github.com/EventLAB-Team/Event-LAB).
 
 ## Getting Started :rocket:
 Event-GeM is powered by [Pixi](https://pixi.sh/latest/) for all dependency and package management. If not already installed, run the following in your command terminal:
@@ -27,56 +27,72 @@ Next, clone our repository **with all the required submodules** and navigate to 
 git clone git@github.com:AdamDHines/Event-GeM.git eventgem --recurse-submodules && cd eventgem
 ```
 
-Once installed, you can quickly try Event-GeM with our demo by running the following in your command terminal:
+`--recurse-submodules` is not optional — Event-GeM refuses to start if the `superevent` or `eventlab` submodules are missing. There is no separate model download step: the SuperEvent weights (`super_event_weights.pth`) are committed inside the SuperEvent submodule and arrive with the clone.
 
-```console
-pixi run demo
-```
+> **Platforms:** the pixi environment targets `linux-64` and `linux-aarch64` with CUDA 12. There is no macOS or Windows environment.
 
-## Running EventGeM & EventGeM-D :sparkles:
+### Pre-trained model
+The EventGeM projection head is downloaded automatically on the first run, from [`AdamHines/eventgem`](https://huggingface.co/AdamHines/eventgem), and cached by `huggingface_hub` — so subsequent runs work offline, and `HF_HUB_OFFLINE=1` is respected. The SuperEvent trunk it sits on top of still comes from the submodule.
+
+If you have features cached from a previous version of Event-GeM, pass `--rerun-features` once: the descriptor changed, but the cached similarity matrix is not named for it.
+
+## Running EventGeM :sparkles:
 ### Basic operation
-To run EventGeM and EventGeM-D, you simply need to input a dataset, reference, and query that you would like to run in a single command-line invocation:
+To run EventGeM you need a dataset, a reference traverse, and a query traverse in a single command-line invocation:
 
 ```console
 pixi run eventgem --dataset brisbane_event --reference sunset2 --query sunset1
 ```
 
-This will generate all of the event-based frame types needed for the various backbones. If you wish to save on disk space, you can instead stream from the event file:
+This extracts global descriptors and keypoints for both traverses, re-ranks the top-K shortlist, and prints a Recall@1/5/10 table. Feature extraction is cached — a second run reuses what is on disk unless you pass `--rerun-features`.
 
-```console
-pixi run eventgem --dataset brisbane_event --reference sunset2 --query sunset1 --stream
+### Expected data layout
+Event data and the pseudo-ground-truth file are generated with [Event-LAB](https://github.com/EventLAB-Team/Event-LAB) and must exist before you run. Event-GeM expects them under `--data-root` (default `./eventgem/data`):
+
+```
+<data-root>/
+└── brisbane_event/
+    ├── sunset2/sunset2.hdf5
+    ├── sunset1/sunset1.hdf5
+    └── ground_truth/sunset2_sunset1_GT.npy
 ```
 
-[Event-LAB](https://github.com/EventLAB-Team/Event-LAB) handles the generation of a pseudo-ground truth file for Recall@K evaluation, which runs automatically.
+### Outputs
+- Global descriptors are written under `--feature-out` (default `./eventgem/features`).
+- Keypoints are written to a packed, memory-mapped store under `--keypoint-out` (default `./eventgem/keypoints`).
+- Both similarity matrices are saved to `<data-root>/<dataset>/<reference>-<query>-similarity/` as `original_sim_mat.npy` and `reranked_sim_mat.npy`.
+- Recall@1/5/10 for the shortlist and the re-ranked result is printed to the terminal.
 
-By default, the EventGeM method will run, however if you want to run the EventGeM-D depth based re-rank run:
 
 ```console
-pixi run eventgem --dataset brisbane_event --reference sunset2 --query sunset1 --method eventgem-d
+pixi run sunset2-sunset1 --data-root /path/to/datasets --feature-out /path/to/features --keypoint-out /path/to/keypoints
 ```
 
-### List of arguments
-#### Dataset parameters
-- `--dt-ms`: max time in msec to consturct polarity and tencode frames to (default=50)
-- `--mcts-time`: list of times to construct the MCTS frames with (deafult=[10, 20, 30, 40, 50])
-- `--time-scale`: time scale of the event timestamps (default=1e-9)
-- `--start-time`: delay time for streaming from event files for synchronizing (default=None)
-- `--skip`: number of frames to skip during inference (default=None)
+## List of arguments
+### Dataset parameters
+- `--dataset`, `-d`: dataset to evaluate; one of `brisbane_event`, `nsavp`, `fast_slow`, `qut_event_walking`
+- `--reference`, `-r`: reference traverse name
+- `--query`, `-q`: query traverse name
+- `--dt-ms`: reconstruction time window in msec per frame (default=50)
+- `--max-window-ms`: MCTS integration window in msec (default=`--dt-ms`, so each frame integrates its full window; pass 30 to reproduce legacy numbers)
+- `--data-root`: root directory for datasets (default="./eventgem/data")
+- `--ref-offset`: offset for the reference event stream start, in the dataset's native timestamp units (default=0)
+- `--query-offset`: offset for the query event stream start (default=0)
 
-#### Model parameters
-- `--stream`: stream from event file instead of generating and saving event frames
-- `--top-k`: top-k reference to run the re-ranking on (default=50)
-- `--se-topk`: number of keypoints to detect per frame and run RANSAC on (default=170)
-- `--backbone-batch-size`: batch size for running the initial ViT embeddings (non-stream mode only)
-- `--keypoint-batch-size`: batch size for running the keypoint detection (non-stream mode only)
-- `--rerank-mode`: run keypoint, depth, or both re-rank options (default="keypoints")
-- `--method`: VPR method to run during inference (default="eventgem")
+### Model parameters
+- `--top-k`: number of shortlist candidates to re-rank with 2D-homography (default=50)
+- `--match-filter`: correspondence filter before RANSAC, `mutual` or `ratio` (default="mutual")
+- `--match-ratio`: Lowe's ratio threshold, only used by `--match-filter ratio` (default=0.8)
+- `--ransac-thresh`: RANSAC pixel threshold (default=5.0)
+- `--inlier-weight`: distance subtraction per RANSAC inlier (default=0.05)
+- `--keypoint-batch-size`: batch size for the backbone forward pass (default=16)
+- `--se-config`: path to the SuperEvent config file (default="eventgem/external/superevent/config/super_event.yaml")
+- `--se-weights`: path to the SuperEvent weights file (default="eventgem/external/superevent/saved_models/super_event_weights.pth")
+- `--feature-out`: directory for global descriptors (default="./eventgem/features")
+- `--keypoint-out`: directory for the keypoint store (default="./eventgem/keypoints")
 
-#### Directory parameters
-- `--data-root`: default root directory to store datasets (default="./eventgem/data")
-- `--feature-out`: default directory for ViT embedding features (default="./eventgem/features")
-- `--keypoint-out`: default directory for keypoints (default="./eventgem/keypoints")
-- `--depth-out`: default directory for depth maps (default="./eventgem/depth")
+### Re-run options
+- `--rerun-features`: re-run feature extraction even if cached features already exist
 
 ## Citation :scroll:
 If you found our work interesting or use it as a baseline method, please cite the following:

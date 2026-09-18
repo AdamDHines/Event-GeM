@@ -24,7 +24,9 @@ except ImportError:  # optional; without it BLAS keeps its own thread count and 
 from tqdm import tqdm
 from pathlib import Path
 from joblib import Parallel, delayed
+from huggingface_hub import hf_hub_download
 from eventgem.inference import stream_file
+from eventgem.training.common import ResidualHead
 from eventgem.dataset import EventGeMMCTS
 from eventgem.utils.eventlab_config import update_config
 from eventgem.utils.rerank_utils import process_single_query, open_keypoint_bank, bank_lookup
@@ -46,6 +48,39 @@ from models.util import fast_nms
 import matplotlib.pyplot as plt
 
 
+def pool_grid_gamma(feats, gamma, g=4):
+    """
+    Regional g x g GeM with a per-cell exponent. [B,128,H,W] -> [B, g*g*128], L2-normalised.
+
+    The shipped head was trained on this descriptor, so three details here are load-bearing and
+    are not tidy-up candidates:
+
+      * `astype(int)` truncates. On the 30x40 FPN grid that gives row bounds [0,7,15,22,30]
+        (heights 7, 8, 7, 8); rounding or `//` would move two of the four rows.
+      * the per-window mean is clamped before `pow(1/p)`. At the learned gamma ~19 a near-empty
+        window underflows `mean(xn^p)` into the subnormal range.
+      * the max-rescale is GLOBAL per (batch, channel), not per cell, so every block keeps a
+        common scale reference and encodes *where* rather than *what*.
+
+    Cells are emitted row-major, so gamma[i*g + j] pairs with descriptor columns 128k : 128(k+1).
+    """
+    x = feats.clamp(min=1e-6)
+    m = x.amax(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+    xn = x / m
+    ys = np.linspace(0, x.shape[-2], g + 1).astype(int)
+    xs = np.linspace(0, x.shape[-1], g + 1).astype(int)
+    parts = []
+    for i in range(g):
+        for j in range(g):
+            pij = gamma[i * g + j]
+            q = xn[..., ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
+            mp = q.pow(pij).mean(dim=(-2, -1)).clamp(min=1e-12)
+            parts.append(mp.pow(1.0 / pij) * m[..., 0, 0])
+    out = torch.stack(parts, dim=1)                                   # [B, g*g, 128]
+    out = F.normalize(out, p=2, dim=2).reshape(out.shape[0], -1)      # per-block L2
+    return F.normalize(out, p=2, dim=1)                               # global L2
+
+
 class EventGeM:
     def __init__(self, args):
         # Before running, ensure repository was cloned with --recurse-submodules
@@ -65,34 +100,25 @@ class EventGeM:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
-    def GeM(self, feats, p=5.0):
-        return F.avg_pool2d((feats.clamp(min=1e-6)).pow(p), (feats.shape[-2], feats.shape[-1])).pow(1.0/p)
-
-    def fit_whitening(self, ref_feats, eps=1e-8):
+    def load_head(self, device):
         """
-        PCA-whitening for the global descriptor, fit on the reference bank only.
+        The shipped projection head, downloaded on first use.
 
-        GeM with a large exponent produces descriptors whose channel variances differ by orders of
-        magnitude, so a handful of channels dominate the cosine similarity. Equalising them is worth
-        far more than it costs: base R@50 on the sunset2->morning pair rises 69.9 -> 79.9%. Only the
-        reference bank is used to fit, which is the database side and is always available offline,
-        so no query information leaks into the transform.
+        `eventgem.pt` is a 4x4 regional descriptor head: a dim-preserving residual MLP over a
+        2048-D (16 x 128) pooled vector, plus `grid`, the 16 learned GeM exponents it was trained
+        with (tied per grid row -- sky 6.69, skyline 17.12, facade 17.61, road 19.19). It sits on
+        top of the SuperEvent trunk from the submodule rather than replacing it.
 
-        Note this is *whitening*, not plain PCA -- centring and rotating without equalising the
-        variances makes retrieval substantially worse.
+        `hf_hub_download` caches, resumes and honours HF_HUB_OFFLINE, and `load_state_dict` is
+        strict, so a wrong checkpoint fails here rather than silently mis-pooling.
         """
-        mu = ref_feats.mean(dim=0, keepdim=True)
-        centred = ref_feats - mu
-        # SVD of the centred bank; eigenvalues of the covariance are S^2 / (N - 1).
-        _, S, Vh = torch.linalg.svd(centred, full_matrices=False)
-        scale = 1.0 / torch.sqrt(torch.clamp(S.pow(2) / max(len(ref_feats) - 1, 1), min=eps))
-
-        def transform(x):
-            return ((x - mu) @ Vh.t()) * scale
-
-        print(f"[INFO] PCA-whitening fit on {len(ref_feats)} reference descriptors "
-              f"({ref_feats.shape[1]}-D)")
-        return transform
+        ckpt = torch.load(hf_hub_download("AdamHines/eventgem", "eventgem.pt"),
+                          map_location=device, weights_only=False)
+        head = ResidualHead(2048, 1638).to(device)
+        head.load_state_dict(ckpt["head"])
+        gamma = torch.as_tensor(ckpt["grid"], dtype=torch.float32, device=device).ravel()
+        print(f"[INFO] EventGeM head loaded (gamma rows {[round(float(v), 2) for v in gamma[::4]]})")
+        return head.eval(), gamma
 
     def extract_superevent_features(self, sim_file):
         """
@@ -113,6 +139,7 @@ class EventGeM:
         model, se_config = self.build_superevent_model(
             Path(self.se_config), Path(self.se_weights), device
         )
+        head, gamma = self.load_head(device)
         ref_dir = f"{self.data_root}/{self.dataset}/{self.reference}/{self.reference}.hdf5"
         query_dir = f"{self.data_root}/{self.dataset}/{self.query}/{self.query}.hdf5"
 
@@ -167,8 +194,8 @@ class EventGeM:
                         # SuperEvent.forward does -- calling model(batch) here would pay for the
                         # backbone and FPN a second time.
                         features = model.fpn(model.backbone(batch))
-                        pooled = self.GeM(features.float(), p=self.gem_p)
-                        feats.append(pooled.squeeze(-1).squeeze(-1).detach().cpu())
+                        pooled = pool_grid_gamma(features.float(), gamma)
+                        feats.append(pooled.detach().cpu())
 
                         _, prob = model.detector(features)      # (B, Hc, Wc)
                         _, desc_map = model.descriptor(features) # (B, D, Hc, Wc)
@@ -232,13 +259,13 @@ class EventGeM:
 
         print(f"[INFO] SE-GeM descriptors: ref {tuple(ref_feats.shape)} | query {tuple(query_feats.shape)}")
 
-        if getattr(self, "gem_whiten", False):
-            whiten = self.fit_whitening(ref_feats)
-            ref_feats, query_feats = whiten(ref_feats), whiten(query_feats)
+        # The head is fit-free -- it was trained on the pooled descriptor's own statistics, with
+        # no PCA and no whitening -- and its forward already returns an L2-normalised vector.
+        with torch.inference_mode():
+            ref_feats = head(ref_feats.to(device)).cpu()
+            query_feats = head(query_feats.to(device)).cpu()
 
         # Same cosine convention as the ECDPT path: rows = references, cols = queries.
-        ref_feats = F.normalize(ref_feats, p=2, dim=1)
-        query_feats = F.normalize(query_feats, p=2, dim=1)
         sim_matrix = torch.matmul(query_feats, ref_feats.t()).T
         torch.save(sim_matrix, sim_file)
 
